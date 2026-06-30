@@ -1,0 +1,143 @@
+package main
+
+import (
+	"log"
+	"time"
+)
+
+// ============================================================================
+// 调度goroutine：exhaust恢复 + 状态保存检查
+//   - 每1s：检查每个alias的恢复调度依据
+//       count型 → RecoveryCron 周期匹配
+//       usage/balance/fallback型 → now >= RecoveryAt 时间点触发
+//     且距上次实际触发 > recoveryMinGap，触发恢复
+//   - 每5min：检查 dirty flag，为true则保存
+// ============================================================================
+
+func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
+	ticker := time.NewTicker(schedulerTickInterval)
+	defer ticker.Stop()
+	saveTicker := time.NewTicker(stateSaveInterval)
+	defer saveTicker.Stop()
+	defer close(done)
+
+	for {
+		select {
+		case <-stopCh:
+			// 退出前若有未保存状态则保存
+			if dirty := func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return stateDirty
+			}(); dirty {
+				if err := saveState(); err != nil {
+					log.Printf("[scheduler] final save failed: %v", err)
+				} else {
+					log.Printf("[scheduler] final state saved")
+				}
+			}
+			return
+		case now := <-ticker.C:
+			checkRecovery(now)
+		case <-saveTicker.C:
+			if dirty := func() bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return stateDirty
+			}(); dirty {
+				if err := saveState(); err != nil {
+					log.Printf("[scheduler] save state failed: %v", err)
+				} else {
+					log.Printf("[scheduler] state saved")
+				}
+			}
+		}
+	}
+}
+
+// checkRecovery 遍历所有alias，判断是否触发恢复：
+//   - count型：RecoveryCron 周期匹配
+//   - usage/balance/fallback型：now >= RecoveryAt 时间点触发
+//     （RecoveryAt 为零值视为旧文件迁移，立即触发一次 provider 检查）
+//     统一受 recoveryMinGap 约束，防止短时间内重复触发
+func checkRecovery(now time.Time) {
+	mu.Lock()
+	// 复制一份需要触发的alias名，避免长时间持锁且不持有 state 指针
+	var toRecover []string
+	for name, st := range stateMap {
+		if st == nil || !st.Exhausted {
+			continue
+		}
+		cfg := tokenMap.Aliases[name].Availability
+		isCount := cfg != nil && cfg.Type == availCount
+
+		if isCount {
+			// count型：按 cron 周期匹配
+			if st.RecoveryCron == "" {
+				continue
+			}
+			sched, err := parseCronCached(st.RecoveryCron)
+			if err != nil {
+				continue
+			}
+			if !sched.Match(now) {
+				continue
+			}
+		} else {
+			// usage/balance/fallback型：按精确时间点触发
+			if !st.RecoveryAt.IsZero() && now.Before(st.RecoveryAt) {
+				continue
+			}
+			// RecoveryAt 为零值 → 旧文件迁移，立即触发一次 provider check
+		}
+		if !st.LastRecovery.IsZero() && now.Sub(st.LastRecovery) < recoveryMinGap {
+			continue
+		}
+		toRecover = append(toRecover, name)
+	}
+	mu.Unlock()
+
+	for _, name := range toRecover {
+		recoverAlias(name, now)
+	}
+}
+
+func recoverAlias(name string, now time.Time) {
+	mu.Lock()
+	cur := stateMap[name]
+	if cur == nil || !cur.Exhausted {
+		mu.Unlock()
+		return
+	}
+	cfg := tokenMap.Aliases[name].Availability
+
+	// count型：直接重置count并恢复。
+	// 注意：count 型语义由网关自行计数 + cron 周期重置驱动，不依赖 provider 检查，
+	// 所以这里不调用 applyAvailabilityResult，LastChecked 也不会更新（保持零值）。
+	// 若未来引入依赖 LastChecked 的逻辑需在此显式更新。
+	if cfg != nil && cfg.Type == availCount {
+		cur.Count = 0
+		cur.Exhausted = false
+		cur.LastRecovery = now
+		stateDirty = true
+		mu.Unlock()
+		log.Printf("[recover] alias=%s count reset (exhausted=false)", name)
+		return
+	}
+
+	// usage/balance/fallback型：先做值拷贝快照，释放锁后调用provider校验
+	stCopy := *cur
+	mu.Unlock()
+
+	res := checkAvailability(name, cfg, &stCopy)
+	applyAvailabilityResult(name, res) // 内部自带锁，会更新 Exhausted 等字段
+
+	// 统一写入 LastRecovery 与 dirty
+	mu.Lock()
+	if cur = stateMap[name]; cur != nil {
+		cur.LastRecovery = now
+		stateDirty = true
+	}
+	mu.Unlock()
+	log.Printf("[recover] alias=%s rechecked by provider (exhausted=%v)", name, res.Exhausted)
+}

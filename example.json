@@ -1,0 +1,91 @@
+{
+  "tokenMap": {
+    "fakeTokens": {
+      "sk-ark": [
+        "ark"
+      ],
+      "sk-deepseek": [
+        "deepseek-trae",
+        "deepseek-astrbot"
+      ],
+      "sk-gemini": [
+        "gemini"
+      ],
+      "sk-mimo": [
+        "mimo"
+      ],
+      "sk-opencode-go": [
+        "opencode-go",
+        "opencode-go-1"
+      ]
+    },
+    "aliases": {
+      "ark": {
+        "realToken": "ark-***",
+        "targetBase": "https://ark.cn-beijing.volces.com"
+      },
+      "deepseek-astrbot": {
+        "realToken": "sk-***",
+        "targetBase": "https://api.deepseek.com",
+        "availability": {
+          "type": "balance",
+          "provider": "deepseek"
+        }
+      },
+      "deepseek-opencode": {
+        "realToken": "sk-***",
+        "targetBase": "https://api.deepseek.com",
+        "availability": {
+          "type": "balance",
+          "provider": "deepseek"
+        }
+      },
+      "deepseek-trae": {
+        "realToken": "sk-***",
+        "targetBase": "https://api.deepseek.com",
+        "availability": {
+          "type": "balance",
+          "provider": "deepseek"
+        }
+      },
+      "gemini": {
+        "realToken": "***",
+        "targetBase": "https://generativelanguage.googleapis.com",
+        "availability": {
+          "type": "count",
+          "limit": 250,
+          "refreshCron": "0 0 16 * * *"
+        }
+      },
+      "mimo": {
+        "realToken": "sk-***",
+        "targetBase": "https://api.xiaomimimo.com"
+      },
+      "opencode-go": {
+        "realToken": "sk-***",
+        "targetBase": "https://opencode.ai/zen/go",
+        "availability": {
+          "type": "usage",
+          "provider": "opencode-go"
+        },
+        "extra": {
+          "cookie": "oc_locale=zh; auth=***",
+          "workspaceId": "wrk_***"
+        }
+      },
+      "opencode-go-1": {
+        "realToken": "sk-***",
+        "targetBase": "https://opencode.ai/zen/go",
+        "availability": {
+          "type": "usage",
+          "provider": "opencode-go"
+        },
+        "extra": {
+          "cookie": "auth=***; oc_locale=zh",
+          "workspaceId": "wrk_***"
+        }
+      }
+    }
+  },
+  "state": {}
+}
