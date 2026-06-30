@@ -47,8 +47,8 @@ go build -o api-gateway.exe .
 1. 首次运行无 `gateway.db` 时启动会创建空库，日志提示：
 
 ```
-State loaded from DB (0 aliases)
 TokenMap loaded from DB (fakeTokens=0, aliases=0)
+State loaded from DB (0 aliases)
 请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。
 Gateway running on port 9090
 ```

@@ -633,9 +633,11 @@ func importFromJSON(inPath string) error {
 	}
 
 	// 6. 孤儿 state 警告（state 中有但 Aliases 中无）
+	orphanWarned := 0
 	for name := range dump.State {
 		if _, ok := dump.TokenMap.Aliases[name]; !ok {
 			log.Printf("[import] WARN state has orphan alias=%s (not in tokenMap.aliases) -> ignored", name)
+			orphanWarned++
 		}
 	}
 
@@ -643,6 +645,6 @@ func importFromJSON(inPath string) error {
 		return fmt.Errorf("commit: %w", err)
 	}
 	log.Printf("Imported %d aliases / %d fake_tokens -> %s (skipped %d dup, %d missing, %d orphan warned)",
-		aliasCount, ftCount, dbPath, dupSkipped, missingSkipped, 0)
+		aliasCount, ftCount, dbPath, dupSkipped, missingSkipped, orphanWarned)
 	return nil
 }
