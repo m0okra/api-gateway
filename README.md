@@ -6,15 +6,16 @@ Go + SQLite 轻量级 API 反向代理网关，兼容三大主流AI API（OpenAI
 
 ```
 src/
-├── main.go          入口：flag 解析、加载配置、启动 HTTP 服务器、优雅关闭
-├── globals.go       全局变量：配置状态、共享 HTTP 客户端、writeJSON 工具
-├── constants.go     常量定义：超时阈值、可用性类型共用名
-├── types.go         数据结构：TokenMapConfig/AliasConfig/AvailabilityConfig/...
-├── cron.go          轻量 Cron 解析调度 + LRU 缓存
-├── providers.go     可用性 Provider：DeepSeek 余额、OpenCode-Go 用量等检查实现
-├── state.go         状态管理：从 SQLite 加载/保存、一致性协调、脏队列清理
-├── scheduler.go     定时调度：exhaust 恢复检查 + 状态持久化触发
-└── gateway.go       核心转发：fakeToken → alias 队列轮转、请求注入、流式响应
+├── main.go            入口：flag 解析、加载配置、启动 HTTP 服务器、优雅关闭
+├── globals.go         全局变量：配置状态、共享 HTTP 客户端、writeJSON 工具
+├── constants.go       常量定义：超时阈值、可用性类型共用名、并发与超时保护常量
+├── types.go           数据结构：TokenMapConfig/AliasConfig/AvailabilityConfig/...
+├── singleflight.go    可用性检查 singleflight（自实现，仅用标准库）
+├── cron.go            轻量 Cron 解析调度 + LRU 缓存
+├── providers.go       可用性 Provider：DeepSeek 余额、OpenCode-Go 用量等检查实现
+├── state.go           状态管理：从 SQLite 加载/保存（锁外 I/O 快照写）、一致性协调
+├── scheduler.go       定时调度：exhaust 恢复检查 + 状态持久化触发
+└── gateway.go         核心转发：fakeToken → alias 队列轮转（原子挑选）、请求注入、流式响应
 ```
 
 ## 编译说明
@@ -108,23 +109,27 @@ api-gateway -p 9090
 client → 网关 (带 fakeToken)
           │
           ▼
+    ┌─ 全局并发信号量（channel semaphore，容量 256）——超限请求阻塞排队
+    ▼
     提取 fakeToken（bearer / goog header / query key / api-key header 优先级递减）
           │
           ▼
     查找 FakeTokens[fakeToken] 队列
           │
           ▼
-    按优先级遍历 alias 队列（最多 len(queue) 次）
+    pickFirstAvailableAlias：写锁内原子扫描队列，跳过已 exhausted 的前缀（移到队尾），
+    返回首个可用 alias 及其配置快照（省去三次单锁间的 TOCTOU 竞态）
           │
-          ├─ alias 已 exhaust → 轮转到队尾，尝试下一个
+          ├─ 整队列不可用 → 返回 503
           │
           └─ alias 可用 → 用 realToken 替换 fakeToken，转发到 targetBase
                             │
                             ├─ count 型 → incrementCount，达 limit 则标记 exhaust
                             │
                             └─ 检查响应状态码
-                                 ├─ 401/402/403/429 → 触发可用性检查，exhaust 则 rotate
-                                 ├─ 流式 (SSE) → streamIdleTimeout 空闲超时保护
+                                 ├─ 401/402/403/429 → singleflight 去重（同 alias
+                                 │   并发仅首次调用 provider），exhaust 则 rotate
+                                 ├─ 流式 (SSE) → streamIdleTimeout 空闲超时 + maxStreamLife 硬上限
                                  └─ 其他 → 直接转发响应
 ```
 
@@ -140,9 +145,11 @@ client → 网关 (带 fakeToken)
 - `X-Api-Key` header → 替换该 header
 - `Authorization: Bearer` / 其他 → 替换 Authorization header
 
-### 流式响应空闲超时
+### 流式响应保护
 
-流式分支启动 goroutine 监控空闲读超时（`streamIdleTimeout = 5min`）。若在超时时间内未读到上游数据，调用 `cancelReq()` 中断上游 HTTP 连接。goroutine 通过 context 取消安全退出。
+流式分支有两个保护层：
+- **空闲读超时**（`streamIdleTimeout = 5min`）：启动 goroutine 监控，超时内未读到上游数据则调用 `cancelReq()` 中断上游连接。
+- **最大生命周期**（`maxStreamLife = 30min`）：流式上下文叠加 `context.WithTimeout` 硬上限。即使空闲监控 goroutine 在边界情况未触发，到期也会强制取消上游连接，防止流式 goroutine 无限堆积。
 
 ### 状态持久化
 
@@ -151,7 +158,8 @@ client → 网关 (带 fakeToken)
 - 恢复调度依据按类型二选一：
   - **count 型**：`RecoveryCron`（cron 表达式，对应配置的 `RefreshCron`）
   - **usage/balance/fallback 型**：`RecoveryAt`（精确时间点 `time.Time`，由 provider 在 exhaust 时设定）
-- 内存中维护 `stateDirty` 标志，每 5min 检查并写入。
+- 内存中维护 `stateDirty` 标志与 `stateGen` 代际计数器（`atomic.Uint64`），每 5min 检查并写入。
+- `saveState()` 优化为锁内快照 → 锁外 I/O：在写锁内深拷贝 state 快照并记录代际后立即释放锁，SQLite 事务在锁外执行；提交后再次取锁，仅当代际未变（无新写入）才清 dirty，避免写库期间（可能数百 ms）阻塞所有请求。
 - 调度器退出前 final save 确保持久化一致性；main 通过 `schedDone` channel 等待 final save 完成后再 `db.Close()`，避免事务被截断。
 - 启动时清理 FakeTokens 队列中 Aliases 不存在的 alias（配置一致性保护）。
 - 运行时 alias 队列轮转顺序不持久化（重启恢复 `fake_tokens.priority` 定义的配置顺序）。
@@ -201,23 +209,26 @@ client → 网关 (带 fakeToken)
 2. 若指定 `-e` 或 `-i`：执行导出/导入后 `os.Exit(0)`，不启动服务器（管理操作，互斥）
 3. 调用 `loadFromDB()` 从 SQLite 加载配置与状态（统一数据源）
 4. 启动 `runScheduler` goroutine
-5. 启动 HTTP server，监听 `:port`
-6. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）
+5. 初始化 `reqSem` 并发信号量（channel semaphore，容量 256），handler 入口 acquire、defer release
+6. 启动 HTTP server，监听 `:port`，配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
+7. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）
 
 ### globals.go
 
-- 包级全局变量（`tokenMap`、`stateMap`、`mu`、`db`、`dbPath` 等）
+- 包级全局变量（`tokenMap`、`stateMap`、`mu sync.RWMutex`、`stateGen atomic.Uint64`、`db`、`dbPath` 等）
 - 共享 HTTP 客户端（复用 Transport，避免每次创建新连接）：
   - `defaultClient`（15s 超时）— provider 可用性检查
   - `proxyClient`（120s 超时）— 普通代理请求
   - `streamClient`（无整体超时）— 流式代理请求
+- `reqSem`（channel semaphore，容量 256）：全局并发上限，handler 入口 acquire，超限请求阻塞排队
+- `availSF`（`availSingleFlight`）：可用性检查 singleflight，同 alias 并发触发仅首次执行 provider 调用
 - `writeJSON` 统一 JSON 响应写入，捕获并记录编码错误
 
 ### state.go
 
 - `openDB`：打开 SQLite（`PRAGMA foreign_keys=ON` + `WAL` + `busy_timeout`）并建表 IF NOT EXISTS，供 `loadFromDB` 与 `importFromJSON` 复用
 - `loadFromDB`：查 4 张表填充 `tokenMap` + `stateMap`、`cleanFakeTokenQueues` + `reconcileStateWithConfig`
-- `saveState`：单事务全量写回——遍历 `stateMap` UPDATE `aliases` 状态列 + 每个 alias 的 `alias_tiers` DELETE/INSERT；`time.Time` 零值存 NULL 避免 1970 误判
+- `saveState`：单事务写回——先持写锁深拷贝 state 快照（含 Tiers 副本）并记录 `stateGen`，释放锁后遍历快照执行 SQLite I/O（`UPDATE aliases` 状态列 + 每个 alias 的 `alias_tiers` DELETE/INSERT）；提交后再取锁，仅当代际未变才清 dirty。锁外 I/O 避免写库阻塞所有请求。
 - `exportToJSON`：复用 `loadFromDB` 载入内存 → marshal `DBDump{tokenMap, stateMap}` → 原子写（tmp+rename，0600）；导出 reconcile 后的规范视图
 - `importFromJSON`：读 JSON → 单事务 DELETE 4 表（先子后父）+ INSERT 全量覆盖；防御：队列重复 alias 用 `INSERT OR IGNORE` 跳过、引用不存在 alias 跳过、orphan state 警告；任一步失败 Rollback
 
@@ -244,13 +255,15 @@ client → 网关 (带 fakeToken)
   - **count 型**：`RecoveryCron` cron 周期匹配
   - **usage/balance/fallback 型**：`now >= RecoveryAt` 时间点触发（零值为旧文件迁移，立即触发）
   - 统一受 `recoveryMinGap`（60s）约束，避免短时间重复触发
-- `recoverAlias`：count 型直接重置计数并清除 exhausted；其余类型释放锁后调用 provider 复查，`applyAvailabilityResult` 写入新 `RecoveryAt`
+- `recoverAlias`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
 
 ### gateway.go
 
-- handler：核心请求处理函数（重试循环、cancelReq 显式调用、共享 proxy/stream client）
-- 队列操作：`pickFirstAlias` / `rotateAliasToEnd` / `getAliasQueueLen` / `hasAliasQueue`（均加锁）
-- 状态查询：`isAliasExhausted`（缺失 state 视为 exhausted）、`incrementCount`（count 型自增）、`applyAvailabilityResult`（写入检查结果；按类型分流：count 写 `RecoveryCron`、其余写 `RecoveryAt`，并清理另一调度依据的残留）
+- handler：核心请求处理函数，以 `reqSem <- struct{}{}` 获取并发令牌（defer 释放），完成后返回
+- 队列操作：`pickFirstAvailableAlias`（一次写锁内原子扫描队列，跳过所有 exhausted 前置 alias 至队尾，返回首个可用 alias 与配置快照）/ `rotateAliasToEnd` / `getAliasQueueLen` / `hasAliasQueue`
+- 状态查询：`incrementCount`（count 型自增）、`applyAvailabilityResult`（写入检查结果；按类型分流：count 写 `RecoveryCron`、其余写 `RecoveryAt`，并清理另一调度依据的残留）
+- 可用性错误（401/402/403/429）路径通过 `availSF.Do()` singleflight 去重 checkAvailability，避免并发请求重复调用 provider
+- 流式响应：idle 监控 goroutine + `maxStreamLife` context 超时硬上限，双保险
 - `writeJSON` 统一 JSON 响应写入（`globals.go` 中定义）
 - 辅助函数：`maskURL` / `maskHeadersStr` / `forwardStreamHeaders` / `removeHopHeaders` / `maskFakeToken` 用于日志脱敏和头处理
 
