@@ -324,8 +324,8 @@ func httpGetText(reqURL string, headers map[string]string) (string, int, error) 
 }
 
 func getAliasConfig(name string) *AliasConfig {
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	if a, ok := tokenMap.Aliases[name]; ok {
 		return &a
 	}

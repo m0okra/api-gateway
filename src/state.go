@@ -334,10 +334,10 @@ func reconcileStateWithConfig() {
 			st.RecoveryCron = ""
 		}
 		// 2) count limit 下调：count >= limit 立即标记 exhaust
-		if cfg.Type == availCount && cfg.Limit > 0 && st.Count >= cfg.Limit && !st.Exhausted {
-			st.Exhausted = true
-			stateDirty = true
-			log.Printf("[state] alias=%s count=%d >= limit=%d -> exhaust at startup", name, st.Count, cfg.Limit)
+if cfg.Type == availCount && cfg.Limit > 0 && st.Count >= cfg.Limit && !st.Exhausted {
+		st.Exhausted = true
+		markDirty()
+		log.Printf("[state] alias=%s count=%d >= limit=%d -> exhaust at startup", name, st.Count, cfg.Limit)
 		}
 	}
 }
@@ -352,10 +352,50 @@ func formatTime(t time.Time) sql.NullString {
 
 // saveState 将内存中所有 alias 状态全量写回 SQLite（单事务）。
 // 配置字段不写回（配置由用户直接编辑 DB；运行时轮转顺序不持久化）。
+//
+// 并发优化：在写锁内构建 state 深拷贝快照后即释放锁，事务的 SQLite I/O 在锁外执行，
+// 避免写库（可能数百 ms）阻塞所有请求。快照后记录 stateGen 代际计数，提交后再取锁：
+// 若代际未变 → 无新写入，安全清除 stateDirty；若代际已增 → 快照后又有变更，保留 stateDirty
+// 由下一个保存周期补写，保证不丢数据。
 func saveState() error {
+	// 1. 持锁快照
+	type aliasSnap struct {
+		name          string
+		exhausted     bool
+		count         int
+		balance       float64
+		recoveryCron  string
+		recoveryAt    time.Time
+		lastRecovery  time.Time
+		lastChecked   time.Time
+		tiers         []TierState
+	}
+	var snap []aliasSnap
 	mu.Lock()
-	defer mu.Unlock()
+	for name, st := range stateMap {
+		if st == nil {
+			continue
+		}
+		s := aliasSnap{
+			name:         name,
+			exhausted:    st.Exhausted,
+			count:        st.Count,
+			balance:      st.Balance,
+			recoveryCron: st.RecoveryCron,
+			recoveryAt:   st.RecoveryAt,
+			lastRecovery: st.LastRecovery,
+			lastChecked:  st.LastChecked,
+		}
+		if len(st.Tiers) > 0 {
+			s.tiers = make([]TierState, len(st.Tiers))
+			copy(s.tiers, st.Tiers)
+		}
+		snap = append(snap, s)
+	}
+	snapGen := stateGen.Load()
+	mu.Unlock()
 
+	// 2. 锁外执行事务 I/O
 	tx, err := db.Begin()
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -382,30 +422,27 @@ func saveState() error {
 	}
 	defer tierIns.Close()
 
-	for name, st := range stateMap {
-		if st == nil {
-			continue
-		}
+	for _, s := range snap {
 		exhausted := 0
-		if st.Exhausted {
+		if s.exhausted {
 			exhausted = 1
 		}
 		var recoveryCron sql.NullString
-		if st.RecoveryCron != "" {
-			recoveryCron = sql.NullString{String: st.RecoveryCron, Valid: true}
+		if s.recoveryCron != "" {
+			recoveryCron = sql.NullString{String: s.recoveryCron, Valid: true}
 		}
-		if _, err := aliasUpd.Exec(exhausted, st.Count, st.Balance, recoveryCron,
-			formatTime(st.RecoveryAt), formatTime(st.LastRecovery), formatTime(st.LastChecked),
-			name); err != nil {
-			return fmt.Errorf("update alias %s: %w", name, err)
+		if _, err := aliasUpd.Exec(exhausted, s.count, s.balance, recoveryCron,
+			formatTime(s.recoveryAt), formatTime(s.lastRecovery), formatTime(s.lastChecked),
+			s.name); err != nil {
+			return fmt.Errorf("update alias %s: %w", s.name, err)
 		}
-		// tiers 全量重写（usage 型；非 usage 型 st.Tiers 为 nil → 仅删除）
-		if _, err := tierDel.Exec(name); err != nil {
-			return fmt.Errorf("delete tiers for %s: %w", name, err)
+		// tiers 全量重写（usage 型；非 usage 型 tiers 为 nil → 仅删除）
+		if _, err := tierDel.Exec(s.name); err != nil {
+			return fmt.Errorf("delete tiers for %s: %w", s.name, err)
 		}
-		for _, ts := range st.Tiers {
-			if _, err := tierIns.Exec(name, ts.Name, ts.UsedPct, ts.ResetInSec); err != nil {
-				return fmt.Errorf("insert tier %s.%s: %w", name, ts.Name, err)
+		for _, ts := range s.tiers {
+			if _, err := tierIns.Exec(s.name, ts.Name, ts.UsedPct, ts.ResetInSec); err != nil {
+				return fmt.Errorf("insert tier %s.%s: %w", s.name, ts.Name, err)
 			}
 		}
 	}
@@ -413,14 +450,21 @@ func saveState() error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
 	}
-	stateDirty = false
+
+	// 3. 提交后再取锁：仅当代际未变才清 dirty
+	mu.Lock()
+	if stateGen.Load() == snapGen {
+		stateDirty = false
+	}
+	mu.Unlock()
 	return nil
 }
 
-func markStateDirty() {
-	mu.Lock()
+// markDirty 在持有 mu 写锁时调用：置脏并自增代际计数。
+// saveState 据此判断快照→提交期间是否产生新变更，避免误清 stateDirty 导致丢失写入。
+func markDirty() {
 	stateDirty = true
-	mu.Unlock()
+	stateGen.Add(1)
 }
 
 // ============================================================================

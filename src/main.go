@@ -68,10 +68,19 @@ func main() {
 	schedDone := make(chan struct{})
 	go runScheduler(schedStop, schedDone)
 
-	// 3. 启动HTTP服务器
+	// 3. 初始化并发信号量（channel semaphore，容量 = maxConcurrentReqs）
+	reqSem = make(chan struct{}, maxConcurrentReqs)
+
+	// 4. 启动HTTP服务器
+	//    WriteTimeout 保持 0：流式 SSE 响应可能持续超过 5min，设写超时会中断合法流。
+	//    ReadTimeout/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
 	server := &http.Server{
-		Addr:    ":" + strconv.Itoa(port),
-		Handler: http.HandlerFunc(handler),
+		Addr:           ":" + strconv.Itoa(port),
+		Handler:        http.HandlerFunc(handler),
+		ReadTimeout:    serverReadTimeout,
+		WriteTimeout:   0,
+		IdleTimeout:    serverIdleTimeout,
+		MaxHeaderBytes: serverMaxHeaderBytes,
 	}
 
 	go func() {

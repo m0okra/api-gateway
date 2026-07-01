@@ -83,15 +83,52 @@ func isAvailabilityError(status int) bool {
 // 网关：alias队列轮转（带锁读取）
 // ============================================================================
 
-// pickFirstAlias 取队列首部alias名（不删除）。若队列为空返回空串。
-func pickFirstAlias(fakeToken string) string {
+// pickFirstAvailableAlias 在一次写锁内原子完成：扫描队列找首个可用 alias，
+// 将其前方所有不可用 alias 轮转到队尾，并返回该可用 alias 名与其配置快照。
+//
+// 不可用定义：stateMap[alias]==nil（含未初始化 alias -> 保守视为耗尽）或 Exhausted==true，
+// 或 tokenMap.Aliases 中缺失该 alias（配置缺失 -> 保守视为不可用）。
+//
+// 返回 (alias, cfg, rotated)：
+//   - alias == "" 表示整队列不可用；rotated 为本次被跳过的 alias 名列表（用于日志）。
+//   - alias != "" 时 cfg 为该 alias 配置快照（值拷贝），调用方无需再次单独加锁读取配置。
+//
+// 用途：消除原 pickFirstAlias -> isAliasExhausted -> rotateAliasToEnd 三次独立加锁间的
+// TOCTOU 竞态——高并发下另一 goroutine 可能在两次加锁间改变队列或 state，
+// 导致选中的 alias 已被耗尽或配置已被移除。本函数把"选 + 把耗尽前置移到队尾"合为一次锁内操作。
+func pickFirstAvailableAlias(fakeToken string) (alias string, cfg *AliasConfig, rotated []string) {
 	mu.Lock()
 	defer mu.Unlock()
 	q := tokenMap.FakeTokens[fakeToken]
 	if len(q) == 0 {
-		return ""
+		return "", nil, nil
 	}
-	return q[0]
+	for i, a := range q {
+		st := stateMap[a]
+		if st == nil || st.Exhausted {
+			rotated = append(rotated, a)
+			continue
+		}
+		ac, ok := tokenMap.Aliases[a]
+		if !ok {
+			// 配置缺失：保守视为不可用，轮到队尾等同耗尽
+			rotated = append(rotated, a)
+			continue
+		}
+		// 找到首个可用 alias；其后的 alias 保持原序，前方已耗尽的前缀整体移到队尾
+		remaining := q[i+1:]
+		newQ := make([]string, 0, len(q))
+		newQ = append(newQ, a)
+		newQ = append(newQ, remaining...)
+		newQ = append(newQ, rotated...)
+		tokenMap.FakeTokens[fakeToken] = newQ
+		snap := ac // 值拷贝；AliasConfig 内 Extra/Availability 为引用，只读路径下安全
+		return a, &snap, rotated
+	}
+	// 整队列不可用：直接返回 "" 让调用方回 503，
+	// 避免原实现 maxAttempts 次循环逐个旋转的无谓空转（语义一致：仍返回 503）。
+	// rotated 已含整个队列供日志使用。
+	return "", nil, rotated
 }
 
 // rotateAliasToEnd 将指定alias移到其fakeToken队列末端
@@ -116,27 +153,14 @@ func rotateAliasToEnd(fakeToken, alias string) {
 
 // getAliasQueueLen 返回 fakeToken 对应队列长度（加锁读取，避免与 rotate 竞争）
 func getAliasQueueLen(fakeToken string) int {
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 	return len(tokenMap.FakeTokens[fakeToken])
 }
 
 // hasAliasQueue 队列是否存在且非空（加锁读取）
 func hasAliasQueue(fakeToken string) bool {
 	return getAliasQueueLen(fakeToken) > 0
-}
-
-// isAliasExhausted 读取alias的exhausted状态。
-// stateMap 中不存在的 alias 视为"已耗尽"（保守策略），避免转发到未初始化的 alias。
-func isAliasExhausted(alias string) bool {
-	mu.Lock()
-	defer mu.Unlock()
-	st := stateMap[alias]
-	if st == nil {
-		log.Printf("[state] alias=%s has no state -> treat as exhausted (conservative)", alias)
-		return true
-	}
-	return st.Exhausted
 }
 
 // incrementCount count型alias请求计数+1，返回新的count；同时若达到limit则标记exhaust
@@ -155,7 +179,7 @@ func incrementCount(alias string) (int, bool) {
 		return 0, false
 	}
 	st.Count++
-	stateDirty = true
+	markDirty()
 	if cfg.Limit > 0 && st.Count >= cfg.Limit {
 		st.Exhausted = true
 		if st.RecoveryCron == "" && cfg.RefreshCron != "" {
@@ -208,7 +232,7 @@ func applyAvailabilityResult(alias string, res AvailabilityResult) bool {
 			}
 		}
 	}
-	stateDirty = true
+	markDirty()
 	return res.Exhausted
 }
 
@@ -218,6 +242,11 @@ func applyAvailabilityResult(alias string, res AvailabilityResult) bool {
 
 // handler 主请求处理：fakeToken -> alias队列轮转
 func handler(w http.ResponseWriter, r *http.Request) {
+	// 全局并发上限：acquire 一个令牌，defer 保证释放（含 panic 路径）。
+	// 通道满时阻塞排队，而非无限开新 goroutine，防止高并发下资源爆炸。
+	reqSem <- struct{}{}
+	defer func() { <-reqSem }()
+
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-goog-api-key")
@@ -311,29 +340,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		client = streamClient
 	}
 
-	// alias 队列轮转：最多尝试 maxAttempts 次（避免全部exhaust时无限循环）
+	// alias 队列轮转：最多尝试 maxAttempts 次（每次 attempt 对应一次真实上游请求 + 可能的后续重试）。
+	// 原子挑选由 pickFirstAvailableAlias 一次加锁完成：跳过所有已 exhausted 的前置 alias（移到队尾），
+	// 返回首个可用 alias 及其配置快照，消除原 pickFirst→isExhausted→rotate 三次加锁间的 TOCTOU 竞态。
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		alias := pickFirstAlias(fakeToken)
+		alias, aliasCfg, rotated := pickFirstAvailableAlias(fakeToken)
+		if len(rotated) > 0 {
+			log.Printf("[ROTATE] fakeToken=%s skipped exhausted aliases=%v (attempt=%d)",
+				maskFakeToken(fakeToken), rotated, attempt+1)
+		}
 		if alias == "" {
+			// 整队列不可用（含配置缺失兜底）——提前返回 503，避免空转 maxAttempts 次
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "No available alias"})
 			return
 		}
-		// 队列首部alias已exhaust → 轮转到队尾，尝试下一个alias
-		if isAliasExhausted(alias) {
-			log.Printf("[ROTATE] fakeToken=%s alias=%s exhausted -> rotate (attempt=%d)", maskFakeToken(fakeToken), alias, attempt+1)
-			rotateAliasToEnd(fakeToken, alias)
-			continue
-		}
-
-		// 取alias配置
-		aliasCfg := getAliasConfig(alias)
-		if aliasCfg == nil {
-			// 配置缺失，直接当作exhaust处理并轮转
-			log.Printf("[ROTATE] alias=%s config missing -> rotate", alias)
-			applyAvailabilityResult(alias, fallbackResult(nil))
-			rotateAliasToEnd(fakeToken, alias)
-			continue
-		}
+		// aliasCfg 由 pickFirstAvailableAlias 一次性快照返回，无需再次单独加锁读 getAliasConfig
 
 		// 构造目标请求
 		query := r.URL.Query()
@@ -370,6 +391,16 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		// Issue 1: 移除循环内 defer cancelReq()，改在每个退出分支显式调用
 		reqCtx, cancelReq := context.WithCancel(r.Context())
+		// 流式请求加 maxStreamLife 生命周期硬上限：即便空闲监控 goroutine 在边界情况未触发，
+		// 到期也会取消上游连接，避免 goroutine 无限堆积。
+		// lifeCtx 派生自 reqCtx，过期会触发 reqCtx(=lifeCtx).Done() → 中断 resp.Body.Read
+		// 同时通知 idle 监控 goroutine 退出。
+		if isStream {
+			lifeCtx, lifeCancel := context.WithTimeout(reqCtx, maxStreamLife)
+			origCancel := cancelReq
+			reqCtx = lifeCtx
+			cancelReq = func() { lifeCancel(); origCancel() }
+		}
 		req, err := http.NewRequestWithContext(reqCtx, r.Method, targetURL, bodyReader)
 		if err != nil {
 			cancelReq()
@@ -400,18 +431,20 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[RES] %s %s -> %d (%dms) alias=%s",
 			r.Method, maskURL(r.URL.String()), resp.StatusCode, time.Since(start).Milliseconds(), alias)
 
-		// 可用性错误 → 触发可用性检查
+		// 可用性错误 → 触发可用性检查（singleflight 去重：同一 alias 并发触发只执行一次真实 provider 调用）
 		if isAvailabilityError(resp.StatusCode) {
 			// 先把错误响应体读出来（错误响应通常很小）
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			// 调用可用性检查（count型走自身判断；其它调用provider）
-			var stCopy *AvailabilityState
-			mu.Lock()
-			stCopy = stateMap[alias]
-			mu.Unlock()
-			res := checkAvailability(alias, aliasCfg.Availability, stCopy)
+			// 调用可用性检查（count型走自身判断；其它调用provider），用 singleflight 合并同 alias 并发调用
+			res := availSF.Do(alias, func() AvailabilityResult {
+				var stCopy *AvailabilityState
+				mu.RLock()
+				stCopy = stateMap[alias]
+				mu.RUnlock()
+				return checkAvailability(alias, aliasCfg.Availability, stCopy)
+			})
 			exhausted := applyAvailabilityResult(alias, res)
 
 			if exhausted {

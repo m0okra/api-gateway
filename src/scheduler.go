@@ -25,13 +25,13 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 		select {
 		case <-stopCh:
 			// 退出前若有未保存状态则保存
-			if dirty := func() bool {
-				mu.Lock()
-				defer mu.Unlock()
+if dirty := func() bool {
+				mu.RLock()
+				defer mu.RUnlock()
 				return stateDirty
 			}(); dirty {
-				if err := saveState(); err != nil {
-					log.Printf("[scheduler] final save failed: %v", err)
+			if err := saveState(); err != nil {
+				log.Printf("[scheduler] final save failed: %v", err)
 				} else {
 					log.Printf("[scheduler] final state saved")
 				}
@@ -40,13 +40,13 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 		case now := <-ticker.C:
 			checkRecovery(now)
 		case <-saveTicker.C:
-			if dirty := func() bool {
-				mu.Lock()
-				defer mu.Unlock()
+if dirty := func() bool {
+				mu.RLock()
+				defer mu.RUnlock()
 				return stateDirty
 			}(); dirty {
-				if err := saveState(); err != nil {
-					log.Printf("[scheduler] save state failed: %v", err)
+			if err := saveState(); err != nil {
+				log.Printf("[scheduler] save state failed: %v", err)
 				} else {
 					log.Printf("[scheduler] state saved")
 				}
@@ -61,7 +61,7 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 //     （RecoveryAt 为零值视为旧文件迁移，立即触发一次 provider 检查）
 //     统一受 recoveryMinGap 约束，防止短时间内重复触发
 func checkRecovery(now time.Time) {
-	mu.Lock()
+	mu.RLock()
 	// 复制一份需要触发的alias名，避免长时间持锁且不持有 state 指针
 	var toRecover []string
 	for name, st := range stateMap {
@@ -95,7 +95,7 @@ func checkRecovery(now time.Time) {
 		}
 		toRecover = append(toRecover, name)
 	}
-	mu.Unlock()
+	mu.RUnlock()
 
 	for _, name := range toRecover {
 		recoverAlias(name, now)
@@ -119,24 +119,28 @@ func recoverAlias(name string, now time.Time) {
 		cur.Count = 0
 		cur.Exhausted = false
 		cur.LastRecovery = now
-		stateDirty = true
+		markDirty()
 		mu.Unlock()
 		log.Printf("[recover] alias=%s count reset (exhausted=false)", name)
 		return
 	}
 
-	// usage/balance/fallback型：先做值拷贝快照，释放锁后调用provider校验
+	// usage/balance/fallback型：先做值拷贝快照，释放锁后调用provider校验。
+	// 用 availSF singleflight 合并：若 handler 路径正在对同一 alias 做可用性检查，
+	// 这里复用其结果，避免并发对外部 provider 发起重复请求。
 	stCopy := *cur
 	mu.Unlock()
 
-	res := checkAvailability(name, cfg, &stCopy)
+	res := availSF.Do(name, func() AvailabilityResult {
+		return checkAvailability(name, cfg, &stCopy)
+	})
 	applyAvailabilityResult(name, res) // 内部自带锁，会更新 Exhausted 等字段
 
 	// 统一写入 LastRecovery 与 dirty
 	mu.Lock()
 	if cur = stateMap[name]; cur != nil {
 		cur.LastRecovery = now
-		stateDirty = true
+		markDirty()
 	}
 	mu.Unlock()
 	log.Printf("[recover] alias=%s rechecked by provider (exhausted=%v)", name, res.Exhausted)

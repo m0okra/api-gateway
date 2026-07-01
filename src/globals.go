@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,11 +17,21 @@ import (
 var (
 	tokenMap   *TokenMapConfig
 	stateMap   map[string]*AvailabilityState
-	mu         sync.Mutex // 保护 tokenMap.FakeTokens 队列与 stateMap
+	mu         sync.RWMutex // 保护 tokenMap.FakeTokens 队列与 stateMap；读多写少用 RWMutex
 	stateDirty bool
+	// stateGen 代际计数器：每次标记脏时自增。saveState 快照后据此判断提交期间是否有新变更，
+	// 避免误清 stateDirty 导致快照后产生的写入丢失。需在持 mu 写锁时操作。
+	stateGen atomic.Uint64
 	dbPath     = "gateway.db"
 	db         *sql.DB
 	cronCache  = newCronLRU(cronCacheCap) // cron 表达式解析缓存（LRU）
+	// reqSem 并发请求信号量（channel semaphore）。在 main 初始化为容量 maxConcurrentReqs。
+	// handler 入口 acquire（写入），defer release（读出），实现全局并发上限保护。
+	reqSem chan struct{}
+
+	// availSF 可用性检查 singleflight：同一 alias 的并发 provider 检查合并为一次实际调用，
+	// 避免上游批量返回 401/429 时对同一 alias 发起重复外部 HTTP 检查风暴。
+	availSF = newAvailSingleFlight()
 )
 
 // ============================================================================
