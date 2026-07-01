@@ -125,6 +125,20 @@ func recoverAlias(name string, now time.Time) {
 		return
 	}
 
+	// 无 availability 配置：没有 provider 可校验，到达 RecoveryAt 即直接自动恢复，
+	// 不调用 checkAvailability/fallbackResult（否则沿用已过期的 RecoveryAt 形成 60s 死循环）。
+	// 清零 RecoveryAt 防止下次 exhaust 时 fallbackResult 沿用过期旧值导致振荡。
+	if cfg == nil {
+		cur.Exhausted = false
+		cur.RecoveryAt = time.Time{}
+		cur.RecoveryCron = ""
+		cur.LastRecovery = now
+		markDirty()
+		mu.Unlock()
+		log.Printf("[recover] alias=%s no-config auto-recovered (exhausted=false)", name)
+		return
+	}
+
 	// usage/balance/fallback型：先做值拷贝快照，释放锁后调用provider校验。
 	// 用 availSF singleflight 合并：若 handler 路径正在对同一 alias 做可用性检查，
 	// 这里复用其结果，避免并发对外部 provider 发起重复请求。

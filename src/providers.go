@@ -126,7 +126,8 @@ func checkDeepSeekBalance(aliasName string, st *AvailabilityState) AvailabilityR
 	res := AvailabilityResult{Balance: bal, Exhausted: bal <= 0}
 	if bal <= 0 {
 		// 余额耗尽，30min后复查（DeepSeek 未返回重置时间，使用默认间隔）
-		if st != nil && !st.RecoveryAt.IsZero() {
+		// 仅当上次设的复查时间点尚未到期时沿用，避免沿用已过期旧值导致每 60s 死循环重试
+		if st != nil && !st.RecoveryAt.IsZero() && time.Now().Before(st.RecoveryAt) {
 			res.RecoveryAt = st.RecoveryAt
 		} else {
 			res.RecoveryAt = time.Now().Add(defaultBalanceRecoverGap)
@@ -200,8 +201,8 @@ func checkOpenCodeGoUsage(aliasName string, cfg *AvailabilityConfig, st *Availab
 
 	res := AvailabilityResult{Exhausted: exhausted, Tiers: tiers}
 	if exhausted {
-		if st != nil && !st.RecoveryAt.IsZero() {
-			// 已有下次复查时间点，沿用避免每次检查都后延
+		if st != nil && !st.RecoveryAt.IsZero() && time.Now().Before(st.RecoveryAt) {
+			// 已有下次复查时间点且尚未到期，沿用避免每次检查都后延
 			res.RecoveryAt = st.RecoveryAt
 		} else {
 			// 在所有已耗尽的层级中选取最长的 resetInSec 作为下次检查间隔。
