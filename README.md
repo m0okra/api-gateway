@@ -96,12 +96,15 @@ api-gateway -p 9090
 
 `count` 类型的 `limit` 若为 `0`（或未配置），表示无上限，计数永不触发 exhaust。
 
+未声明 `type` 的 alias 默认使用 `none` 类型（不统计，永不耗尽）。
+
 | 类型 | 含义 | exhaust 条件 | 恢复依据 |
-|---|---|---|---|
+|---|---|---|---|---|
+| `none` | 不统计（默认） | 永不 exhaust | 无（透传所有错误，不进入恢复调度） |
 | `count` | 请求次数限流 | `count >= limit` | `RecoveryCron`（cron 周期匹配 = `RefreshCron`），按表达式定时重置 count |
 | `balance` | 余额型 | provider 返回 balance ≤ 0 | `RecoveryAt`（精确时间点），由 provider 按最长的 resetInSec 设定 |
 | `usage` | 用量型 | provider 返回任一层级 ≥ 100% | `RecoveryAt`（精确时间点），由 provider 按已耗尽层级最长的 resetInSec 设定 |
-| `fallback` | 兜底（始终视为耗尽） | 始终 exhaust | `RecoveryAt`（精确时间点），默认 30min 后复查 |
+| `exhaust` | 始终耗尽（需显式声明） | 始终 exhaust | `RecoveryAt`（精确时间点），默认 30min 后复查 |
 
 ### 请求流程
 
@@ -157,13 +160,13 @@ client → 网关 (带 fakeToken)
 - 表结构：`aliases`（配置列 + 运行时状态列同行）、`alias_tiers`（usage 型层级配置+状态）、`alias_extra`（Extra map）、`fake_tokens`（fakeToken→有序 alias 队列，priority=队列下标）。
 - 恢复调度依据按类型二选一：
   - **count 型**：`RecoveryCron`（cron 表达式，对应配置的 `RefreshCron`）
-  - **usage/balance/fallback 型**：`RecoveryAt`（精确时间点 `time.Time`，由 provider 在 exhaust 时设定）
+  - **usage/balance/exhaust 型**：`RecoveryAt`（精确时间点 `time.Time`，由 provider 在 exhaust 时设定）
 - 内存中维护 `stateDirty` 标志与 `stateGen` 代际计数器（`atomic.Uint64`），每 5min 检查并写入。
 - `saveState()` 优化为锁内快照 → 锁外 I/O：在写锁内深拷贝 state 快照并记录代际后立即释放锁，SQLite 事务在锁外执行；提交后再次取锁，仅当代际未变（无新写入）才清 dirty，避免写库期间（可能数百 ms）阻塞所有请求。
 - 调度器退出前 final save 确保持久化一致性；main 通过 `schedDone` channel 等待 final save 完成后再 `db.Close()`，避免事务被截断。
 - 启动时清理 FakeTokens 队列中 Aliases 不存在的 alias（配置一致性保护）。
 - 运行时 alias 队列轮转顺序不持久化（重启恢复 `fake_tokens.priority` 定义的配置顺序）。
-- 旧文件迁移：usage/balance/fallback 型旧 `RecoveryCron` 字段在重启后被忽略，`RecoveryAt` 为零值触发立即复查，首次写入后清空旧字段。
+- 旧文件迁移：usage/balance/exhaust 型旧 `RecoveryCron` 字段在重启后被忽略，`RecoveryAt` 为零值触发立即复查，首次写入后清空旧字段。
 
 ### 配置导入导出
 
@@ -250,13 +253,13 @@ curl http://localhost:9090/status
 
 解析结果缓存在容量 256 的 LRU 中，避免重启后反复解析相同表达式。
 
-#### usage/balance/fallback 型 — 精确时间点 RecoveryAt
+#### usage/balance/exhaust 型 — 精确时间点 RecoveryAt
 
 由 provider 在 exhaust 检查时计算下一次复查时间点：
 
 - **OpenCode-Go 用量型**：在已耗尽（usagePercent ≥ 100）的 rolling/weekly/monthly 层级中，选取最长的 `resetInSec` 作为间隔，设为 `RecoveryAt = now + maxReset`。因为只要任一层级仍耗尽，整体就不可用，必须等最慢的那个层级恢复。
 - **DeepSeek 余额型**：余额 ≤ 0 时设为 `now + 30min`。
-- **兜底 fallback**：设为 `now + 30min`。
+- **兜底 exhaust**：设为 `now + 30min`。
 - 当 provider 返回的 `resetInSec` 异常（≤ 0）时，使用 `minRecoverGap = 60s` 地板保护，防止死循环。
 
 调度器每 1s 遍历所有 exhausted alias，检查 `now >= RecoveryAt`（零值视为旧文件迁移，立即触发）。触发后调用 provider 复查，返回新的 exhausted 状态和 `RecoveryAt`；若已恢复则清除 exhausted，alias 重新参与请求轮转。
@@ -304,12 +307,12 @@ curl http://localhost:9090/status
 
 ### providers.go
 
-- `checkAvailability`：入口分发，按 `availCount` / `availBalance` / `availUsage` / `availFallback` 调用对应逻辑
+- `checkAvailability`：入口分发，按 `availCount` / `availBalance` / `availUsage` / `availExhaust` / `availPassthrough` 调用对应逻辑（无配置或未知类型默认走 none 型）
 - `checkDeepSeekBalance`：GET `/user/balance`，解析 `total_balance`；余额耗尽时返回 `RecoveryAt = now + 30min`
 - `checkOpenCodeGoUsage`：GET `/_server`，解析 rolling/weekly/monthly 三级用量；在所有已耗尽层级（usagePercent ≥ 100）中取最长 `resetInSec`，返回 `RecoveryAt = now + maxReset`
   - rolling 若不匹配直接 fallback（opencode API 必返回 rolling）
   - weekly/monthly 可能缺失，不影响逻辑
-- 其他 provider（Kimi / OpenRouter / Claude / Codex / Gemini / ZAI / MiniMax）仅框架返回 fallback
+- 其他 provider（Kimi / OpenRouter / Claude / Codex / Gemini / ZAI / MiniMax）仅框架返回 exhaust（始终耗尽+30min 复查）
 - `httpGetJSON` / `httpGetText` 使用共享 `defaultClient`
 
 ### scheduler.go
@@ -317,7 +320,7 @@ curl http://localhost:9090/status
 - `runScheduler`：主循环 select ticker（1s 恢复检查）与 saveTicker（5min 状态保存）；通过 `done` channel 通知 main 已完成 final save
 - `checkRecovery`：遍历 all alias，按类型分流：
   - **count 型**：`RecoveryCron` cron 周期匹配
-  - **usage/balance/fallback 型**：`now >= RecoveryAt` 时间点触发（零值为旧文件迁移，立即触发）
+  - **usage/balance/exhaust 型**：`now >= RecoveryAt` 时间点触发（零值为旧文件迁移，立即触发）
   - 统一受 `recoveryMinGap`（60s）约束，避免短时间重复触发
 - `recoverAlias`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
 

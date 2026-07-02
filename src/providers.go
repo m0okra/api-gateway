@@ -15,15 +15,15 @@ import (
 // ============================================================================
 // 可用性Provider：参考cclimits.py，使用alias的token；额外内容从Extra读
 //   - usage/balance型：调用对应provider查询
-//   - 出问题走兜底逻辑
+//   - 出问题时按类型处理
 // ============================================================================
 
 // checkAvailability 根据 alias 配置与当前 state 执行可用性检查，返回是否exhaust
-// 若检查过程出错，走兜底逻辑（返回exhausted=true）
+// 若检查过程出错，按类型处理（none 型透传，其余走 exhaust 兜底）
 func checkAvailability(aliasName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
 	if cfg == nil {
-		// 无配置 → 兜底
-		return fallbackResult(st)
+		// 无配置 → 默认不统计（none 型），永不耗尽、透传所有错误
+		return AvailabilityResult{}
 	}
 
 	switch cfg.Type {
@@ -38,12 +38,15 @@ func checkAvailability(aliasName string, cfg *AvailabilityConfig, st *Availabili
 	case availUsage:
 		return checkUsageProvider(cfg.Provider, aliasName, cfg, st)
 
-	case availFallback:
+	case availExhaust:
 		return fallbackResult(st)
 
+	case availPassthrough:
+		return AvailabilityResult{}
+
 	default:
-		// 未知类型走兜底
-		return fallbackResult(st)
+		// 未知类型 → 默认不统计（安全兜底，永不耗尽）
+		return AvailabilityResult{}
 	}
 }
 

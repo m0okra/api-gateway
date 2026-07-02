@@ -15,8 +15,8 @@ const (
 	recoveryMinGap        = 60 * time.Second // 同一alias两次恢复触发之间的最小间隔，防止死循环
 	streamIdleTimeout     = 5 * time.Minute  // 流式响应空闲读超时，超过则取消上游连接
 
-	// 以下为非 count 型（usage/balance/fallback）恢复调度的时间兜底值
-	defaultFallbackRecoverGap = 30 * time.Minute // fallback 兜底下次复查间隔
+	// 以下为非 count 型（usage/balance/exhaust）恢复调度的时间兜底值
+	defaultFallbackRecoverGap = 30 * time.Minute // exhaust 兜底下次复查间隔
 	defaultBalanceRecoverGap  = 30 * time.Minute // balance provider 未提供 reset 时默认间隔
 	minRecoverGap             = 60 * time.Second // provider resetInSec 异常时的地板保护
 
@@ -30,10 +30,11 @@ const (
 
 // 可用性类型
 const (
-	availCount    = "count"
-	availUsage    = "usage"
-	availBalance  = "balance"
-	availFallback = "fallback"
+	availCount       = "count"
+	availUsage       = "usage"
+	availBalance     = "balance"
+	availExhaust     = "exhaust"
+	availPassthrough = "none"
 )
 
 // maxBodySize 限制单次请求体大小，避免恶意超大body导致OOM

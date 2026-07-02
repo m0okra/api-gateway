@@ -9,7 +9,7 @@ import (
 // 调度goroutine：exhaust恢复 + 状态保存检查
 //   - 每1s：检查每个alias的恢复调度依据
 //       count型 → RecoveryCron 周期匹配
-//       usage/balance/fallback型 → now >= RecoveryAt 时间点触发
+//       usage/balance/exhaust型 → now >= RecoveryAt 时间点触发
 //     且距上次实际触发 > recoveryMinGap，触发恢复
 //   - 每5min：检查 dirty flag，为true则保存
 // ============================================================================
@@ -57,7 +57,7 @@ if dirty := func() bool {
 
 // checkRecovery 遍历所有alias，判断是否触发恢复：
 //   - count型：RecoveryCron 周期匹配
-//   - usage/balance/fallback型：now >= RecoveryAt 时间点触发
+//   - usage/balance/exhaust型：now >= RecoveryAt 时间点触发
 //     （RecoveryAt 为零值视为旧文件迁移，立即触发一次 provider 检查）
 //     统一受 recoveryMinGap 约束，防止短时间内重复触发
 func checkRecovery(now time.Time) {
@@ -84,7 +84,7 @@ func checkRecovery(now time.Time) {
 				continue
 			}
 		} else {
-			// usage/balance/fallback型：按精确时间点触发
+			// usage/balance/exhaust型：按精确时间点触发
 			if !st.RecoveryAt.IsZero() && now.Before(st.RecoveryAt) {
 				continue
 			}
@@ -125,9 +125,9 @@ func recoverAlias(name string, now time.Time) {
 		return
 	}
 
-	// 无 availability 配置：没有 provider 可校验，到达 RecoveryAt 即直接自动恢复，
-	// 不调用 checkAvailability/fallbackResult（否则沿用已过期的 RecoveryAt 形成 60s 死循环）。
-	// 清零 RecoveryAt 防止下次 exhaust 时 fallbackResult 沿用过期旧值导致振荡。
+	// 无 availability 配置（旧版隐式 exhaust 迁移场景）：到达 RecoveryAt 即直接自动恢复，
+	// 不调用 checkAvailability（否则沿用已过期的 RecoveryAt 形成 60s 死循环）。
+	// 清零 RecoveryAt 防止下次 exhaust 时沿用过期旧值导致振荡。
 	if cfg == nil {
 		cur.Exhausted = false
 		cur.RecoveryAt = time.Time{}
@@ -139,7 +139,7 @@ func recoverAlias(name string, now time.Time) {
 		return
 	}
 
-	// usage/balance/fallback型：先做值拷贝快照，释放锁后调用provider校验。
+	// usage/balance/exhaust型：先做值拷贝快照，释放锁后调用provider校验。
 	// 用 availSF singleflight 合并：若 handler 路径正在对同一 alias 做可用性检查，
 	// 这里复用其结果，避免并发对外部 provider 发起重复请求。
 	stCopy := *cur

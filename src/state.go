@@ -327,10 +327,16 @@ func reconcileStateWithConfig() {
 			st.Count = 0
 			st.Balance = 0
 			st.RecoveryCron = ""
-		case availFallback:
+		case availExhaust:
 			st.Count = 0
 			st.Balance = 0
 			st.Tiers = nil
+			st.RecoveryCron = ""
+		case availPassthrough:
+			st.Count = 0
+			st.Balance = 0
+			st.Tiers = nil
+			st.RecoveryAt = time.Time{}
 			st.RecoveryCron = ""
 		}
 		// 2) count limit 下调：count >= limit 立即标记 exhaust

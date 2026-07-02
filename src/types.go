@@ -24,9 +24,9 @@ type AliasConfig struct {
 	Extra map[string]string `json:"extra,omitempty"`
 }
 
-// AvailabilityConfig 可用性配置，对应4种基础类型
+// AvailabilityConfig 可用性配置，对应5种基础类型
 type AvailabilityConfig struct {
-	Type string `json:"type"` // count|usage|balance|fallback
+	Type string `json:"type"` // count|usage|balance|exhaust|none
 
 	// count型参数
 	Limit       int    `json:"limit,omitempty"`
@@ -58,7 +58,7 @@ type AvailabilityState struct {
 
 	// 恢复调度依据（两选一）：
 	//   - count 型：RecoveryCron 等于配置的 RefreshCron，调度器按 cron 周期匹配触发重置
-	//   - usage/balance/fallback 型：RecoveryAt 为下次 provider 复查时间点，
+	//   - usage/balance/exhaust 型：RecoveryAt 为下次 provider 复查时间点，
 	//     由 provider 在 exhaust 时基于最长 resetInSec 设定（精确一次性定时）
 	RecoveryCron string    `json:"recoveryCron,omitempty"`
 	RecoveryAt   time.Time `json:"recoveryAt,omitempty"`
@@ -82,7 +82,7 @@ type AvailabilityResult struct {
 	Tiers   []TierState
 	// RecoveryCron 仅count型使用，对应配置的 RefreshCron
 	RecoveryCron string
-	// RecoveryAt 仅usage/balance/fallback型使用，下次 provider 复查时间点
+	// RecoveryAt 仅usage/balance/exhaust型使用，下次 provider 复查时间点
 	RecoveryAt time.Time
 }
 

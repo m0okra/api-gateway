@@ -215,7 +215,7 @@ func applyAvailabilityResult(alias string, res AvailabilityResult) bool {
 		}
 		st.RecoveryAt = time.Time{}
 	} else {
-		// usage/balance/fallback型：恢复依据是精确时间点 RecoveryAt
+		// usage/balance/exhaust型：恢复依据是精确时间点 RecoveryAt
 		if !res.RecoveryAt.IsZero() {
 			st.RecoveryAt = res.RecoveryAt
 		} else if res.Exhausted {
