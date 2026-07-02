@@ -242,6 +242,8 @@ curl http://localhost:9090/status
 
 ### 恢复调度机制
 
+> **时区说明**：两种恢复机制均按**服务器本地时区**处理。cron 表达式按本地时区匹配，`RecoveryAt` 以带本地 offset 的 RFC3339 格式存储。可通过设置进程的 `TZ` 环境变量调整时区（如 `TZ=Asia/Shanghai`）。
+
 #### count 型 — Cron 周期匹配
 
 使用 6 字段 cron 表达式（秒 分 时 日 月 周），支持 `*` / `*/N` / `N` / `a-b` / `a,b,c` / `a-b/S`。`RecoveryCron` 直接取配置的 `RefreshCron`。调度器每 1s 匹配当前时间，命中且距上次恢复 ≥ `recoveryMinGap`（60s）时触发重置计数。

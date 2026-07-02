@@ -347,7 +347,7 @@ func formatTime(t time.Time) sql.NullString {
 	if t.IsZero() {
 		return sql.NullString{}
 	}
-	return sql.NullString{String: t.UTC().Format(time.RFC3339Nano), Valid: true}
+	return sql.NullString{String: t.Format(time.RFC3339Nano), Valid: true}
 }
 
 // saveState 将内存中所有 alias 状态全量写回 SQLite（单事务）。
