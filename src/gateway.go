@@ -438,16 +438,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// count型：请求发出即计数（不论结果），达limit则exhaust
-		if aliasCfg.Availability != nil && aliasCfg.Availability.Type == availCount {
-			_, nowExhausted := incrementCount(alias)
-			if nowExhausted {
-				log.Printf("[COUNT] alias=%s reached limit -> exhaust+rotate", alias)
-				rotateAliasToEnd(fakeToken, alias)
-				// 若响应是可用性错误，继续轮转；否则照常转发响应
-			}
-		}
-
 		log.Printf("[RES] %s %s -> %d (%dms) alias=%s",
 			r.Method, maskURL(r.URL.String()), resp.StatusCode, time.Since(start).Milliseconds(), alias)
 
@@ -490,6 +480,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 			cancelReq()
 			return
+		}
+
+		// count型：仅成功（2xx）且携带 model 名（计费请求）才计数。
+		// 可用性错误 4xx(401/402/403/429) 已在上分支 continue/return，传输错误已提前 return，
+		// 故此处只需额外门禁 modelStr != "" 与状态码 < 300。
+		// 无 model 名（如 /v1/models 列模型、无 body 的查询请求）视为非计费请求，跳过计数。
+		if aliasCfg.Availability != nil && aliasCfg.Availability.Type == availCount &&
+			modelStr != "" && resp.StatusCode < 300 {
+			_, nowExhausted := incrementCount(alias)
+			if nowExhausted {
+				log.Printf("[COUNT] alias=%s reached limit -> exhaust+rotate", alias)
+				rotateAliasToEnd(fakeToken, alias)
+			} else {
+				log.Printf("[COUNT] alias=%s incremented count (status=%d)", alias, resp.StatusCode)
+			}
 		}
 
 		// 成功或其它状态 → 转发响应（不重试）
