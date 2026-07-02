@@ -178,6 +178,68 @@ client → 网关 (带 fakeToken)
 
 典型用途：备份/恢复 `gateway.db`、手工编辑配置后导入、跨环境迁移。导出文件含明文 `realToken`，需自行保护文件权限。
 
+### 状态查询（/status）
+
+`GET /status` 返回当前网关内存运行时状态的脱敏快照，供运维排查使用：
+
+```bash
+curl http://localhost:9090/status
+```
+
+响应体：
+
+```json
+{
+  "aliases": [
+    {
+      "name": "deepseek-aaa",
+      "targetBase": "https://api.deepseek.com",
+      "realToken": "sk-a********aaaa",
+      "availType": "balance",
+      "exhausted": false,
+      "balance": 12.34,
+      "recoveryAt": "0001-01-01T00:00:00Z",
+      "queueFor": ["sk...aa"]
+    },
+    {
+      "name": "gemini",
+      "targetBase": "https://generativelanguage.googleapis.com",
+      "realToken": "AIb********bbbb",
+      "availType": "count",
+      "exhausted": false,
+      "count": 10,
+      "recoveryCron": "0 0 16 * * *",
+      "lastChecked": "2026-06-30T11:53:01.91Z",
+      "queueFor": ["sk...bb"]
+    },
+    {
+      "name": "opencode-go",
+      "targetBase": "https://opencode.ai/zen/go",
+      "realToken": "sk-c********cccc",
+      "availType": "usage",
+      "exhausted": true,
+      "tiers": [
+        {"name": "rolling", "usedPct": 100, "resetInSec": 2592000}
+      ],
+      "recoveryAt": "2026-07-11T09:09:29Z",
+      "queueFor": ["sk...cc"]
+    }
+  ],
+  "fakeTokens": {
+    "sk...aa": ["deepseek-aaa", "gemini"],
+    "sk...cc": ["opencode-go"]
+  }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `aliases` | 每个 alias 的运行时快照（配置+状态） |
+| `aliases[].realToken` | 真实 API Key 脱敏视图（首尾各 4 字符 + `********`） |
+| `aliases[].queueFor` | 该 alias 出现在哪些 fakeToken 队列中（脱敏），便于排障 |
+| `aliases[].tiers` | usage 型的各配额层级用量（count/balance 型无此字段） |
+| `fakeTokens` | 当前 fakeToken → alias 队列映射，fakeToken 名脱敏 |
+
 ### 恢复调度机制
 
 #### count 型 — Cron 周期匹配

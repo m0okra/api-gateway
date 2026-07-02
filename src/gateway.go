@@ -561,3 +561,102 @@ func maskFakeToken(t string) string {
 	}
 	return t[:2] + "..." + t[len(t)-2:]
 }
+
+// ============================================================================
+// /status 端点：暴露运行时状态（脱敏），供运维排查
+// ============================================================================
+
+// statusAlias 单个 alias 的运行时视图（给 /status 用）。
+// realToken 脱敏为首尾各 4 字符，targetBase 完整暴露便于排查路由。
+type statusAlias struct {
+	Name           string         `json:"name"`
+	TargetBase     string         `json:"targetBase"`
+	RealToken      string         `json:"realToken"`
+	AvailType      string         `json:"availType,omitempty"`
+	Exhausted      bool           `json:"exhausted"`
+	Count          int            `json:"count,omitempty"`
+	Balance        float64        `json:"balance,omitempty"`
+	Tiers          []TierState    `json:"tiers,omitempty"`
+	RecoveryCron   string         `json:"recoveryCron,omitempty"`
+	RecoveryAt     time.Time      `json:"recoveryAt,omitempty"`
+	LastRecovery   time.Time      `json:"lastRecovery,omitempty"`
+	LastChecked    time.Time      `json:"lastChecked,omitempty"`
+	QueueFor       []string       `json:"queueFor,omitempty"` // 出现在哪些 fakeToken 队列中（脱敏）
+}
+
+// statusResponse /status 的响应体。
+type statusResponse struct {
+	Aliases    []statusAlias      `json:"aliases"`
+	FakeTokens map[string][]string `json:"fakeTokens"` // fakeToken(脱敏) -> alias 名队列
+}
+
+// handlerStatus 构建内存状态的脱敏快照并通过 /status 返回。
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	mu.RLock()
+
+	// 收集每个 alias 出现在哪些 fakeToken 队列中
+	queueFor := make(map[string][]string)
+	for ft, q := range tokenMap.FakeTokens {
+		ftMasked := maskFakeToken(ft)
+		for _, a := range q {
+			queueFor[a] = append(queueFor[a], ftMasked)
+		}
+	}
+
+	resp := statusResponse{
+		Aliases:    make([]statusAlias, 0, len(tokenMap.Aliases)),
+		FakeTokens: make(map[string][]string, len(tokenMap.FakeTokens)),
+	}
+
+	for name, alias := range tokenMap.Aliases {
+		st := stateMap[name]
+		sa := statusAlias{
+			Name:       name,
+			TargetBase: alias.TargetBase,
+			RealToken:  maskToken(alias.RealToken),
+		}
+		if alias.Availability != nil {
+			sa.AvailType = alias.Availability.Type
+		}
+		if st != nil {
+			sa.Exhausted = st.Exhausted
+			sa.Count = st.Count
+			sa.Balance = st.Balance
+			if len(st.Tiers) > 0 {
+				sa.Tiers = make([]TierState, len(st.Tiers))
+				copy(sa.Tiers, st.Tiers)
+			}
+			sa.RecoveryCron = st.RecoveryCron
+			sa.RecoveryAt = st.RecoveryAt
+			sa.LastRecovery = st.LastRecovery
+			sa.LastChecked = st.LastChecked
+		}
+		if qf, ok := queueFor[name]; ok {
+			sa.QueueFor = qf
+		}
+		resp.Aliases = append(resp.Aliases, sa)
+	}
+
+	for ft, q := range tokenMap.FakeTokens {
+		cq := make([]string, len(q))
+		copy(cq, q)
+		resp.FakeTokens[maskFakeToken(ft)] = cq
+	}
+
+	mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// maskToken 脱敏 realToken：保留首尾各 4 字符，中间用 mask 替代。
+func maskToken(t string) string {
+	if len(t) <= 8 {
+		return t[:2] + mask
+	}
+	return t[:4] + mask + t[len(t)-4:]
+}
