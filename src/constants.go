@@ -19,6 +19,13 @@ const (
 	defaultFallbackRecoverGap = 30 * time.Minute // fallback 兜底下次复查间隔
 	defaultBalanceRecoverGap  = 30 * time.Minute // balance provider 未提供 reset 时默认间隔
 	minRecoverGap             = 60 * time.Second // provider resetInSec 异常时的地板保护
+
+	// providerRetryTimeouts 可用性检查 HTTP 请求的三阶段重试超时（2s + 4s + 8s）。
+	// 短超时快速捕获瞬态抖动，长超时给慢响应留余地；仅网络错误/5xx/429 触发重试，
+	// 2xx 成功直接返回，其他 4xx 视为确定失败不重试。
+	providerRetryStage1 = 2 * time.Second
+	providerRetryStage2 = 4 * time.Second
+	providerRetryStage3 = 8 * time.Second
 )
 
 // 可用性类型

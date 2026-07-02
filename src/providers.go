@@ -278,50 +278,88 @@ func checkMiniMaxUsage(aliasName string, st *AvailabilityState) AvailabilityResu
 	return fallbackResult(st)
 }
 
-// ---- HTTP 工具（使用共享 defaultClient，复用连接）----
+// ---- HTTP 工具（三阶段重试：2s + 4s + 8s，仅网络错误/5xx/429 触发重试）----
 
-func httpGetJSON(reqURL string, headers map[string]string) (map[string]interface{}, int, error) {
+// providerRetryTimeouts 三阶段重试的每阶段超时。
+var providerRetryTimeouts = []time.Duration{providerRetryStage1, providerRetryStage2, providerRetryStage3}
+
+// httpGetRaw 带三阶段重试的 HTTP GET 底层实现。
+// 仅对网络错误（含超时）/ 5xx 服务器错误 / 429 限流重试；
+// 2xx 成功立即返回；其他 4xx（如 401/403）视为确定失败不重试。
+// 每阶段使用独立超时创建 client，共享 Transport 保持连接池复用。
+func httpGetRaw(reqURL string, headers map[string]string) (statusCode int, body []byte, err error) {
+	for stage, t := range providerRetryTimeouts {
+		var code int
+		var data []byte
+		code, data, err = httpGetOnce(reqURL, headers, t)
+		if err != nil {
+			// 网络错误（含超时）：非最后一阶段则重试
+			if stage < len(providerRetryTimeouts)-1 {
+				log.Printf("[AVAIL] provider request stage %d/%d timeout=%s failed: %v -> retrying",
+					stage+1, len(providerRetryTimeouts), t, err)
+				continue
+			}
+			return code, nil, err
+		}
+		// 2xx：确定成功
+		if code >= 200 && code < 300 {
+			return code, data, nil
+		}
+		// 429 / 5xx：服务端临时错误，非最后一阶段则重试
+		if code == 429 || (code >= 500 && code < 600) {
+			if stage < len(providerRetryTimeouts)-1 {
+				log.Printf("[AVAIL] provider request stage %d/%d HTTP %d -> retrying",
+					stage+1, len(providerRetryTimeouts), code)
+				continue
+			}
+			return code, nil, fmt.Errorf("HTTP %d", code)
+		}
+		// 其他 4xx：确定失败，不重试
+		return code, data, nil
+	}
+	return 0, nil, err // unreachable
+}
+
+// httpGetOnce 单次 HTTP GET，使用指定超时。
+func httpGetOnce(reqURL string, headers map[string]string, timeout time.Duration) (int, []byte, error) {
+	client := &http.Client{Timeout: timeout, Transport: sharedTransport}
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
-		return nil, 0, err
+		return 0, nil, err
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := defaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, data, nil
+}
+
+func httpGetJSON(reqURL string, headers map[string]string) (map[string]interface{}, int, error) {
+	code, data, err := httpGetRaw(reqURL, headers)
+	if err != nil {
+		return nil, code, err
 	}
 	var m map[string]interface{}
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("json decode failed: %w", err)
+	if jerr := json.Unmarshal(data, &m); jerr != nil {
+		return nil, code, fmt.Errorf("json decode failed: %w", jerr)
 	}
-	return m, resp.StatusCode, nil
+	return m, code, nil
 }
 
 func httpGetText(reqURL string, headers map[string]string) (string, int, error) {
-	req, err := http.NewRequest("GET", reqURL, nil)
+	code, data, err := httpGetRaw(reqURL, headers)
 	if err != nil {
-		return "", 0, err
+		return "", code, err
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := defaultClient.Do(req)
-	if err != nil {
-		return "", 0, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", resp.StatusCode, err
-	}
-	return string(data), resp.StatusCode, nil
+	return string(data), code, nil
 }
 
 func getAliasConfig(name string) *AliasConfig {

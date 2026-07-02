@@ -46,12 +46,6 @@ var (
 		IdleConnTimeout:     90 * time.Second,
 	}
 
-	// defaultClient 用于provider可用性检查（httpGetJSON/httpGetText）
-	defaultClient = &http.Client{
-		Timeout:   15 * time.Second,
-		Transport: sharedTransport,
-	}
-
 	// proxyClient 用于普通（非流式）反向代理请求
 	proxyClient = &http.Client{
 		Timeout:   120 * time.Second,
