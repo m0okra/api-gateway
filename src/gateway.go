@@ -19,6 +19,10 @@ import (
 
 var keyQueryRegex = regexp.MustCompile(`([?&])key=([^&#]*)`)
 
+// geminiModelRegex 从 Gemini 风格 URL path 中提取模型名，例如
+// /v1beta/models/gemini-2.0-flash:generateContent -> gemini-2.0-flash
+var geminiModelRegex = regexp.MustCompile(`/models/([^:/]+)`)
+
 func maskURL(rawURL string) string {
 	return keyQueryRegex.ReplaceAllString(rawURL, "${1}key="+mask)
 }
@@ -320,13 +324,29 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	isStream := strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
 		r.URL.Query().Get("alt") == "sse"
-	if hasBody && !isStream {
+	// 解析请求体提取 stream 标志与 model 字段；body 非 JSON 则静默忽略。
+	// 无条件解析（不再依赖 !isStream）：仅靠 Accept 头判为 SSE 的请求同样
+	// 需要从 body 读取 stream/model，顺带补齐原逻辑缺口。
+	var modelStr string
+	if hasBody {
 		var bodyMap map[string]interface{}
 		if json.Unmarshal(bodyBytes, &bodyMap) == nil {
 			if s, ok := bodyMap["stream"].(bool); ok && s {
 				isStream = true
 			}
+			if m, ok := bodyMap["model"].(string); ok {
+				modelStr = m
+			}
 		}
+	}
+	// body 无 model（如 Gemini 风格）→ 回退从 URL path 提取模型名
+	if modelStr == "" {
+		if m := geminiModelRegex.FindStringSubmatch(r.URL.Path); m != nil {
+			modelStr = m[1]
+		}
+	}
+	if modelStr != "" {
+		log.Printf("  model: %s", modelStr)
 	}
 
 	// 判断 token 注入方式（与原实现一致：query key / goog header / x-api-key / bearer）
