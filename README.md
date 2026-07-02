@@ -99,7 +99,7 @@ api-gateway -p 9090
 未声明 `type` 的 alias 默认使用 `none` 类型（不统计，永不耗尽）。
 
 | 类型 | 含义 | exhaust 条件 | 恢复依据 |
-|---|---|---|---|---|
+|---|---|---|---|
 | `none` | 不统计（默认） | 永不 exhaust | 无（透传所有错误，不进入恢复调度） |
 | `count` | 请求次数限流 | `count >= limit` | `RecoveryCron`（cron 周期匹配 = `RefreshCron`），按表达式定时重置 count |
 | `balance` | 余额型 | provider 返回 balance ≤ 0 | `RecoveryAt`（精确时间点），由 provider 按最长的 resetInSec 设定 |
