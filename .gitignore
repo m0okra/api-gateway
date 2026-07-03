@@ -2,3 +2,5 @@ api-gateway.exe
 gateway.db
 gateway.db-shm
 gateway.db-wal
+
+aliases.json

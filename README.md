@@ -15,6 +15,7 @@ src/
 ├── providers.go       可用性 Provider：DeepSeek 余额、OpenCode-Go 用量等检查实现
 ├── state.go           状态管理：从 SQLite 加载/保存（锁外 I/O 快照写）、一致性协调
 ├── scheduler.go       定时调度：exhaust 恢复检查 + 状态持久化触发
+├── aliases.go         模型别名：从 aliases.json 加载别名映射（不存在则禁用）
 └── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、流式响应
 ```
 
@@ -38,6 +39,7 @@ go build -o api-gateway.exe .
 |---|---|
 | `-p` / `-port` | 运行端口，默认 `9090` |
 | `-db` | SQLite 数据库文件路径，默认 `gateway.db` |
+| `-aliases` | 模型别名配置文件路径，默认 `aliases.json`（文件不存在则禁用别名功能） |
 | `-e <file>` / `-export <file>` | 将 `-db` 库全量导出为 JSON 文件后退出（不启动服务器） |
 | `-i <file>` / `-import <file>` | 将 JSON 文件全量导入 `-db` 库后退出（不启动服务器，全量覆盖） |
 
@@ -181,6 +183,30 @@ client → 网关 (带 fakeToken)
 
 典型用途：备份/恢复 `gateway.db`、手工编辑配置后导入、跨环境迁移。导出文件含明文 `realToken`，需自行保护文件权限。
 
+### 模型别名
+
+通过 `aliases.json` 文件提供请求模型名 → 上游真实模型名的映射，用于在转发前重写请求中的模型名。**默认不启用**：仅当 `-aliases` 指定的文件（默认 `aliases.json`，相对工作目录）存在时启用；文件不存在则别名功能保持禁用，请求原样转发。
+
+文件格式为 `map[string]string`，key 与 value 均为字符串：
+
+```json
+{
+  "gpt-4-turbo": "gpt-4",
+  "claude-3-opus": "claude-3-opus-20240229",
+  "gemini-pro": "gemini-1.5-pro"
+}
+```
+
+替换规则：
+
+- 仅当请求中提取到模型名（body 的 `model` 字段，或 Gemini 风格 URL path `/models/{name}`）且该模型名命中 `aliases.json` 的 key 时，替换为对应 value。
+- 同时覆盖三种 API 风格：
+  - OpenAI/Anthropic 风格：重写请求体 JSON 的 `model` 字段（重新序列化 body，`Content-Length` 由 transport 自动重算）。
+  - Gemini 风格：重写 URL path 中的模型名段（如 `/v1beta/models/gemini-pro:generateContent` → `/v1beta/models/gemini-1.5-pro:generateContent`）。
+- **不处理模型列表请求**（如 `GET /v1/models`）：此类请求无模型名，天然跳过替换。
+- body 非 JSON 或 `model` 字段非字符串时静默跳过 body 重写（不影响 URL path 重写）。
+- 仅在启动时一次性加载，运行期只读；修改 `aliases.json` 后需重启生效。文件解析失败时记录错误日志并禁用别名功能（不阻断启动）。
+
 ### 状态查询（/status）
 
 `GET /status` 返回当前网关内存运行时状态的脱敏快照，供运维排查使用：
@@ -323,6 +349,10 @@ curl http://localhost:9090/status
   - **usage/balance/exhaust 型**：`now >= RecoveryAt` 时间点触发（零值为旧文件迁移，立即触发）
   - 统一受 `recoveryMinGap`（60s）约束，避免短时间重复触发
 - `recoverUpstream`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
+
+### aliases.go
+
+- `loadAliases`：启动期一次性加载 `-aliases` 指定的 JSON 文件为 `map[string]string` 并赋值全局 `aliases`。文件不存在 → `aliases` 保持 nil（禁用，非错误）；解析失败 → 记录错误日志且 `aliases` 保持 nil（禁用，不阻断启动）；加载成功 → `aliases` 非 nil（含空 map）视为已启用。运行期只读，无锁。
 
 ### gateway.go
 

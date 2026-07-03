@@ -32,6 +32,11 @@ var (
 	// availSF 可用性检查 singleflight：同一 upstream 的并发 provider 检查合并为一次实际调用，
 	// 避免上游批量返回 401/429 时对同一 upstream 发起重复外部 HTTP 检查风暴。
 	availSF = newAvailSingleFlight()
+
+	// aliases 模型别名映射：key 为请求中的模型名，value 为转发到上游时替换后的真实模型名。
+	// nil 表示别名功能未启用（aliases.json 不存在或解析失败）；非 nil（含空 map）表示已启用。
+	// 仅在启动时由 loadAliases 一次性加载，运行期只读，故无锁访问。
+	aliases map[string]string
 )
 
 // ============================================================================

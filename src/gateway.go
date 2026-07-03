@@ -349,6 +349,34 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  model: %s", modelStr)
 	}
 
+	// 模型别名替换：仅在 aliases.json 已加载（aliases != nil）且提取到模型名时执行。
+	// /v1/models 等无模型名请求因 modelStr == "" 天然跳过，无需额外特判。
+	// 同时处理 body 的 model 字段（OpenAI/Anthropic 风格）与 URL path 中的模型名
+	// （Gemini 风格 /v1beta/models/{name}:generateContent），二者独立检查，
+	// 仅当源值与提取到的 modelStr 一致时才重写，避免误改无关字段。
+	// body 重写后 bodyBytes 更新，由于 removeHopHeaders 已剔除 Content-Length，
+	// bytes.NewReader 会让 http.NewRequestWithContext 自动重算长度，无尺寸不一致风险。
+	if aliases != nil && modelStr != "" {
+		if alias, ok := aliases[modelStr]; ok && alias != "" && alias != modelStr {
+			log.Printf("[ALIAS] %s -> %s", modelStr, alias)
+			if hasBody {
+				var bm map[string]interface{}
+				if json.Unmarshal(bodyBytes, &bm) == nil {
+					if cur, ok := bm["model"].(string); ok && cur == modelStr {
+						bm["model"] = alias
+						if nb, merr := json.Marshal(bm); merr == nil {
+							bodyBytes = nb
+						}
+					}
+				}
+			}
+			if m := geminiModelRegex.FindStringSubmatch(r.URL.Path); m != nil && m[1] == modelStr {
+				r.URL.Path = geminiModelRegex.ReplaceAllString(r.URL.Path, "/models/"+alias)
+			}
+			modelStr = alias
+		}
+	}
+
 	// 判断 token 注入方式（与原实现一致：query key / goog header / x-api-key / bearer）
 	useGoogHeader := googHeader != ""
 	useQueryKey := queryKey != ""
