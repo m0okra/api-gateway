@@ -238,9 +238,9 @@ func checkOpenCodeGoUsage(upstreamName string, cfg *AvailabilityConfig, st *Avai
 }
 
 var (
-	opencodeUsageRegex  = regexp.MustCompile(`rollingUsage:\$R\[1\]=\{status:"([^"]+)",resetInSec:(\d+),usagePercent:(\d+)\}`)
-	opencodeUsageRegex2 = regexp.MustCompile(`weeklyUsage:\$R\[2\]=\{status:"([^"]+)",resetInSec:(\d+),usagePercent:(\d+)\}`)
-	opencodeUsageRegex3 = regexp.MustCompile(`monthlyUsage:\$R\[3\]=\{status:"([^"]+)",resetInSec:(\d+),usagePercent:(\d+)\}`)
+	opencodeUsageRegex  = regexp.MustCompile(`rollingUsage:\$R\[\d+\]=\{status:"([^"]+)",resetInSec:(\d+),usagePercent:(\d+)\}`)
+	opencodeUsageRegex2 = regexp.MustCompile(`weeklyUsage:\$R\[\d+\]=\{status:"([^"]+)",resetInSec:(\d+),usagePercent:(\d+)\}`)
+	opencodeUsageRegex3 = regexp.MustCompile(`monthlyUsage:\$R\[\d+\]=\{status:"([^"]+)",resetInSec:(\d+),usagePercent:(\d+)\}`)
 )
 
 // ---- 以下provider仅框架，返回兜底 ----
