@@ -29,8 +29,8 @@ var (
 	// handler 入口 acquire（写入），defer release（读出），实现全局并发上限保护。
 	reqSem chan struct{}
 
-	// availSF 可用性检查 singleflight：同一 alias 的并发 provider 检查合并为一次实际调用，
-	// 避免上游批量返回 401/429 时对同一 alias 发起重复外部 HTTP 检查风暴。
+	// availSF 可用性检查 singleflight：同一 upstream 的并发 provider 检查合并为一次实际调用，
+	// 避免上游批量返回 401/429 时对同一 upstream 发起重复外部 HTTP 检查风暴。
 	availSF = newAvailSingleFlight()
 )
 

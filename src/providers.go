@@ -13,14 +13,14 @@ import (
 )
 
 // ============================================================================
-// 可用性Provider：参考cclimits.py，使用alias的token；额外内容从Extra读
+// 可用性Provider：参考cclimits.py，使用upstream的token；额外内容从Extra读
 //   - usage/balance型：调用对应provider查询
 //   - 出问题时按类型处理
 // ============================================================================
 
-// checkAvailability 根据 alias 配置与当前 state 执行可用性检查，返回是否exhaust
+// checkAvailability 根据 upstream 配置与当前 state 执行可用性检查，返回是否exhaust
 // 若检查过程出错，按类型处理（none 型透传，其余走 exhaust 兜底）
-func checkAvailability(aliasName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
+func checkAvailability(upstreamName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
 	if cfg == nil {
 		// 无配置 → 默认不统计（none 型），永不耗尽、透传所有错误
 		return AvailabilityResult{}
@@ -33,10 +33,10 @@ func checkAvailability(aliasName string, cfg *AvailabilityConfig, st *Availabili
 		return AvailabilityResult{Exhausted: exhausted, Count: st.Count, RecoveryCron: cfg.RefreshCron}
 
 	case availBalance:
-		return checkBalanceProvider(cfg.Provider, aliasName, st)
+		return checkBalanceProvider(cfg.Provider, upstreamName, st)
 
 	case availUsage:
-		return checkUsageProvider(cfg.Provider, aliasName, cfg, st)
+		return checkUsageProvider(cfg.Provider, upstreamName, cfg, st)
 
 	case availExhaust:
 		return fallbackResult(st)
@@ -63,14 +63,14 @@ func fallbackResult(st *AvailabilityState) AvailabilityResult {
 
 // ---- balance型 provider ----
 
-func checkBalanceProvider(provider, aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkBalanceProvider(provider, upstreamName string, st *AvailabilityState) AvailabilityResult {
 	switch provider {
 	case "deepseek":
-		return checkDeepSeekBalance(aliasName, st)
+		return checkDeepSeekBalance(upstreamName, st)
 	case "kimi":
-		return checkKimiBalance(aliasName, st)
+		return checkKimiBalance(upstreamName, st)
 	case "openrouter":
-		return checkOpenRouterBalance(aliasName, st)
+		return checkOpenRouterBalance(upstreamName, st)
 	default:
 		// 未实现的provider走兜底
 		return fallbackResult(st)
@@ -79,20 +79,20 @@ func checkBalanceProvider(provider, aliasName string, st *AvailabilityState) Ava
 
 // ---- usage型 provider ----
 
-func checkUsageProvider(provider, aliasName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
+func checkUsageProvider(provider, upstreamName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
 	switch provider {
 	case "opencode-go":
-		return checkOpenCodeGoUsage(aliasName, cfg, st)
+		return checkOpenCodeGoUsage(upstreamName, cfg, st)
 	case "claude":
-		return checkClaudeUsage(aliasName, st)
+		return checkClaudeUsage(upstreamName, st)
 	case "codex":
-		return checkCodexUsage(aliasName, st)
+		return checkCodexUsage(upstreamName, st)
 	case "gemini":
-		return checkGeminiUsage(aliasName, st)
+		return checkGeminiUsage(upstreamName, st)
 	case "zai":
-		return checkZAIUsage(aliasName, st)
+		return checkZAIUsage(upstreamName, st)
 	case "minimax":
-		return checkMiniMaxUsage(aliasName, st)
+		return checkMiniMaxUsage(upstreamName, st)
 	default:
 		return fallbackResult(st)
 	}
@@ -101,17 +101,17 @@ func checkUsageProvider(provider, aliasName string, cfg *AvailabilityConfig, st 
 // ---- DeepSeek（余额型，具体实现）----
 // GET https://api.deepseek.com/user/balance
 // 余额为0则exhaust
-func checkDeepSeekBalance(aliasName string, st *AvailabilityState) AvailabilityResult {
-	alias := getAliasConfig(aliasName)
-	if alias == nil {
+func checkDeepSeekBalance(upstreamName string, st *AvailabilityState) AvailabilityResult {
+	upstream := getUpstreamConfig(upstreamName)
+	if upstream == nil {
 		return fallbackResult(st)
 	}
-	token := alias.RealToken
+	token := upstream.RealToken
 
 	body, status, err := httpGetJSON("https://api.deepseek.com/user/balance",
 		map[string]string{"Authorization": "Bearer " + token, "Accept": "application/json"})
 	if err != nil || status != 200 {
-		log.Printf("[AVAIL] deepseek check failed alias=%s status=%d err=%v -> fallback", aliasName, status, err)
+		log.Printf("[AVAIL] deepseek check failed upstream=%s status=%d err=%v -> fallback", upstreamName, status, err)
 		return fallbackResult(st)
 	}
 
@@ -119,7 +119,7 @@ func checkDeepSeekBalance(aliasName string, st *AvailabilityState) AvailabilityR
 	avail, _ := body["is_available"].(bool)
 	infos, _ := body["balance_infos"].([]interface{})
 	if !avail || len(infos) == 0 {
-		log.Printf("[AVAIL] deepseek alias=%s not available -> fallback", aliasName)
+		log.Printf("[AVAIL] deepseek upstream=%s not available -> fallback", upstreamName)
 		return fallbackResult(st)
 	}
 	info, _ := infos[0].(map[string]interface{})
@@ -136,7 +136,7 @@ func checkDeepSeekBalance(aliasName string, st *AvailabilityState) AvailabilityR
 			res.RecoveryAt = time.Now().Add(defaultBalanceRecoverGap)
 		}
 	}
-	log.Printf("[AVAIL] deepseek alias=%s balance=%.4f exhausted=%v", aliasName, bal, res.Exhausted)
+	log.Printf("[AVAIL] deepseek upstream=%s balance=%.4f exhausted=%v", upstreamName, bal, res.Exhausted)
 	return res
 }
 
@@ -145,15 +145,15 @@ func checkDeepSeekBalance(aliasName string, st *AvailabilityState) AvailabilityR
 // GET https://opencode.ai/_server?id=...&args=...
 // 解析 rollingUsage:$R[1]={status,resetInSec,usagePercent}
 // 任何配额层级剩余用量为0则exhaust
-func checkOpenCodeGoUsage(aliasName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
-	alias := getAliasConfig(aliasName)
-	if alias == nil {
+func checkOpenCodeGoUsage(upstreamName string, cfg *AvailabilityConfig, st *AvailabilityState) AvailabilityResult {
+	upstream := getUpstreamConfig(upstreamName)
+	if upstream == nil {
 		return fallbackResult(st)
 	}
-	cookie := alias.Extra["cookie"]
-	workspaceID := alias.Extra["workspaceId"]
+	cookie := upstream.Extra["cookie"]
+	workspaceID := upstream.Extra["workspaceId"]
 	if cookie == "" || workspaceID == "" {
-		log.Printf("[AVAIL] opencode-go alias=%s missing cookie/workspaceId -> fallback", aliasName)
+		log.Printf("[AVAIL] opencode-go upstream=%s missing cookie/workspaceId -> fallback", upstreamName)
 		return fallbackResult(st)
 	}
 
@@ -167,13 +167,13 @@ func checkOpenCodeGoUsage(aliasName string, cfg *AvailabilityConfig, st *Availab
 		"x-server-instance": "server-fn:3",
 	})
 	if err != nil || status != 200 {
-		log.Printf("[AVAIL] opencode-go check failed alias=%s status=%d err=%v -> fallback", aliasName, status, err)
+		log.Printf("[AVAIL] opencode-go check failed upstream=%s status=%d err=%v -> fallback", upstreamName, status, err)
 		return fallbackResult(st)
 	}
 
 	rolling := opencodeUsageRegex.FindStringSubmatch(text)
 	if rolling == nil {
-		log.Printf("[AVAIL] opencode-go alias=%s parse rollingUsage failed -> fallback", aliasName)
+		log.Printf("[AVAIL] opencode-go upstream=%s parse rollingUsage failed -> fallback", upstreamName)
 		return fallbackResult(st)
 	}
 	rollingPct, _ := strconv.ParseFloat(rolling[3], 64)
@@ -210,7 +210,7 @@ func checkOpenCodeGoUsage(aliasName string, cfg *AvailabilityConfig, st *Availab
 		} else {
 			// 在所有已耗尽的层级中选取最长的 resetInSec 作为下次检查间隔。
 			// 因为只要任一层级仍耗尽就整体不可用：rolling 即使最先恢复，
-			// 但 weekly/monthly 还没到 reset 时间则 alias 依然不能转发。
+			// 但 weekly/monthly 还没到 reset 时间则 upstream 依然不能转发。
 			// 故必须按最长重置周期的耗尽层级来设定精确复查时间点，
 			// 一次性定时而非周期 cron（cron 表达式对超大秒数会语义退化）。
 			var maxReset int
@@ -232,8 +232,8 @@ func checkOpenCodeGoUsage(aliasName string, cfg *AvailabilityConfig, st *Availab
 			res.RecoveryAt = time.Now().Add(time.Duration(maxReset) * time.Second)
 		}
 	}
-	log.Printf("[AVAIL] opencode-go alias=%s rolling=%.0f%% weekly=%.0f%% monthly=%.0f%% exhausted=%v",
-		aliasName, rollingPct, weeklyPct, monthlyPct, res.Exhausted)
+	log.Printf("[AVAIL] opencode-go upstream=%s rolling=%.0f%% weekly=%.0f%% monthly=%.0f%% exhausted=%v",
+		upstreamName, rollingPct, weeklyPct, monthlyPct, res.Exhausted)
 	return res
 }
 
@@ -245,38 +245,38 @@ var (
 
 // ---- 以下provider仅框架，返回兜底 ----
 
-func checkKimiBalance(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkKimiBalance(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: GET https://api.moonshot.ai/v1/users/me/balance
 	return fallbackResult(st)
 }
 
-func checkOpenRouterBalance(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkOpenRouterBalance(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: GET https://openrouter.ai/api/v1/credits
 	return fallbackResult(st)
 }
 
-func checkClaudeUsage(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkClaudeUsage(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: GET https://api.anthropic.com/api/oauth/usage
 	return fallbackResult(st)
 }
 
-func checkCodexUsage(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkCodexUsage(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: GET https://chatgpt.com/backend-api/wham/usage
 	return fallbackResult(st)
 }
 
-func checkGeminiUsage(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkGeminiUsage(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: POST https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota
 	// gemini的oauth从文件读，不储存于Extra
 	return fallbackResult(st)
 }
 
-func checkZAIUsage(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkZAIUsage(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: GET https://api.z.ai/api/monitor/usage/quota/limit
 	return fallbackResult(st)
 }
 
-func checkMiniMaxUsage(aliasName string, st *AvailabilityState) AvailabilityResult {
+func checkMiniMaxUsage(upstreamName string, st *AvailabilityState) AvailabilityResult {
 	// TODO: GET {base}/v1/api/openplatform/coding_plan/remains
 	return fallbackResult(st)
 }
@@ -365,10 +365,10 @@ func httpGetText(reqURL string, headers map[string]string) (string, int, error) 
 	return string(data), code, nil
 }
 
-func getAliasConfig(name string) *AliasConfig {
+func getUpstreamConfig(name string) *UpstreamConfig {
 	mu.RLock()
 	defer mu.RUnlock()
-	if a, ok := tokenMap.Aliases[name]; ok {
+	if a, ok := tokenMap.Upstreams[name]; ok {
 		return &a
 	}
 	return nil

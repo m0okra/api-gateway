@@ -12,7 +12,7 @@ const (
 	opencodeGoServiceID   = "c7389bd0e731f80f49593e5ee53835475f4e28594dd6bd83eb229bab753498cd"
 	stateSaveInterval     = 5 * time.Minute
 	schedulerTickInterval = 1 * time.Second
-	recoveryMinGap        = 60 * time.Second // 同一alias两次恢复触发之间的最小间隔，防止死循环
+	recoveryMinGap        = 60 * time.Second // 同一upstream两次恢复触发之间的最小间隔，防止死循环
 	streamIdleTimeout     = 5 * time.Minute  // 流式响应空闲读超时，超过则取消上游连接
 
 	// 以下为非 count 型（usage/balance/exhaust）恢复调度的时间兜底值

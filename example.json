@@ -19,7 +19,7 @@
         "opencode-go-1"
       ]
     },
-    "aliases": {
+    "upstreams": {
       "ark": {
         "realToken": "ark-***",
         "targetBase": "https://ark.cn-beijing.volces.com"

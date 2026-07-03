@@ -57,9 +57,9 @@ func main() {
 	if err := loadFromDB(); err != nil {
 		log.Fatalf("Failed to load from DB: %v", err)
 	}
-	log.Printf("TokenMap loaded from DB (fakeTokens=%d, aliases=%d)",
-		len(tokenMap.FakeTokens), len(tokenMap.Aliases))
-	if !dbExisted || len(tokenMap.Aliases) == 0 {
+	log.Printf("TokenMap loaded from DB (fakeTokens=%d, upstreams=%d)",
+		len(tokenMap.FakeTokens), len(tokenMap.Upstreams))
+	if !dbExisted || len(tokenMap.Upstreams) == 0 {
 		log.Printf("请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。")
 	}
 

@@ -9,13 +9,13 @@ src/
 ├── main.go            入口：flag 解析、加载配置、启动 HTTP 服务器、优雅关闭
 ├── globals.go         全局变量：配置状态、共享 HTTP 客户端、writeJSON 工具
 ├── constants.go       常量定义：超时阈值、可用性类型共用名、并发与超时保护常量
-├── types.go           数据结构：TokenMapConfig/AliasConfig/AvailabilityConfig/...
+├── types.go           数据结构：TokenMapConfig/UpstreamConfig/AvailabilityConfig/...
 ├── singleflight.go    可用性检查 singleflight（自实现，仅用标准库）
 ├── cron.go            轻量 Cron 解析调度 + LRU 缓存
 ├── providers.go       可用性 Provider：DeepSeek 余额、OpenCode-Go 用量等检查实现
 ├── state.go           状态管理：从 SQLite 加载/保存（锁外 I/O 快照写）、一致性协调
 ├── scheduler.go       定时调度：exhaust 恢复检查 + 状态持久化触发
-└── gateway.go         核心转发：fakeToken → alias 队列轮转（原子挑选）、请求注入、流式响应
+└── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、流式响应
 ```
 
 ## 编译说明
@@ -48,13 +48,13 @@ go build -o api-gateway.exe .
 1. 首次运行无 `gateway.db` 时启动会创建空库，日志提示：
 
 ```
-TokenMap loaded from DB (fakeTokens=0, aliases=0)
-State loaded from DB (0 aliases)
+TokenMap loaded from DB (fakeTokens=0, upstreams=0)
+State loaded from DB (0 upstreams)
 请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。
 Gateway running on port 9090
 ```
 
-2. 参考 `example.json` 编写配置（脱敏示例，含 fakeTokens 队列与 aliases 配置），导入：
+2. 参考 `example.json` 编写配置（脱敏示例，含 fakeTokens 队列与 upstreams 配置），导入：
 
 ```bash
 api-gateway -i my-config.json
@@ -66,7 +66,7 @@ api-gateway -i my-config.json
 api-gateway -p 9090
 ```
 
-4. 客户端用 fakeToken 请求，token 注入方式按优先级递减：`Authorization: Bearer xxx` / `X-Goog-Api-Key` / `?key=` / `X-Api-Key`。网关将 fakeToken 替换为 alias 的 realToken 转发到 targetBase。
+4. 客户端用 fakeToken 请求，token 注入方式按优先级递减：`Authorization: Bearer xxx` / `X-Goog-Api-Key` / `?key=` / `X-Api-Key`。网关将 fakeToken 替换为 upstream 的 realToken 转发到 targetBase。
 
 ### 配置导入导出
 
@@ -86,17 +86,17 @@ api-gateway -p 9090
 
 ## 核心概念
 
-### fakeToken / alias
+### fakeToken / upstream
 
 - **fakeToken**: 用户对外持有的假 token，请求中通过 `Authorization: Bearer xxx`、`X-Goog-Api-Key`、`?key=` 或 `X-Api-Key` 传入。
-- **alias**: 一个真实 API Key 的抽象标识，包含 `realToken`（真实密钥）、`targetBase`（上游 base URL）以及可用性配置。
-- 每个 fakeToken 对应一个有序的 alias 队列（`FakeTokens`），请求被转发到队列首部非 exhaust 的 alias；请求后若触发 exhaust 则该 alias 轮转到队尾，实现自动容灾。
+- **upstream**: 一个真实 API Key 的抽象标识，包含 `realToken`（真实密钥）、`targetBase`（上游 base URL）以及可用性配置。
+- 每个 fakeToken 对应一个有序的 upstream 队列（`FakeTokens`），请求被转发到队列首部非 exhaust 的 upstream；请求后若触发 exhaust 则该 upstream 轮转到队尾，实现自动容灾。
 
 ### 可用性类型
 
 `count` 类型的 `limit` 若为 `0`（或未配置），表示无上限，计数永不触发 exhaust。
 
-未声明 `type` 的 alias 默认使用 `none` 类型（不统计，永不耗尽）。
+未声明 `type` 的 upstream 默认使用 `none` 类型（不统计，永不耗尽）。
 
 | 类型 | 含义 | exhaust 条件 | 恢复依据 |
 |---|---|---|---|
@@ -104,7 +104,7 @@ api-gateway -p 9090
 | `count` | 请求次数限流 | `count >= limit` | `RecoveryCron`（cron 周期匹配 = `RefreshCron`），按表达式定时重置 count |
 | `balance` | 余额型 | provider 返回 balance ≤ 0 | `RecoveryAt`（精确时间点），由 provider 按最长的 resetInSec 设定 |
 | `usage` | 用量型 | provider 返回任一层级 ≥ 100% | `RecoveryAt`（精确时间点），由 provider 按已耗尽层级最长的 resetInSec 设定 |
-| `exhaust` | 始终耗尽（需显式声明） | 始终 exhaust | `RecoveryAt`（精确时间点），默认 30min 后复查 |
+| `exhaust` | 触发即耗尽 | 响应可用性错误时立即 exhaust | `RecoveryAt`（精确时间点），默认 30min 后自动恢复 |
 
 ### 请求流程
 
@@ -120,17 +120,17 @@ client → 网关 (带 fakeToken)
     查找 FakeTokens[fakeToken] 队列
           │
           ▼
-    pickFirstAvailableAlias：写锁内原子扫描队列，跳过已 exhausted 的前缀（移到队尾），
-    返回首个可用 alias 及其配置快照（省去三次单锁间的 TOCTOU 竞态）
+    pickFirstAvailableUpstream：写锁内原子扫描队列，跳过已 exhausted 的前缀（移到队尾），
+    返回首个可用 upstream 及其配置快照（省去三次单锁间的 TOCTOU 竞态）
           │
           ├─ 整队列不可用 → 返回 503
           │
-          └─ alias 可用 → 用 realToken 替换 fakeToken，转发到 targetBase
+          └─ upstream 可用 → 用 realToken 替换 fakeToken，转发到 targetBase
                             │
                             ├─ count 型 → incrementCount，达 limit 则标记 exhaust
                             │
                             └─ 检查响应状态码
-                                 ├─ 401/402/403/429 → singleflight 去重（同 alias
+                                 ├─ 401/402/403/429 → singleflight 去重（同 upstream
                                  │   并发仅首次调用 provider），exhaust 则 rotate
                                  ├─ 流式 (SSE) → streamIdleTimeout 空闲超时 + maxStreamLife 硬上限
                                  └─ 其他 → 直接转发响应
@@ -157,15 +157,15 @@ client → 网关 (带 fakeToken)
 ### 状态持久化
 
 - 所有配置与运行时状态统一存储在 `gateway.db`（SQLite，WAL 模式，明文不加密，依赖文件权限保护）。
-- 表结构：`aliases`（配置列 + 运行时状态列同行）、`alias_tiers`（usage 型层级配置+状态）、`alias_extra`（Extra map）、`fake_tokens`（fakeToken→有序 alias 队列，priority=队列下标）。
+- 表结构：`upstreams`（配置列 + 运行时状态列同行）、`upstream_tiers`（usage 型层级配置+状态）、`upstream_extra`（Extra map）、`fake_tokens`（fakeToken→有序 upstream 队列，priority=队列下标）。
 - 恢复调度依据按类型二选一：
   - **count 型**：`RecoveryCron`（cron 表达式，对应配置的 `RefreshCron`）
   - **usage/balance/exhaust 型**：`RecoveryAt`（精确时间点 `time.Time`，由 provider 在 exhaust 时设定）
 - 内存中维护 `stateDirty` 标志与 `stateGen` 代际计数器（`atomic.Uint64`），每 5min 检查并写入。
 - `saveState()` 优化为锁内快照 → 锁外 I/O：在写锁内深拷贝 state 快照并记录代际后立即释放锁，SQLite 事务在锁外执行；提交后再次取锁，仅当代际未变（无新写入）才清 dirty，避免写库期间（可能数百 ms）阻塞所有请求。
 - 调度器退出前 final save 确保持久化一致性；main 通过 `schedDone` channel 等待 final save 完成后再 `db.Close()`，避免事务被截断。
-- 启动时清理 FakeTokens 队列中 Aliases 不存在的 alias（配置一致性保护）。
-- 运行时 alias 队列轮转顺序不持久化（重启恢复 `fake_tokens.priority` 定义的配置顺序）。
+- 启动时清理 FakeTokens 队列中 Upstreames 不存在的 upstream（配置一致性保护）。
+- 运行时 upstream 队列轮转顺序不持久化（重启恢复 `fake_tokens.priority` 定义的配置顺序）。
 - 旧文件迁移：usage/balance/exhaust 型旧 `RecoveryCron` 字段在重启后被忽略，`RecoveryAt` 为零值触发立即复查，首次写入后清空旧字段。
 
 ### 配置导入导出
@@ -175,9 +175,9 @@ client → 网关 (带 fakeToken)
 - `-e <file>` / `--export <file>`：将 `-db` 库全量导出为单个 JSON 文件
 - `-i <file>` / `--import <file>`：将 JSON 文件全量导入 `-db` 库（**全量覆盖**，DB 中原有数据被清空替换）
 
-两者互斥。JSON 文件格式为 `DBDump`：`{ "tokenMap": {fakeTokens, aliases}, "state": {alias: AvailabilityState} }`，结构与运行时内存模型一致，`time.Time` 走 RFC3339Nano 字符串，人类可读可编辑。
+两者互斥。JSON 文件格式为 `DBDump`：`{ "tokenMap": {fakeTokens, upstreams}, "state": {upstream: AvailabilityState} }`，结构与运行时内存模型一致，`time.Time` 走 RFC3339Nano 字符串，人类可读可编辑。
 
-导入防御：fakeToken 队列中重复 alias 跳过保留首次、引用不存在的 alias 跳过避免 FK 违约、state 中有但 aliases 中无的孤儿条目警告忽略；全程单事务，任一步失败回滚保持 DB 原状。
+导入防御：fakeToken 队列中重复 upstream 跳过保留首次、引用不存在的 upstream 跳过避免 FK 违约、state 中有但 upstreams 中无的孤儿条目警告忽略；全程单事务，任一步失败回滚保持 DB 原状。
 
 典型用途：备份/恢复 `gateway.db`、手工编辑配置后导入、跨环境迁移。导出文件含明文 `realToken`，需自行保护文件权限。
 
@@ -193,7 +193,7 @@ curl http://localhost:9090/status
 
 ```json
 {
-  "aliases": [
+  "upstreams": [
     {
       "name": "deepseek-aaa",
       "targetBase": "https://api.deepseek.com",
@@ -237,11 +237,11 @@ curl http://localhost:9090/status
 
 | 字段 | 说明 |
 |---|---|
-| `aliases` | 每个 alias 的运行时快照（配置+状态） |
-| `aliases[].realToken` | 真实 API Key 脱敏视图（首尾各 4 字符 + `********`） |
-| `aliases[].queueFor` | 该 alias 出现在哪些 fakeToken 队列中（脱敏），便于排障 |
-| `aliases[].tiers` | usage 型的各配额层级用量（count/balance 型无此字段） |
-| `fakeTokens` | 当前 fakeToken → alias 队列映射，fakeToken 名脱敏 |
+| `upstreams` | 每个 upstream 的运行时快照（配置+状态） |
+| `upstreams[].realToken` | 真实 API Key 脱敏视图（首尾各 4 字符 + `********`） |
+| `upstreams[].queueFor` | 该 upstream 出现在哪些 fakeToken 队列中（脱敏），便于排障 |
+| `upstreams[].tiers` | usage 型的各配额层级用量（count/balance 型无此字段） |
+| `fakeTokens` | 当前 fakeToken → upstream 队列映射，fakeToken 名脱敏 |
 
 ### 恢复调度机制
 
@@ -262,7 +262,7 @@ curl http://localhost:9090/status
 - **兜底 exhaust**：设为 `now + 30min`。
 - 当 provider 返回的 `resetInSec` 异常（≤ 0）时，使用 `minRecoverGap = 60s` 地板保护，防止死循环。
 
-调度器每 1s 遍历所有 exhausted alias，检查 `now >= RecoveryAt`（零值视为旧文件迁移，立即触发）。触发后调用 provider 复查，返回新的 exhausted 状态和 `RecoveryAt`；若已恢复则清除 exhausted，alias 重新参与请求轮转。
+调度器每 1s 遍历所有 exhausted upstream，检查 `now >= RecoveryAt`（零值视为旧文件迁移，立即触发）。触发后调用 provider 复查，返回新的 exhausted 状态和 `RecoveryAt`；若已恢复则清除 exhausted，upstream 重新参与请求轮转。
 
 ### 请求体大小限制
 
@@ -288,16 +288,16 @@ curl http://localhost:9090/status
   - `proxyClient`（120s 超时）— 普通代理请求
   - `streamClient`（无整体超时）— 流式代理请求
 - `reqSem`（channel semaphore，容量 256）：全局并发上限，handler 入口 acquire，超限请求阻塞排队
-- `availSF`（`availSingleFlight`）：可用性检查 singleflight，同 alias 并发触发仅首次执行 provider 调用
+- `availSF`（`availSingleFlight`）：可用性检查 singleflight，同 upstream 并发触发仅首次执行 provider 调用
 - `writeJSON` 统一 JSON 响应写入，捕获并记录编码错误
 
 ### state.go
 
 - `openDB`：打开 SQLite（`PRAGMA foreign_keys=ON` + `WAL` + `busy_timeout`）并建表 IF NOT EXISTS，供 `loadFromDB` 与 `importFromJSON` 复用
 - `loadFromDB`：查 4 张表填充 `tokenMap` + `stateMap`、`cleanFakeTokenQueues` + `reconcileStateWithConfig`
-- `saveState`：单事务写回——先持写锁深拷贝 state 快照（含 Tiers 副本）并记录 `stateGen`，释放锁后遍历快照执行 SQLite I/O（`UPDATE aliases` 状态列 + 每个 alias 的 `alias_tiers` DELETE/INSERT）；提交后再取锁，仅当代际未变才清 dirty。锁外 I/O 避免写库阻塞所有请求。
+- `saveState`：单事务写回——先持写锁深拷贝 state 快照（含 Tiers 副本）并记录 `stateGen`，释放锁后遍历快照执行 SQLite I/O（`UPDATE upstreams` 状态列 + 每个 upstream 的 `upstream_tiers` DELETE/INSERT）；提交后再取锁，仅当代际未变才清 dirty。锁外 I/O 避免写库阻塞所有请求。
 - `exportToJSON`：复用 `loadFromDB` 载入内存 → marshal `DBDump{tokenMap, stateMap}` → 原子写（tmp+rename，0600）；导出 reconcile 后的规范视图
-- `importFromJSON`：读 JSON → 单事务 DELETE 4 表（先子后父）+ INSERT 全量覆盖；防御：队列重复 alias 用 `INSERT OR IGNORE` 跳过、引用不存在 alias 跳过、orphan state 警告；任一步失败 Rollback
+- `importFromJSON`：读 JSON → 单事务 DELETE 4 表（先子后父）+ INSERT 全量覆盖；防御：队列重复 upstream 用 `INSERT OR IGNORE` 跳过、引用不存在 upstream 跳过、orphan state 警告；任一步失败 Rollback
 
 ### cron.go
 
@@ -318,16 +318,16 @@ curl http://localhost:9090/status
 ### scheduler.go
 
 - `runScheduler`：主循环 select ticker（1s 恢复检查）与 saveTicker（5min 状态保存）；通过 `done` channel 通知 main 已完成 final save
-- `checkRecovery`：遍历 all alias，按类型分流：
+- `checkRecovery`：遍历 all upstream，按类型分流：
   - **count 型**：`RecoveryCron` cron 周期匹配
   - **usage/balance/exhaust 型**：`now >= RecoveryAt` 时间点触发（零值为旧文件迁移，立即触发）
   - 统一受 `recoveryMinGap`（60s）约束，避免短时间重复触发
-- `recoverAlias`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
+- `recoverUpstream`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
 
 ### gateway.go
 
 - handler：核心请求处理函数，以 `reqSem <- struct{}{}` 获取并发令牌（defer 释放），完成后返回
-- 队列操作：`pickFirstAvailableAlias`（一次写锁内原子扫描队列，跳过所有 exhausted 前置 alias 至队尾，返回首个可用 alias 与配置快照）/ `rotateAliasToEnd` / `getAliasQueueLen` / `hasAliasQueue`
+- 队列操作：`pickFirstAvailableUpstream`（一次写锁内原子扫描队列，跳过所有 exhausted 前置 upstream 至队尾，返回首个可用 upstream 与配置快照）/ `rotateUpstreamToEnd` / `getUpstreamQueueLen` / `hasUpstreamQueue`
 - 状态查询：`incrementCount`（count 型自增）、`applyAvailabilityResult`（写入检查结果；按类型分流：count 写 `RecoveryCron`、其余写 `RecoveryAt`，并清理另一调度依据的残留）
 - 可用性错误（401/402/403/429）路径通过 `availSF.Do()` singleflight 去重 checkAvailability，避免并发请求重复调用 provider
 - 流式响应：idle 监控 goroutine + `maxStreamLife` context 超时硬上限，双保险

@@ -84,23 +84,23 @@ func isAvailabilityError(status int) bool {
 }
 
 // ============================================================================
-// 网关：alias队列轮转（带锁读取）
+// 网关：upstream队列轮转（带锁读取）
 // ============================================================================
 
-// pickFirstAvailableAlias 在一次写锁内原子完成：扫描队列找首个可用 alias，
-// 将其前方所有不可用 alias 轮转到队尾，并返回该可用 alias 名与其配置快照。
+// pickFirstAvailableUpstream 在一次写锁内原子完成：扫描队列找首个可用 upstream，
+// 将其前方所有不可用 upstream 轮转到队尾，并返回该可用 upstream 名与其配置快照。
 //
-// 不可用定义：stateMap[alias]==nil（含未初始化 alias -> 保守视为耗尽）或 Exhausted==true，
-// 或 tokenMap.Aliases 中缺失该 alias（配置缺失 -> 保守视为不可用）。
+// 不可用定义：stateMap[upstream]==nil（含未初始化 upstream -> 保守视为耗尽）或 Exhausted==true，
+// 或 tokenMap.Upstreams 中缺失该 upstream（配置缺失 -> 保守视为不可用）。
 //
-// 返回 (alias, cfg, rotated)：
-//   - alias == "" 表示整队列不可用；rotated 为本次被跳过的 alias 名列表（用于日志）。
-//   - alias != "" 时 cfg 为该 alias 配置快照（值拷贝），调用方无需再次单独加锁读取配置。
+// 返回 (upstreamName, cfg, rotated)：
+//   - upstreamName == "" 表示整队列不可用；rotated 为本次被跳过的 upstream 名列表（用于日志）。
+//   - upstreamName != "" 时 cfg 为该 upstream 配置快照（值拷贝），调用方无需再次单独加锁读取配置。
 //
-// 用途：消除原 pickFirstAlias -> isAliasExhausted -> rotateAliasToEnd 三次独立加锁间的
+// 用途：消除原 pickFirst -> isExhausted -> rotateToEnd 三次独立加锁间的
 // TOCTOU 竞态——高并发下另一 goroutine 可能在两次加锁间改变队列或 state，
-// 导致选中的 alias 已被耗尽或配置已被移除。本函数把"选 + 把耗尽前置移到队尾"合为一次锁内操作。
-func pickFirstAvailableAlias(fakeToken string) (alias string, cfg *AliasConfig, rotated []string) {
+// 导致选中的 upstream 已被耗尽或配置已被移除。本函数把"选 + 把耗尽前置移到队尾"合为一次锁内操作。
+func pickFirstAvailableUpstream(fakeToken string) (upstreamName string, cfg *UpstreamConfig, rotated []string) {
 	mu.Lock()
 	defer mu.Unlock()
 	q := tokenMap.FakeTokens[fakeToken]
@@ -113,20 +113,20 @@ func pickFirstAvailableAlias(fakeToken string) (alias string, cfg *AliasConfig, 
 			rotated = append(rotated, a)
 			continue
 		}
-		ac, ok := tokenMap.Aliases[a]
+		ac, ok := tokenMap.Upstreams[a]
 		if !ok {
 			// 配置缺失：保守视为不可用，轮到队尾等同耗尽
 			rotated = append(rotated, a)
 			continue
 		}
-		// 找到首个可用 alias；其后的 alias 保持原序，前方已耗尽的前缀整体移到队尾
+		// 找到首个可用 upstream；其后的 upstream 保持原序，前方已耗尽的前缀整体移到队尾
 		remaining := q[i+1:]
 		newQ := make([]string, 0, len(q))
 		newQ = append(newQ, a)
 		newQ = append(newQ, remaining...)
 		newQ = append(newQ, rotated...)
 		tokenMap.FakeTokens[fakeToken] = newQ
-		snap := ac // 值拷贝；AliasConfig 内 Extra/Availability 为引用，只读路径下安全
+		snap := ac // 值拷贝；UpstreamConfig 内 Extra/Availability 为引用，只读路径下安全
 		return a, &snap, rotated
 	}
 	// 整队列不可用：直接返回 "" 让调用方回 503，
@@ -135,14 +135,14 @@ func pickFirstAvailableAlias(fakeToken string) (alias string, cfg *AliasConfig, 
 	return "", nil, rotated
 }
 
-// rotateAliasToEnd 将指定alias移到其fakeToken队列末端
-func rotateAliasToEnd(fakeToken, alias string) {
+// rotateUpstreamToEnd 将指定upstream移到其fakeToken队列末端
+func rotateUpstreamToEnd(fakeToken, upstreamName string) {
 	mu.Lock()
 	defer mu.Unlock()
 	q := tokenMap.FakeTokens[fakeToken]
 	idx := -1
 	for i, a := range q {
-		if a == alias {
+		if a == upstreamName {
 			idx = i
 			break
 		}
@@ -151,34 +151,34 @@ func rotateAliasToEnd(fakeToken, alias string) {
 		return
 	}
 	q = append(q[:idx], q[idx+1:]...)
-	q = append(q, alias)
+	q = append(q, upstreamName)
 	tokenMap.FakeTokens[fakeToken] = q
 }
 
-// getAliasQueueLen 返回 fakeToken 对应队列长度（加锁读取，避免与 rotate 竞争）
-func getAliasQueueLen(fakeToken string) int {
+// getUpstreamQueueLen 返回 fakeToken 对应队列长度（加锁读取，避免与 rotate 竞争）
+func getUpstreamQueueLen(fakeToken string) int {
 	mu.RLock()
 	defer mu.RUnlock()
 	return len(tokenMap.FakeTokens[fakeToken])
 }
 
-// hasAliasQueue 队列是否存在且非空（加锁读取）
-func hasAliasQueue(fakeToken string) bool {
-	return getAliasQueueLen(fakeToken) > 0
+// hasUpstreamQueue 队列是否存在且非空（加锁读取）
+func hasUpstreamQueue(fakeToken string) bool {
+	return getUpstreamQueueLen(fakeToken) > 0
 }
 
-// incrementCount count型alias请求计数+1，返回新的count；同时若达到limit则标记exhaust
+// incrementCount count型upstream请求计数+1，返回新的count；同时若达到limit则标记exhaust
 // Limit 为 0 时永不 exhaust（无限制计数）
 // 返回 (newCount, nowExhausted)
-func incrementCount(alias string) (int, bool) {
+func incrementCount(upstreamName string) (int, bool) {
 	mu.Lock()
 	defer mu.Unlock()
-	st := stateMap[alias]
+	st := stateMap[upstreamName]
 	if st == nil {
-		st = initStateFor(alias)
-		stateMap[alias] = st
+		st = initStateFor(upstreamName)
+		stateMap[upstreamName] = st
 	}
-	cfg := tokenMap.Aliases[alias].Availability
+	cfg := tokenMap.Upstreams[upstreamName].Availability
 	if cfg == nil || cfg.Type != availCount {
 		return 0, false
 	}
@@ -195,18 +195,18 @@ func incrementCount(alias string) (int, bool) {
 }
 
 // applyAvailabilityResult 将provider检查结果应用到state，返回是否exhausted
-func applyAvailabilityResult(alias string, res AvailabilityResult) bool {
+func applyAvailabilityResult(upstreamName string, res AvailabilityResult) bool {
 	mu.Lock()
 	defer mu.Unlock()
-	st := stateMap[alias]
+	st := stateMap[upstreamName]
 	if st == nil {
-		st = initStateFor(alias)
-		stateMap[alias] = st
+		st = initStateFor(upstreamName)
+		stateMap[upstreamName] = st
 	}
 	st.Exhausted = res.Exhausted
 	st.LastChecked = time.Now()
 
-	cfg := tokenMap.Aliases[alias].Availability
+	cfg := tokenMap.Upstreams[upstreamName].Availability
 	isCount := cfg != nil && cfg.Type == availCount
 	if isCount {
 		// count 型：恢复依据是 cron（= RefreshCron），不使用 RecoveryAt
@@ -241,10 +241,10 @@ func applyAvailabilityResult(alias string, res AvailabilityResult) bool {
 }
 
 // ============================================================================
-// 网关：请求转发 + alias队列轮转
+// 网关：请求转发 + upstream队列轮转
 // ============================================================================
 
-// handler 主请求处理：fakeToken -> alias队列轮转
+// handler 主请求处理：fakeToken -> upstream队列轮转
 func handler(w http.ResponseWriter, r *http.Request) {
 	// 全局并发上限：acquire 一个令牌，defer 保证释放（含 panic 路径）。
 	// 通道满时阻塞排队，而非无限开新 goroutine，防止高并发下资源爆炸。
@@ -287,11 +287,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Issue 2: 读取 FakeTokens 队列须加锁
-	if !hasAliasQueue(fakeToken) {
+	if !hasUpstreamQueue(fakeToken) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid token"})
 		return
 	}
-	maxAttempts := getAliasQueueLen(fakeToken)
+	maxAttempts := getUpstreamQueueLen(fakeToken)
 	if maxAttempts < 1 {
 		maxAttempts = 1
 	}
@@ -360,21 +360,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		client = streamClient
 	}
 
-	// alias 队列轮转：最多尝试 maxAttempts 次（每次 attempt 对应一次真实上游请求 + 可能的后续重试）。
-	// 原子挑选由 pickFirstAvailableAlias 一次加锁完成：跳过所有已 exhausted 的前置 alias（移到队尾），
-	// 返回首个可用 alias 及其配置快照，消除原 pickFirst→isExhausted→rotate 三次加锁间的 TOCTOU 竞态。
+	// upstream 队列轮转：最多尝试 maxAttempts 次（每次 attempt 对应一次真实上游请求 + 可能的后续重试）。
+	// 原子挑选由 pickFirstAvailableUpstream 一次加锁完成：跳过所有已 exhausted 的前置 upstream（移到队尾），
+	// 返回首个可用 upstream 及其配置快照，消除原三次加锁间的 TOCTOU 竞态。
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		alias, aliasCfg, rotated := pickFirstAvailableAlias(fakeToken)
+		upstreamName, upstreamCfg, rotated := pickFirstAvailableUpstream(fakeToken)
 		if len(rotated) > 0 {
-			log.Printf("[ROTATE] fakeToken=%s skipped exhausted aliases=%v (attempt=%d)",
+			log.Printf("[ROTATE] fakeToken=%s skipped exhausted upstreams=%v (attempt=%d)",
 				maskFakeToken(fakeToken), rotated, attempt+1)
 		}
-		if alias == "" {
+		if upstreamName == "" {
 			// 整队列不可用（含配置缺失兜底）——提前返回 503，避免空转 maxAttempts 次
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "No available alias"})
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "No available upstream"})
 			return
 		}
-		// aliasCfg 由 pickFirstAvailableAlias 一次性快照返回，无需再次单独加锁读 getAliasConfig
+		// upstreamCfg 由 pickFirstAvailableUpstream 一次性快照返回，无需再次单独加锁读 getUpstreamConfig
 
 		// 构造目标请求
 		query := r.URL.Query()
@@ -388,18 +388,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// 若两者都不在则回退到 X-Api-Key 或 Authorization。
 		if useGoogHeader || useQueryKey {
 			if useGoogHeader {
-				outHeaders.Set("X-Goog-Api-Key", aliasCfg.RealToken)
+				outHeaders.Set("X-Goog-Api-Key", upstreamCfg.RealToken)
 			}
 			if useQueryKey {
-				query.Set("key", aliasCfg.RealToken)
+				query.Set("key", upstreamCfg.RealToken)
 			}
 		} else if useAPIKeyHeader {
-			outHeaders.Set("X-Api-Key", aliasCfg.RealToken)
+			outHeaders.Set("X-Api-Key", upstreamCfg.RealToken)
 		} else {
-			outHeaders.Set("Authorization", "Bearer "+aliasCfg.RealToken)
+			outHeaders.Set("Authorization", "Bearer "+upstreamCfg.RealToken)
 		}
 
-		targetURL := aliasCfg.TargetBase + r.URL.Path
+		targetURL := upstreamCfg.TargetBase + r.URL.Path
 		if encoded := query.Encode(); encoded != "" {
 			targetURL += "?" + encoded
 		}
@@ -438,30 +438,30 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		log.Printf("[RES] %s %s -> %d (%dms) alias=%s",
-			r.Method, maskURL(r.URL.String()), resp.StatusCode, time.Since(start).Milliseconds(), alias)
+		log.Printf("[RES] %s %s -> %d (%dms) upstream=%s",
+			r.Method, maskURL(r.URL.String()), resp.StatusCode, time.Since(start).Milliseconds(), upstreamName)
 
-		// 可用性错误 → 触发可用性检查（singleflight 去重：同一 alias 并发触发只执行一次真实 provider 调用）
+		// 可用性错误 → 触发可用性检查（singleflight 去重：同一 upstream 并发触发只执行一次真实 provider 调用）
 		if isAvailabilityError(resp.StatusCode) {
 			// 先把错误响应体读出来（错误响应通常很小）
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			// 调用可用性检查（count型走自身判断；其它调用provider），用 singleflight 合并同 alias 并发调用
-			res := availSF.Do(alias, func() AvailabilityResult {
+			// 调用可用性检查（count型走自身判断；其它调用provider），用 singleflight 合并同 upstream 并发调用
+			res := availSF.Do(upstreamName, func() AvailabilityResult {
 				var stCopy *AvailabilityState
 				mu.RLock()
-				stCopy = stateMap[alias]
+				stCopy = stateMap[upstreamName]
 				mu.RUnlock()
-				return checkAvailability(alias, aliasCfg.Availability, stCopy)
+				return checkAvailability(upstreamName, upstreamCfg.Availability, stCopy)
 			})
-			exhausted := applyAvailabilityResult(alias, res)
+			exhausted := applyAvailabilityResult(upstreamName, res)
 
 			if exhausted {
-				log.Printf("[AVAIL] alias=%s exhausted (status=%d) -> rotate", alias, resp.StatusCode)
-				rotateAliasToEnd(fakeToken, alias)
+				log.Printf("[AVAIL] upstream=%s exhausted (status=%d) -> rotate", upstreamName, resp.StatusCode)
+				rotateUpstreamToEnd(fakeToken, upstreamName)
 				cancelReq() // 释放本次迭代context（continue前）
-				// 继续尝试下一个alias
+				// 继续尝试下一个upstream
 				continue
 			}
 			// 非exhaust但返回可用性错误 → 把错误响应返回给客户端
@@ -486,14 +486,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// 可用性错误 4xx(401/402/403/429) 已在上分支 continue/return，传输错误已提前 return，
 		// 故此处只需额外门禁 modelStr != "" 与状态码 < 300。
 		// 无 model 名（如 /v1/models 列模型、无 body 的查询请求）视为非计费请求，跳过计数。
-		if aliasCfg.Availability != nil && aliasCfg.Availability.Type == availCount &&
+		if upstreamCfg.Availability != nil && upstreamCfg.Availability.Type == availCount &&
 			modelStr != "" && resp.StatusCode < 300 {
-			_, nowExhausted := incrementCount(alias)
+			_, nowExhausted := incrementCount(upstreamName)
 			if nowExhausted {
-				log.Printf("[COUNT] alias=%s reached limit -> exhaust+rotate", alias)
-				rotateAliasToEnd(fakeToken, alias)
+				log.Printf("[COUNT] upstream=%s reached limit -> exhaust+rotate", upstreamName)
+				rotateUpstreamToEnd(fakeToken, upstreamName)
 			} else {
-				log.Printf("[COUNT] alias=%s incremented count (status=%d)", alias, resp.StatusCode)
+				log.Printf("[COUNT] upstream=%s incremented count (status=%d)", upstreamName, resp.StatusCode)
 			}
 		}
 
@@ -551,7 +551,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 所有尝试都用尽（全部exhaust）
-	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "All aliases exhausted"})
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "All upstreams exhausted"})
 }
 
 // maskFakeToken 简单脱敏fakeToken用于日志
@@ -566,9 +566,9 @@ func maskFakeToken(t string) string {
 // /status 端点：暴露运行时状态（脱敏），供运维排查
 // ============================================================================
 
-// statusAlias 单个 alias 的运行时视图（给 /status 用）。
+// statusUpstream 单个 upstream 的运行时视图（给 /status 用）。
 // realToken 脱敏为首尾各 4 字符，targetBase 完整暴露便于排查路由。
-type statusAlias struct {
+type statusUpstream struct {
 	Name           string         `json:"name"`
 	TargetBase     string         `json:"targetBase"`
 	RealToken      string         `json:"realToken"`
@@ -586,8 +586,8 @@ type statusAlias struct {
 
 // statusResponse /status 的响应体。
 type statusResponse struct {
-	Aliases    []statusAlias      `json:"aliases"`
-	FakeTokens map[string][]string `json:"fakeTokens"` // fakeToken(脱敏) -> alias 名队列
+	Upstreams  []statusUpstream    `json:"upstreams"`
+	FakeTokens map[string][]string `json:"fakeTokens"` // fakeToken(脱敏) -> upstream 名队列
 }
 
 // handlerStatus 构建内存状态的脱敏快照并通过 /status 返回。
@@ -599,7 +599,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.RLock()
 
-	// 收集每个 alias 出现在哪些 fakeToken 队列中
+	// 收集每个 upstream 出现在哪些 fakeToken 队列中
 	queueFor := make(map[string][]string)
 	for ft, q := range tokenMap.FakeTokens {
 		ftMasked := maskFakeToken(ft)
@@ -609,19 +609,19 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := statusResponse{
-		Aliases:    make([]statusAlias, 0, len(tokenMap.Aliases)),
+		Upstreams:  make([]statusUpstream, 0, len(tokenMap.Upstreams)),
 		FakeTokens: make(map[string][]string, len(tokenMap.FakeTokens)),
 	}
 
-	for name, alias := range tokenMap.Aliases {
+	for name, upstream := range tokenMap.Upstreams {
 		st := stateMap[name]
-		sa := statusAlias{
+		sa := statusUpstream{
 			Name:       name,
-			TargetBase: alias.TargetBase,
-			RealToken:  maskToken(alias.RealToken),
+			TargetBase: upstream.TargetBase,
+			RealToken:  maskToken(upstream.RealToken),
 		}
-		if alias.Availability != nil {
-			sa.AvailType = alias.Availability.Type
+		if upstream.Availability != nil {
+			sa.AvailType = upstream.Availability.Type
 		}
 		if st != nil {
 			sa.Exhausted = st.Exhausted
@@ -639,7 +639,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 		if qf, ok := queueFor[name]; ok {
 			sa.QueueFor = qf
 		}
-		resp.Aliases = append(resp.Aliases, sa)
+		resp.Upstreams = append(resp.Upstreams, sa)
 	}
 
 	for ft, q := range tokenMap.FakeTokens {

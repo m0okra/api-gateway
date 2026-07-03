@@ -7,7 +7,7 @@ import (
 
 // ============================================================================
 // 调度goroutine：exhaust恢复 + 状态保存检查
-//   - 每1s：检查每个alias的恢复调度依据
+//   - 每1s：检查每个upstream的恢复调度依据
 //       count型 → RecoveryCron 周期匹配
 //       usage/balance/exhaust型 → now >= RecoveryAt 时间点触发
 //     且距上次实际触发 > recoveryMinGap，触发恢复
@@ -55,20 +55,20 @@ if dirty := func() bool {
 	}
 }
 
-// checkRecovery 遍历所有alias，判断是否触发恢复：
+// checkRecovery 遍历所有upstream，判断是否触发恢复：
 //   - count型：RecoveryCron 周期匹配
 //   - usage/balance/exhaust型：now >= RecoveryAt 时间点触发
 //     （RecoveryAt 为零值视为旧文件迁移，立即触发一次 provider 检查）
 //     统一受 recoveryMinGap 约束，防止短时间内重复触发
 func checkRecovery(now time.Time) {
 	mu.RLock()
-	// 复制一份需要触发的alias名，避免长时间持锁且不持有 state 指针
+	// 复制一份需要触发的upstream名，避免长时间持锁且不持有 state 指针
 	var toRecover []string
 	for name, st := range stateMap {
 		if st == nil || !st.Exhausted {
 			continue
 		}
-		cfg := tokenMap.Aliases[name].Availability
+		cfg := tokenMap.Upstreams[name].Availability
 		isCount := cfg != nil && cfg.Type == availCount
 
 		if isCount {
@@ -98,18 +98,18 @@ func checkRecovery(now time.Time) {
 	mu.RUnlock()
 
 	for _, name := range toRecover {
-		recoverAlias(name, now)
+		recoverUpstream(name, now)
 	}
 }
 
-func recoverAlias(name string, now time.Time) {
+func recoverUpstream(name string, now time.Time) {
 	mu.Lock()
 	cur := stateMap[name]
 	if cur == nil || !cur.Exhausted {
 		mu.Unlock()
 		return
 	}
-	cfg := tokenMap.Aliases[name].Availability
+	cfg := tokenMap.Upstreams[name].Availability
 
 	// count型：直接重置count并恢复。
 	// 注意：count 型语义由网关自行计数 + cron 周期重置驱动，不依赖 provider 检查，
@@ -121,7 +121,7 @@ func recoverAlias(name string, now time.Time) {
 		cur.LastRecovery = now
 		markDirty()
 		mu.Unlock()
-		log.Printf("[recover] alias=%s count reset (exhausted=false)", name)
+		log.Printf("[recover] upstream=%s count reset (exhausted=false)", name)
 		return
 	}
 
@@ -135,12 +135,25 @@ func recoverAlias(name string, now time.Time) {
 		cur.LastRecovery = now
 		markDirty()
 		mu.Unlock()
-		log.Printf("[recover] alias=%s no-config auto-recovered (exhausted=false)", name)
+		log.Printf("[recover] upstream=%s no-config auto-recovered (exhausted=false)", name)
 		return
 	}
 
-	// usage/balance/exhaust型：先做值拷贝快照，释放锁后调用provider校验。
-	// 用 availSF singleflight 合并：若 handler 路径正在对同一 alias 做可用性检查，
+	// exhaust型：到达 RecoveryAt 直接恢复，不调用 provider。
+	// 因为 fallbackResult 永远返回 Exhausted=true，若走下方 provider 路径会死循环。
+	if cfg.Type == availExhaust {
+		cur.Exhausted = false
+		cur.RecoveryAt = time.Time{}
+		cur.RecoveryCron = ""
+		cur.LastRecovery = now
+		markDirty()
+		mu.Unlock()
+		log.Printf("[recover] upstream=%s exhaust auto-recovered (exhausted=false)", name)
+		return
+	}
+
+	// usage/balance型：先做值拷贝快照，释放锁后调用provider校验。
+	// 用 availSF singleflight 合并：若 handler 路径正在对同一 upstream 做可用性检查，
 	// 这里复用其结果，避免并发对外部 provider 发起重复请求。
 	stCopy := *cur
 	mu.Unlock()
@@ -157,5 +170,5 @@ func recoverAlias(name string, now time.Time) {
 		markDirty()
 	}
 	mu.Unlock()
-	log.Printf("[recover] alias=%s rechecked by provider (exhausted=%v)", name, res.Exhausted)
+	log.Printf("[recover] upstream=%s rechecked by provider (exhausted=%v)", name, res.Exhausted)
 }

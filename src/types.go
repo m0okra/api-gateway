@@ -7,15 +7,15 @@ import "time"
 // ============================================================================
 
 // TokenMapConfig 是 EncryptedTokenMap 的顶层结构，包含两个映射：
-//   - FakeTokens: fakeToken -> alias队列（按优先级排序）
-//   - Aliases:    alias -> 实际工作所需内容（realToken、targetBase、可用性配置等）
+//   - FakeTokens: fakeToken -> upstream队列（按优先级排序）
+//   - Upstreams:    upstream -> 实际工作所需内容（realToken、targetBase、可用性配置等）
 type TokenMapConfig struct {
-	FakeTokens map[string][]string    `json:"fakeTokens"`
-	Aliases    map[string]AliasConfig `json:"aliases"`
+	FakeTokens map[string][]string      `json:"fakeTokens"`
+	Upstreams  map[string]UpstreamConfig `json:"upstreams"`
 }
 
-// AliasConfig 单个alias的配置
-type AliasConfig struct {
+// UpstreamConfig 单个upstream的配置
+type UpstreamConfig struct {
 	RealToken    string              `json:"realToken"`
 	TargetBase   string              `json:"targetBase"`
 	Availability *AvailabilityConfig `json:"availability,omitempty"`
