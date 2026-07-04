@@ -715,6 +715,7 @@ type openaiResponsesToAnthropicStream struct {
 	openThinkingBlockIdx *int
 	toolBlocks           map[string]*responsesToolBlock
 	openToolIndices      map[int]bool
+	partBlockIndex       map[string]int
 	hasSentStop          bool
 	hasSetStopReason     bool
 	pendingStopReason    string
@@ -856,6 +857,9 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 	if s.openToolIndices == nil {
 		s.openToolIndices = make(map[int]bool)
 	}
+	if s.partBlockIndex == nil {
+		s.partBlockIndex = make(map[string]int)
+	}
 
 	switch eventType {
 	case "response.created":
@@ -942,6 +946,94 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 				"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
 			}))...)
 			s.openThinkingBlockIdx = nil
+		}
+
+	case "response.reasoning_summary_text.delta":
+		// 某些 Codex 版本不发 response.reasoning.delta，而是发 summary 事件。
+		// 复用 thinking block 逻辑（与 response.reasoning.delta 一致）。
+		s.ensureMessageStart(&output)
+		if s.openTextBlockIndex != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openTextBlockIndex,
+			}))...)
+			s.openTextBlockIndex = nil
+		}
+		if s.openThinkingBlockIdx == nil {
+			idx := s.nextContentIndex
+			s.nextContentIndex++
+			s.openThinkingBlockIdx = &idx
+			output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+			}))...)
+		}
+		if delta := getString(data, "delta"); delta != "" {
+			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": *s.openThinkingBlockIdx,
+				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": delta},
+			}))...)
+		}
+
+	case "response.reasoning_summary_text.done":
+		if s.openThinkingBlockIdx != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+			}))...)
+			s.openThinkingBlockIdx = nil
+		}
+
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		// part 级别事件，不直接产生内容，忽略
+
+	case "response.content_part.added":
+		// 显式内容块边界：为 output_text 类型开新 text block。
+		// 若上游不发此事件，output_text.delta 的懒开逻辑仍能正常工作。
+		s.ensureMessageStart(&output)
+		if s.openThinkingBlockIdx != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+			}))...)
+			s.openThinkingBlockIdx = nil
+		}
+		outputIdx := intFromInterface(data["output_index"])
+		contentIdx := intFromInterface(data["content_index"])
+		key := fmt.Sprintf("%d:%d", outputIdx, contentIdx)
+		part := getMap(data, "part")
+		partType := getString(part, "type")
+		if partType == "output_text" || partType == "text" || partType == "" {
+			if s.openTextBlockIndex == nil {
+				idx := s.nextContentIndex
+				s.nextContentIndex++
+				s.openTextBlockIndex = &idx
+				s.partBlockIndex[key] = idx
+				output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         idx,
+					"content_block": map[string]interface{}{"type": "text", "text": ""},
+				}))...)
+			} else {
+				s.partBlockIndex[key] = *s.openTextBlockIndex
+			}
+		} else {
+			s.partBlockIndex[key] = -1
+		}
+
+	case "response.content_part.done":
+		outputIdx := intFromInterface(data["output_index"])
+		contentIdx := intFromInterface(data["content_index"])
+		key := fmt.Sprintf("%d:%d", outputIdx, contentIdx)
+		if idx, exists := s.partBlockIndex[key]; exists {
+			if idx >= 0 {
+				output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+					"type": "content_block_stop", "index": idx,
+				}))...)
+				if s.openTextBlockIndex != nil && *s.openTextBlockIndex == idx {
+					s.openTextBlockIndex = nil
+				}
+			}
+			delete(s.partBlockIndex, key)
 		}
 
 	case "response.function_call_arguments.delta":
@@ -1340,6 +1432,10 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 			// 影子存储：抓取 thoughtSignature 供下一轮 Anthropic→Gemini 复用
 			if tc.thoughtSignature != "" {
 				storeGeminiThoughtSignature(id, tc.thoughtSignature)
+			}
+			// 影子存储：首个工具调用时存完整 Gemini parts（含 thought:true 块）
+			if i == 0 {
+				storeGeminiAssistantTurn(id, parts)
 			}
 			output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
 				"type":  "content_block_start",

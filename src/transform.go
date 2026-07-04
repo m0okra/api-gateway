@@ -296,6 +296,24 @@ func supportsReasoningEffort(model string) bool {
 	return isOSSeries(model)
 }
 
+// openaiExtraPassthroughFields 是 Anthropic↔OpenAI 转换时额外透传的标准参数。
+// 这些参数在两种格式中字段名一致，可直接透传，避免客户端设置静默失效。
+// stop 已单独处理（Anthropic 用 stop_sequences），stream_options 已单独注入，不在此列。
+var openaiExtraPassthroughFields = []string{
+	"frequency_penalty",
+	"logit_bias",
+	"logprobs",
+	"metadata",
+	"n",
+	"parallel_tool_calls",
+	"presence_penalty",
+	"response_format",
+	"seed",
+	"service_tier",
+	"top_logprobs",
+	"user",
+}
+
 // resolveReasoningEffort 从 Anthropic thinking 配置提取 reasoning effort。
 // 优先级：output_config.effort > thinking.budget_tokens。
 // budget_tokens 阈值与 cc-switch 对齐：<4096→low, 4096-16383→medium, >=16384→high。
@@ -1038,6 +1056,11 @@ func anthropicToOpenAIChatRequest(body map[string]interface{}, preserveReasoning
 			}
 		}
 	}
+	for _, key := range openaiExtraPassthroughFields {
+		if v, ok := body[key]; ok {
+			result[key] = v
+		}
+	}
 	if ss := getArray(body, "stop_sequences"); ss != nil {
 		result["stop"] = ss
 	}
@@ -1371,6 +1394,11 @@ func anthropicToOpenAIResponsesRequest(body map[string]interface{}) (map[string]
 			result[key] = v
 		}
 	}
+	for _, key := range openaiExtraPassthroughFields {
+		if v, ok := body[key]; ok {
+			result[key] = v
+		}
+	}
 
 	// reasoning effort
 	if supportsReasoningEffort(model) {
@@ -1482,6 +1510,20 @@ func shapeForCodexBackendInBytes(body []byte, fastMode bool) ([]byte, error) {
 	return json.Marshal(parsed)
 }
 
+// injectPromptCacheKeyInBytes 向 Responses 格式请求体注入 prompt_cache_key 字段。
+// 空值时不注入。用于利用上游的缓存路由优化。
+func injectPromptCacheKeyInBytes(body []byte, cacheKey string) ([]byte, error) {
+	if cacheKey == "" {
+		return body, nil
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return body, err
+	}
+	parsed["prompt_cache_key"] = cacheKey
+	return json.Marshal(parsed)
+}
+
 // convertAnthropicMessagesToResponsesInput 将 Anthropic messages 转为 Responses API input。
 // tool_use 提升为顶层 function_call 项，tool_result 提升为 function_call_output 项。
 func convertAnthropicMessagesToResponsesInput(messages []interface{}) []interface{} {
@@ -1534,6 +1576,24 @@ func convertAnthropicMessagesToResponsesInput(messages []interface{}) []interfac
 						contentParts = append(contentParts, map[string]interface{}{
 							"type":      "input_image",
 							"image_url": "data:" + mediaType + ";base64," + data,
+						})
+					}
+				}
+			case "document":
+				source := getMap(bm, "source")
+				if source != nil {
+					mediaType := getString(source, "media_type")
+					if mediaType == "" {
+						mediaType = "application/pdf"
+					}
+					data := getString(source, "data")
+					if data != "" {
+						contentParts = append(contentParts, map[string]interface{}{
+							"type": "input_file",
+							"file_data": map[string]interface{}{
+								"mime_type": mediaType,
+								"data":      data,
+							},
 						})
 					}
 				}
@@ -1720,7 +1780,17 @@ func convertAnthropicMessagesToGeminiContents(messages []interface{}, toolNames 
 		if role == "assistant" {
 			geminiRole = "model"
 		}
-		parts := convertAnthropicContentToGeminiParts(m["content"], toolNames)
+		// 影子存储回放：assistant 消息含 tool_use 时，尝试用原始 Gemini parts 替换，
+		// 保留 thought:true 块和 thoughtSignature，避免 Gemini 校验失败
+		var parts []interface{}
+		if role == "assistant" {
+			if stored := tryLookupGeminiAssistantParts(m["content"]); stored != nil {
+				parts = stored
+			}
+		}
+		if parts == nil {
+			parts = convertAnthropicContentToGeminiParts(m["content"], toolNames)
+		}
 		if len(parts) > 0 {
 			contents = append(contents, map[string]interface{}{
 				"role":  geminiRole,
@@ -1729,6 +1799,30 @@ func convertAnthropicMessagesToGeminiContents(messages []interface{}, toolNames 
 		}
 	}
 	return contents
+}
+
+// tryLookupGeminiAssistantParts 尝试从影子存储中查找 Anthropic assistant 消息
+// 对应的原始 Gemini parts。通过第一个 tool_use 块的 id 查找。
+// 返回 nil 表示未找到，调用方应回退到正常转换。
+func tryLookupGeminiAssistantParts(content interface{}) []interface{} {
+	blocks, ok := asArray(content)
+	if !ok {
+		return nil
+	}
+	for _, block := range blocks {
+		bm, ok := asMap(block)
+		if !ok {
+			continue
+		}
+		if getString(bm, "type") == "tool_use" {
+			id := getString(bm, "id")
+			if id == "" {
+				return nil
+			}
+			return lookupGeminiAssistantParts(id)
+		}
+	}
+	return nil
 }
 
 func convertAnthropicContentToGeminiParts(content interface{}, toolNames map[string]string) []interface{} {
@@ -1760,6 +1854,23 @@ func convertAnthropicContentToGeminiParts(content interface{}, toolNames map[str
 				mediaType := getString(source, "media_type")
 				data := getString(source, "data")
 				if getString(source, "type") == "base64" && data != "" {
+					parts = append(parts, map[string]interface{}{
+						"inlineData": map[string]interface{}{
+							"mimeType": mediaType,
+							"data":     data,
+						},
+					})
+				}
+			}
+		case "document":
+			source := getMap(bm, "source")
+			if source != nil {
+				mediaType := getString(source, "media_type")
+				if mediaType == "" {
+					mediaType = "application/pdf"
+				}
+				data := getString(source, "data")
+				if data != "" {
 					parts = append(parts, map[string]interface{}{
 						"inlineData": map[string]interface{}{
 							"mimeType": mediaType,
@@ -2146,6 +2257,23 @@ func geminiToAnthropicResponse(body map[string]interface{}) (map[string]interfac
 		}
 	}
 
+	// 影子存储：若 assistant turn 含 functionCall，存完整 Gemini parts
+	// （含 thought:true 块）供下一轮 Anthropic→Gemini 原样回放
+	if hasToolUse {
+		for _, part := range parts {
+			pm, ok := asMap(part)
+			if !ok {
+				continue
+			}
+			if fc := getMap(pm, "functionCall"); fc != nil {
+				if id := getString(fc, "id"); id != "" {
+					storeGeminiAssistantTurn(id, parts)
+					break
+				}
+			}
+		}
+	}
+
 	stopReason := mapGeminiFinishReason(getString(candidate, "finishReason"), hasToolUse)
 
 	if content == nil {
@@ -2239,6 +2367,11 @@ func openaiChatToAnthropicRequest(body map[string]interface{}) (map[string]inter
 	}
 
 	for _, key := range []string{"temperature", "top_p", "stream"} {
+		if v, ok := body[key]; ok {
+			result[key] = v
+		}
+	}
+	for _, key := range openaiExtraPassthroughFields {
 		if v, ok := body[key]; ok {
 			result[key] = v
 		}
@@ -2494,6 +2627,11 @@ func openaiResponsesToAnthropicRequest(body map[string]interface{}) (map[string]
 		result["max_tokens"] = mt
 	}
 	for _, key := range []string{"temperature", "top_p", "stream"} {
+		if v, ok := body[key]; ok {
+			result[key] = v
+		}
+	}
+	for _, key := range openaiExtraPassthroughFields {
 		if v, ok := body[key]; ok {
 			result[key] = v
 		}

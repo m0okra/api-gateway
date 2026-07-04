@@ -17,7 +17,11 @@ src/
 ├── scheduler.go       定时调度：exhaust 恢复检查 + 状态持久化触发
 ├── aliases.go         模型别名：从 aliases.json 加载别名映射（不存在则禁用）
 ├── transform.go       API 格式转换：4 格式 × 请求/响应转换器（openai/anthropic/gemini 互转，anthropic pivot）
-├── transform_stream.go SSE 流式转换状态机（6 方向 + 链式，经 anthropic pivot）
+├── transform_stream.go SSE 流式转换状态机（4 格式两两互转，经 anthropic pivot）
+├── gemini_shadow.go   Gemini thoughtSignature 影子存储（按 tool_call_id 存完整 parts，多轮回放）
+├── reasoning_vendor.go reasoning vendor 兼容（thinking 历史重写、thinking 禁用时剥离 effort）
+├── cache_injector.go  Anthropic cache_control 自动注入（最多 4 个断点）
+├── thinking_rectifier.go thinking signature 自动修复（400 重试时剥离 thinking 块）
 └── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、格式转换、流式响应
 ```
 
@@ -227,14 +231,21 @@ client → 网关 (带 fakeToken)
 
 - **目标格式** = upstream 配置的 `formatTransform`。
 - **客户端格式** 按请求 URL path 自动检测：`/v1/chat/completions`→openai、`/v1/responses`→openai_responses、`/v1/messages`→anthropic、`/v1beta/models/{model}:...`→gemini，其他→unknown（透传）。
-- **同族透传**：`openai` 与 `openai_responses` 互转视为同族，原样透传（两者请求/响应结构差异在转换层忽略，按需求"透传其他"）。
-- **链式转换**：跨族转换（如 openai↔gemini）经 anthropic 作为 pivot 中间格式两步完成，对调用方透明。
+- **链式转换**：任何两种不同格式间都经 anthropic 作为 pivot 中间格式两步完成（含 `openai_chat` ↔ `openai_responses`），对调用方透明。仅当客户端格式 == 目标格式时才透传。
 - **目标 path 重写**：转换路径下，目标 URL path 按目标格式规范端点替换；透传路径保留原始 `r.URL.Path`。
 - **认证头重写**：转换路径下，按目标格式注入认证（gemini→`X-Goog-Api-Key`/`?key=`；anthropic→`x-api-key`+`anthropic-version`；openai→`Authorization: Bearer`）；透传路径沿用原 token 注入优先级（`X-Goog-Api-Key`/`?key=`/`X-Api-Key`/`Authorization`）。
 
 #### 流式支持
 
-6 个跨族方向全部支持 SSE 流式转换（openai_chat↔anthropic、openai_responses↔anthropic、gemini↔anthropic，以及经 anthropic pivot 的 openai↔gemini 链式）。流式转换器实现为状态机，按 SSE 事件块增量转换，保持上游→客户端的低延迟。Gemini 流式输出采用累积快照 diff 语义（每个 chunk 携带截至当前的完整内容）。
+所有 4 种格式两两之间的 SSE 流式转换均支持（openai_chat↔anthropic、openai_responses↔anthropic、gemini↔anthropic 三个直接方向 + 经 anthropic pivot 的链式方向如 openai_chat↔openai_responses、openai↔gemini）。流式转换器实现为状态机，按 SSE 事件块增量转换，保持上游→客户端的低延迟。Gemini 流式输出采用累积快照 diff 语义（每个 chunk 携带截至当前的完整内容）。
+
+流式转换要点：
+- **reasoning 透传**：OpenAI Chat 的 `delta.reasoning`/`reasoning_content`、Responses 的 `response.reasoning.delta`/`.done` 与 `response.reasoning_summary_text.*` 事件均转成 Anthropic `thinking` block（`content_block_start` + `thinking_delta` + `content_block_stop`）。
+- **懒发 message_start**：`message_start` 推迟到首个实际内容/usage 事件时才发送，避免空响应留下"悬挂消息"。
+- **UTF-8 安全累积**：跨 TCP chunk 边界拆分的多字节 UTF-8 字符会正确累积，不损坏工具调用 JSON 参数。
+- **流式 error 事件**：上游流式传输中途出错时发送 Anthropic 格式 `event: error`，并抑制合成的 `message_stop`，避免把失败伪装成正常完成。
+- **无限空白中止**：工具调用 `arguments` 中超过 500 连续空白字符视为上游异常，中止该 tool block 以防客户端挂起。
+- **重复 finish_reason 去重**：异常上游多次发送终止事件时，`stop_reason` 仅设置一次。
 
 #### 配置示例
 
@@ -257,8 +268,35 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 - **请求转换失败 → 继续尝试下一个 upstream**：客户端请求体无法解析为目标格式时，不直接 400 中断，而是记录 `[TRANSFORM] request convert failed (will try next upstream)` 日志后继续尝试队列中的下一个 upstream（透传 upstream 不进入转换路径，可正常处理）。全部 upstream 均失败后由循环外兜底返回 `503`。
 - **响应转换失败 → 回退原 body**：响应转换出错时记日志并原样返回上游响应（非流式）；流式转换 Feed 出错则中断流并记日志。
 - **Gemini 工具调用 ID**：Gemini `functionCall` 无独立 ID 字段，转换到 anthropic/openai 时用无状态启发式合成 ID（基于调用顺序），可能与上游真实 ID 不一致；反向（anthropic/openai→gemini）时 ID 丢失。
-- **OpenAI 同族透传**：`openai` ↔ `openai_responses` 不做结构转换，仅透传。若客户端用 chat completions 格式请求一个 `formatTransform: "openai_responses"` 的 upstream，请求/响应原样转发，需客户端自行兼容。
+- **链式转换语义损耗**：`openai_chat` ↔ `openai_responses` 等跨子格式转换经 anthropic pivot 两步完成，工具调用、reasoning 等字段经历两次映射，可能出现语义损耗（如 Responses 的 namespace tool 经 anthropic 中转后降级为普通 function tool）。
 - **非法值兜底**：`formatTransform` 配置为非上述 4 个合法值时，记 `[TRANSFORM] invalid formatTransform ... -> passthrough` 警告日志后按透传处理，不报错。
+
+#### 高级转换特性
+
+除基础格式转换外，网关还内置以下增强能力（多数通过 `upstreams[].extra` map 的字符串参数按 upstream 单独启用）。`extra` map 同时承载可用性检查参数（如 OpenCode-Go 的 `cookie`/`workspaceId`，见上文），以下仅列格式转换相关的 5 个参数：
+
+**格式转换相关 `extra` 参数（5 个）**：
+
+| key | 取值 | 作用 |
+|---|---|---|
+| `codexBackend` | `"true"` / `"fast"` | 对发往 ChatGPT Codex 后端的 Responses 请求做字段整形（注入 `store:false`/`include`/`stream:true`/兜底字段，剥离 `max_output_tokens`/`temperature`/`top_p`；`fast` 额外注入 `service_tier:"priority"`） |
+| `preserveReasoningContent` | `"true"` | Anthropic→OpenAI Chat 转换时把 `thinking` 块提取为 `reasoning_content` 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 兼容） |
+| `reasoningVendor` | `"auto"` 或 `"kimi"`/`"deepseek"`/`"mimo"` 等非空值 | 重写 thinking 历史为占位符，兼容拒绝原始 thinking 块的供应商（`auto` 按 upstream 名/`targetBase` 自动检测） |
+| `stripEffortWhenThinkingDisabled` | `"true"` | `thinking.type != enabled` 时剥离 `reasoning_effort`/`output_config.effort` 参数（DeepSeek Anthropic 兼容端点要求） |
+| `promptCacheKey` | 任意非空字符串 | 对发往 Responses 上游的请求注入 `prompt_cache_key` 字段，改善上游缓存路由 |
+
+`extra` 中 `codexBackend` 与 `promptCacheKey` 作用于转换后的 `sendBody`（post-transform pass）；`preserveReasoningContent` 通过 `TransformOptions` 透传到转换函数；`reasoningVendor` 与 `stripEffortWhenThinkingDisabled` 作用于转换前的客户端请求体副本（pre-transform pass），不污染跨 attempt 复用的原始 `bodyBytes`。
+
+**其他内置增强**（无需配置，默认启用）：
+
+- **cache_control 自动注入**：upstream 配置 `cacheInjection: { enabled: true, ttl: "5m" }` 时，自动在 tools/system/最后 assistant/最后 user 消息末尾注入最多 4 个 `cache_control: {"type":"ephemeral"}` 断点，享受 Anthropic Prompt Caching 折扣。
+- **Gemini thoughtSignature 影子存储**：按 `tool_call_id` 维度存储 Gemini 的 `thoughtSignature` 与完整 assistant turn `parts` 数组（含 `thought:true` 块），多轮工具调用时原样回放，避免 Gemini 签名校验失败 400。
+- **thinking signature 自动修复**：上游返回 thinking signature 相关 400 错误时，自动剥离 thinking/redacted_thinking 块与残留 `signature` 字段后重试同一 upstream（最多 1 次）。
+- **reasoning effort 4 档映射**：`thinking.budget_tokens` 与 `output_config.effort` 映射到 `low`/`medium`/`high`/`xhigh` 四档（`adaptive` → `xhigh`），`xhigh` 在转 OpenAI 时降级为 `high`。
+- **redacted_thinking 占位符**：Anthropic 的 `redacted_thinking` 块转 OpenAI/Gemini 时替换为 `[redacted thinking]` 占位文本，保留语义。
+- **标准参数透传**：Anthropic↔OpenAI 转换时透传 `frequency_penalty`/`logit_bias`/`logprobs`/`metadata`/`n`/`parallel_tool_calls`/`presence_penalty`/`response_format`/`seed`/`service_tier`/`top_logprobs`/`user` 等 12 个标准参数，不再静默丢弃。
+- **document/input_file 支持**：Anthropic `document` 块（PDF）转 Gemini 时变 `inlineData`，转 Responses 时变 `input_file`+`file_data`。
+- **incomplete_reason 细分**：Responses `incomplete` 状态按 `incomplete_reason` 细分，仅 `max_output_tokens`/`max_tokens` 映射为 `max_tokens`，其他映射为 `end_turn`。
 
 ### 状态查询（/status）
 
@@ -414,8 +452,38 @@ curl http://localhost:9090/status
 - 状态查询：`incrementCount`（count 型自增）、`applyAvailabilityResult`（写入检查结果；按类型分流：count 写 `RecoveryCron`、其余写 `RecoveryAt`，并清理另一调度依据的残留）
 - 可用性错误（401/402/403/429）路径通过 `availSF.Do()` singleflight 去重 checkAvailability，避免并发请求重复调用 provider
 - 流式响应：idle 监控 goroutine + `maxStreamLife` context 超时硬上限，双保险
+- 格式转换集成：按 `inFormat`/`outFormat` 决定是否转换（`needsTransform`）。pre-transform pass 对客户端请求体副本应用 `reasoningVendor` 重写与 `stripEffortWhenThinkingDisabled` 剥离（不污染跨 attempt 复用的 `bodyBytes`）；post-transform pass 对转换后的 `sendBody` 应用 `codexBackend` 整形与 `promptCacheKey` 注入。`preserveReasoningContent` 通过 `TransformOptions` 透传到转换函数
+- thinking signature 重试：上游返回 400 且 `shouldRectifyThinkingSignature` 命中时，调用 `rectifyAnthropicRequest` 清理 thinking 块后重试同一 upstream（最多 1 次）
 - `writeJSON` 统一 JSON 响应写入（`globals.go` 中定义）
 - 辅助函数：`maskURL` / `maskHeadersStr` / `forwardStreamHeaders` / `removeHopHeaders` / `maskFakeToken` 用于日志脱敏和头处理
+
+### gemini_shadow.go
+
+- 全局 `geminiShadowStore`：`map[string]geminiShadowEntry`，按 `tool_call_id` 维度存储 Gemini 的 `thoughtSignature`（签名字符串）与完整 assistant turn `parts` 数组（含 `thought:true` 块）
+- `storeGeminiThoughtSignature` / `lookupGeminiThoughtSignature`：签名存取（多轮工具调用回放签名，避免 Gemini 400）
+- `storeGeminiAssistantTurn` / `lookupGeminiAssistantParts`：完整 parts 存取（回放原始 Gemini 形态的 thinking parts）
+- 条目 1h TTL（`geminiShadowTTL`），惰性清理：读取时发现过期条目即删除
+- 在 `geminiToAnthropicResponse`（非流式）与 `geminiToAnthropicStream`（流式首个 tool call）写入；在 `convertAnthropicMessagesToGeminiContents`（assistant turn 含 `tool_use` 块时）回放
+- 局限：无 session 概念，用 `tool_call_id` 全局唯一作键；多副本部署不跨实例共享
+
+### reasoning_vendor.go
+
+- `isReasoningVendorIdentifier`：大小写不敏感匹配 `moonshot`/`kimi`/`deepseek`/`mimo`/`xiaomimimo` 关键词
+- `normalizeThinkingHistoryForVendor`：对含 `tool_use` 块的 assistant 消息，剥离 thinking `signature`、空 thinking 文本替换为占位符 `"tool call"`、`redacted_thinking` 改写为 thinking 块、无 thinking 时插入占位 thinking 块
+- `stripEffortIfThinkingDisabled`：`thinking.type != enabled` 时移除 `reasoning_effort` 与 `output_config.effort`（`output_config` 仅含 effort 时整体移除）
+- byte 级封装 `normalizeThinkingHistoryForVendorInBytes` / `stripEffortIfThinkingDisabledInBytes` 供 `gateway.go` 在 pre-transform pass 调用
+
+### cache_injector.go
+
+- `injectCacheControl`：在 Anthropic 请求体注入最多 4 个 `cache_control: {"type":"ephemeral"}` 断点（tools 末尾、system 末尾、最后 assistant 消息末尾非 thinking block、最后 user 消息末尾）
+- 已有断点不覆盖；`ttl` 为空或 `"5m"` 时不带 ttl 字段，其他值带 `"ttl"` 字段
+- byte 级封装 `injectCacheControlIntoBytes` 供 `gateway.go` 在发送 body 为 Anthropic 格式时调用（含转换到 anthropic 与透传 anthropic→anthropic 两条路径）
+
+### thinking_rectifier.go
+
+- `thinkingSignatureErrorPatterns`：7 个正则匹配 Anthropic thinking signature 错误消息（`signature.*not.*valid`、`must start with a thinking block` 等）
+- `shouldRectifyThinkingSignature`：检测错误响应体是否为 thinking signature 问题
+- `rectifyAnthropicRequest`：移除所有 thinking/redacted_thinking 块、剥离非 thinking 块的 `signature` 字段、若最后一条 assistant 消息移除 thinking 后则移除顶层 `thinking` 配置
 
 ## 许可证
 

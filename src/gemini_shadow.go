@@ -15,12 +15,14 @@ import (
 //
 // 问题：Anthropic tool_use 块没有承载 Gemini thoughtSignature 的字段。
 // 若直接丢弃，下一轮把 Anthropic 历史转回 Gemini 时 functionCall 就缺
-// thoughtSignature，Gemini 校验失败。
+// thoughtSignature，Gemini 校验失败。此外，Gemini 期望其 thought:true
+// parts 原样返回，仅回放签名不够。
 //
 // 方案：仿照 cc-switch 的 shadow store，在 Gemini→Anthropic 响应转换时
 // 抓取每个 functionCall 的 thoughtSignature，以 tool_call_id 为键存入
-// 全局表；后续 Anthropic→Gemini 请求转换时按 tool_use.id 查回并附到
-// functionCall 上。条目带 TTL 防止内存无限增长。
+// 全局表；同时存储完整 Gemini parts 数组（含 thought:true 块），后续
+// Anthropic→Gemini 请求转换时按 tool_use.id 查回并原样替换 assistant turn。
+// 条目带 TTL 防止内存无限增长。
 //
 // 局限：网关无 session 概念，这里用 tool_call_id 全局唯一作键。Gemini
 // 合成的 id 形如 "toolu_xxx" 或 uuid，碰撞概率极低。多副本部署时各副本
@@ -30,6 +32,7 @@ const geminiShadowTTL = 1 * time.Hour
 
 type geminiShadowEntry struct {
 	signature string
+	parts     []interface{} // 完整 Gemini parts（含 thought:true 块），用于多轮回放
 	expireAt  time.Time
 }
 
@@ -46,10 +49,30 @@ func storeGeminiThoughtSignature(toolCallID, signature string) {
 	}
 	geminiShadowMu.Lock()
 	defer geminiShadowMu.Unlock()
-	geminiShadowStore[toolCallID] = geminiShadowEntry{
-		signature: signature,
-		expireAt:  time.Now().Add(geminiShadowTTL),
+	entry, exists := geminiShadowStore[toolCallID]
+	if !exists {
+		entry = geminiShadowEntry{expireAt: time.Now().Add(geminiShadowTTL)}
 	}
+	entry.signature = signature
+	entry.expireAt = time.Now().Add(geminiShadowTTL)
+	geminiShadowStore[toolCallID] = entry
+}
+
+// storeGeminiAssistantTurn 记录某个 tool_call_id 对应的完整 Gemini parts 数组。
+// 用于多轮对话中原样回放 assistant turn（含 thought:true 块）。
+func storeGeminiAssistantTurn(toolCallID string, parts []interface{}) {
+	if toolCallID == "" || len(parts) == 0 {
+		return
+	}
+	geminiShadowMu.Lock()
+	defer geminiShadowMu.Unlock()
+	entry, exists := geminiShadowStore[toolCallID]
+	if !exists {
+		entry = geminiShadowEntry{expireAt: time.Now().Add(geminiShadowTTL)}
+	}
+	entry.parts = parts
+	entry.expireAt = time.Now().Add(geminiShadowTTL)
+	geminiShadowStore[toolCallID] = entry
 }
 
 // lookupGeminiThoughtSignature 查询 tool_call_id 对应的 thoughtSignature。
@@ -71,6 +94,27 @@ func lookupGeminiThoughtSignature(toolCallID string) string {
 		return ""
 	}
 	return entry.signature
+}
+
+// lookupGeminiAssistantParts 查询 tool_call_id 对应的完整 Gemini parts。
+// 不存在或已过期返回 nil。用于多轮对话中原样回放 assistant turn。
+func lookupGeminiAssistantParts(toolCallID string) []interface{} {
+	if toolCallID == "" {
+		return nil
+	}
+	geminiShadowMu.RLock()
+	entry, ok := geminiShadowStore[toolCallID]
+	geminiShadowMu.RUnlock()
+	if !ok {
+		return nil
+	}
+	if time.Now().After(entry.expireAt) {
+		geminiShadowMu.Lock()
+		delete(geminiShadowStore, toolCallID)
+		geminiShadowMu.Unlock()
+		return nil
+	}
+	return entry.parts
 }
 
 // cleanupExpiredGeminiShadows 清理所有过期条目。由调度器周期调用。

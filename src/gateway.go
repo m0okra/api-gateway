@@ -497,6 +497,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 						log.Printf("[TRANSFORM] upstream=%s codex shape failed: %v", upstreamName, err)
 					}
 				}
+				// prompt_cache_key 注入：利用上游的缓存路由优化。
+				if cacheKey := upstreamCfg.Extra["promptCacheKey"]; cacheKey != "" {
+					if injected, err := injectPromptCacheKeyInBytes(sendBody, cacheKey); err == nil {
+						sendBody = injected
+					} else {
+						log.Printf("[TRANSFORM] upstream=%s prompt_cache_key inject failed: %v", upstreamName, err)
+					}
+				}
 			}
 		}
 

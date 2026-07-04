@@ -4,3 +4,5 @@ gateway.db-shm
 gateway.db-wal
 
 aliases.json
+
+*_test.go
