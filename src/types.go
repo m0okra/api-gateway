@@ -25,6 +25,17 @@ type UpstreamConfig struct {
 	// FormatTransform 控制网关在转发前/后做 API 格式转换。
 	// 取值：openai | openai_responses | anthropic | gemini | ""（空=透传）
 	FormatTransform string `json:"formatTransform,omitempty"`
+	// CacheInjection 控制 Anthropic Prompt Caching 自动断点注入。
+	// 仅在目标格式为 anthropic 时生效。nil 或 Enabled=false 时不注入。
+	CacheInjection *CacheInjectorConfig `json:"cacheInjection,omitempty"`
+}
+
+// CacheInjectorConfig 控制 Anthropic Prompt Caching 自动 cache_control 断点注入。
+type CacheInjectorConfig struct {
+	Enabled bool   `json:"enabled"`
+	// TTL 取值 "5m"（默认）或 "1h"。空串视为 "5m"。
+	// "5m" 对应 Anthropic 的 ephemeral 默认 5 分钟；"1h" 对应 1 小时扩展缓存。
+	TTL string `json:"ttl,omitempty"`
 }
 
 // AvailabilityConfig 可用性配置，对应5种基础类型

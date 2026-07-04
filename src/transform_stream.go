@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // ============================================================================
@@ -51,6 +53,23 @@ func takeSSEBlock(buffer *bytes.Buffer) (string, bool) {
 	block := string(buf[:bestPos])
 	buffer.Next(bestPos + bestLen)
 	return block, true
+}
+
+// appendUTF8Safe 将 chunk 追加到 buffer，只保留完整的 UTF-8 字符。
+// 返回尾部不完整字节（留待下次拼接），防止多字节字符被 TCP chunk 边界拆分
+// 导致 JSON 参数损坏。
+func appendUTF8Safe(buf *bytes.Buffer, chunk []byte) []byte {
+	if len(chunk) == 0 {
+		return nil
+	}
+	valid := len(chunk)
+	for valid > 0 && !utf8.Valid(chunk[:valid]) {
+		valid--
+	}
+	if valid > 0 {
+		buf.Write(chunk[:valid])
+	}
+	return chunk[valid:]
 }
 
 // ============================================================================
@@ -146,7 +165,7 @@ func newAnthropicToXStream(inFormat string) StreamConverter {
 	case formatOpenAIResponses:
 		return &anthropicToOpenAIResponsesStream{}
 	case formatGemini:
-		return &anthropicToGeminiStream{currentToolIdx: -1}
+		return &anthropicToGeminiStream{}
 	}
 	return &passthroughStreamConverter{}
 }
@@ -168,19 +187,81 @@ func mustJSON(v interface{}) string {
 	return string(b)
 }
 
+// sortedIntKeys 返回 map[int]bool 的键升序切片，用于按确定顺序发送 content_block_stop
+// 等事件，避免 map 迭代乱序导致事件顺序与 content_block_start 不匹配。
+func sortedIntKeys(m map[int]bool) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+// parseSSEBlock 解析单个 SSE 事件块，返回 event 类型与 data。
+// 多行 data: 按 SSE 规范以 \n 拼接（主流厂商只发单行 JSON，行为兼容）。
+func parseSSEBlock(block string) (eventType, data string) {
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if e, ok := stripSSEField(line, "event"); ok {
+			eventType = strings.TrimSpace(e)
+		} else if d, ok := stripSSEField(line, "data"); ok {
+			if data == "" {
+				data = d
+			} else {
+				data += "\n" + d
+			}
+		}
+	}
+	return eventType, data
+}
+
 // ============================================================================
 // OpenAI Chat SSE → Anthropic SSE（port 自 streaming.rs）
 // ============================================================================
 
+// infiniteWhitespaceThreshold 是工具调用 arguments 流中允许的连续空白字符上限。
+// 超过该阈值视为上游异常（卡死/吐空格），中止该 tool block 以防客户端无限等待。
+const infiniteWhitespaceThreshold = 500
+
 type toolBlockState struct {
-	anthropicIndex int
-	id             string
-	name           string
-	started        bool
+	anthropicIndex        int
+	id                    string
+	name                  string
+	started               bool
+	consecutiveWhitespace int
+	aborted               bool
+}
+
+// feedToolArgs 处理 OpenAI Chat/Responses 流式 arguments 增量。
+// 检测连续空白异常：若超过 infiniteWhitespaceThreshold 则标记 block.aborted=true，
+// 后续 delta 不再转发，避免某些上游在 tool 调用陷入循环时空吐空白导致客户端挂起。
+// 返回值：
+//   - "emit": 本次 delta 正常发射
+//   - "abort": 本次触发了中止（首次），调用方应发射 content_block_stop 关闭 block
+//   - "skip": 已中止，调用方跳过，不发射任何事件
+func (b *toolBlockState) feedToolArgs(args string) string {
+	if b.aborted {
+		return "skip"
+	}
+	for _, r := range args {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			b.consecutiveWhitespace++
+			if b.consecutiveWhitespace > infiniteWhitespaceThreshold {
+				b.aborted = true
+				return "abort"
+			}
+		default:
+			b.consecutiveWhitespace = 0
+		}
+	}
+	return "emit"
 }
 
 type openaiChatToAnthropicStream struct {
 	buffer              bytes.Buffer
+	utf8Remainder       []byte
 	messageID           string
 	model               string
 	nextContentIndex    int
@@ -195,7 +276,11 @@ type openaiChatToAnthropicStream struct {
 }
 
 func (s *openaiChatToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
-	s.buffer.Write(chunk)
+	if len(s.utf8Remainder) > 0 {
+		chunk = append(s.utf8Remainder, chunk...)
+		s.utf8Remainder = nil
+	}
+	s.utf8Remainder = appendUTF8Safe(&s.buffer, chunk)
 	var output []byte
 
 	for {
@@ -207,13 +292,8 @@ func (s *openaiChatToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
 			continue
 		}
 
-		// 提取 data: 行
-		var dataStr string
-		for _, line := range strings.Split(block, "\n") {
-			if d, ok := stripSSEField(strings.TrimRight(line, "\r"), "data"); ok {
-				dataStr = d
-			}
-		}
+		// 提取 data: 行（多行按 SSE 规范以 \n 拼接）
+		_, dataStr := parseSSEBlock(block)
 		if dataStr == "" {
 			continue
 		}
@@ -262,17 +342,7 @@ func (s *openaiChatToAnthropicStream) Flush() ([]byte, error) {
 	return output, nil
 }
 
-func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) []byte {
-	var output []byte
-
-	if id, ok := asString(chunk["id"]); ok && s.messageID == "" {
-		s.messageID = id
-	}
-	if m, ok := asString(chunk["model"]); ok && s.model == "" {
-		s.model = m
-	}
-
-	// 首次 chunk → message_start
+func (s *openaiChatToAnthropicStream) ensureMessageStart(output *[]byte) {
 	if !s.hasSentMessageStart {
 		s.hasSentMessageStart = true
 		event := map[string]interface{}{
@@ -285,7 +355,18 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 				"usage": map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
 			},
 		}
-		output = append(output, sseEvent("message_start", mustJSON(event))...)
+		*output = append(*output, sseEvent("message_start", mustJSON(event))...)
+	}
+}
+
+func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) []byte {
+	var output []byte
+
+	if id, ok := asString(chunk["id"]); ok && s.messageID == "" {
+		s.messageID = id
+	}
+	if m, ok := asString(chunk["model"]); ok && s.model == "" {
+		s.model = m
 	}
 
 	if s.toolBlocks == nil {
@@ -308,6 +389,7 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 
 		// text content
 		if content, ok := asString(delta["content"]); ok && content != "" {
+			s.ensureMessageStart(&output)
 			if s.openTextBlockIndex == nil {
 				idx := s.nextContentIndex
 				s.nextContentIndex++
@@ -375,6 +457,7 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 
 				if !block.started {
 					block.started = true
+					s.ensureMessageStart(&output)
 					startEvent := map[string]interface{}{
 						"type":  "content_block_start",
 						"index": block.anthropicIndex,
@@ -389,15 +472,27 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 				}
 
 				if args, ok := asString(fn["arguments"]); ok && args != "" {
-					deltaEvent := map[string]interface{}{
-						"type":  "content_block_delta",
-						"index": block.anthropicIndex,
-						"delta": map[string]interface{}{
-							"type":         "input_json_delta",
-							"partial_json": args,
-						},
+					switch block.feedToolArgs(args) {
+					case "abort":
+						stopEvent := map[string]interface{}{
+							"type":  "content_block_stop",
+							"index": block.anthropicIndex,
+						}
+						output = append(output, sseEvent("content_block_stop", mustJSON(stopEvent))...)
+						delete(s.openToolIndices, block.anthropicIndex)
+					case "emit":
+						deltaEvent := map[string]interface{}{
+							"type":  "content_block_delta",
+							"index": block.anthropicIndex,
+							"delta": map[string]interface{}{
+								"type":         "input_json_delta",
+								"partial_json": args,
+							},
+						}
+						output = append(output, sseEvent("content_block_delta", mustJSON(deltaEvent))...)
+					case "skip":
+						// 已中止，跳过
 					}
-					output = append(output, sseEvent("content_block_delta", mustJSON(deltaEvent))...)
 				}
 			}
 		}
@@ -434,6 +529,7 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 
 			if !block.started {
 				block.started = true
+				s.ensureMessageStart(&output)
 				startEvent := map[string]interface{}{
 					"type":  "content_block_start",
 					"index": block.anthropicIndex,
@@ -448,15 +544,27 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 			}
 
 			if args, ok := asString(fnCall["arguments"]); ok && args != "" {
-				deltaEvent := map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": block.anthropicIndex,
-					"delta": map[string]interface{}{
-						"type":         "input_json_delta",
-						"partial_json": args,
-					},
+				switch block.feedToolArgs(args) {
+				case "abort":
+					stopEvent := map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": block.anthropicIndex,
+					}
+					output = append(output, sseEvent("content_block_stop", mustJSON(stopEvent))...)
+					delete(s.openToolIndices, block.anthropicIndex)
+				case "emit":
+					deltaEvent := map[string]interface{}{
+						"type":  "content_block_delta",
+						"index": block.anthropicIndex,
+						"delta": map[string]interface{}{
+							"type":         "input_json_delta",
+							"partial_json": args,
+						},
+					}
+					output = append(output, sseEvent("content_block_delta", mustJSON(deltaEvent))...)
+				case "skip":
+					// 已中止，跳过
 				}
-				output = append(output, sseEvent("content_block_delta", mustJSON(deltaEvent))...)
 			}
 		}
 
@@ -481,6 +589,7 @@ func (s *openaiChatToAnthropicStream) handleDone() []byte {
 	}
 	s.hasSentStop = true
 	var output []byte
+	s.ensureMessageStart(&output)
 
 	// 关闭已打开的 text block
 	if s.openTextBlockIndex != nil {
@@ -492,16 +601,21 @@ func (s *openaiChatToAnthropicStream) handleDone() []byte {
 		s.openTextBlockIndex = nil
 	}
 
-	// 关闭已打开的 tool blocks
+	// 关闭已打开的 tool blocks（按 anthropicIndex 升序，保证与 content_block_start 顺序匹配）
+	var openIdxs []int
 	for _, block := range s.toolBlocks {
 		if s.openToolIndices[block.anthropicIndex] {
-			stopEvent := map[string]interface{}{
-				"type":  "content_block_stop",
-				"index": block.anthropicIndex,
-			}
-			output = append(output, sseEvent("content_block_stop", mustJSON(stopEvent))...)
-			delete(s.openToolIndices, block.anthropicIndex)
+			openIdxs = append(openIdxs, block.anthropicIndex)
 		}
+	}
+	sort.Ints(openIdxs)
+	for _, idx := range openIdxs {
+		stopEvent := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": idx,
+		}
+		output = append(output, sseEvent("content_block_stop", mustJSON(stopEvent))...)
+		delete(s.openToolIndices, idx)
 	}
 
 	// message_delta
@@ -536,6 +650,7 @@ func (s *openaiChatToAnthropicStream) handleDone() []byte {
 
 type openaiResponsesToAnthropicStream struct {
 	buffer              bytes.Buffer
+	utf8Remainder       []byte
 	messageID           string
 	model               string
 	hasSentMessageStart bool
@@ -544,19 +659,48 @@ type openaiResponsesToAnthropicStream struct {
 	toolBlocks          map[string]*responsesToolBlock
 	openToolIndices     map[int]bool
 	hasSentStop         bool
+	hasSetStopReason    bool
 	pendingStopReason   string
 	pendingUsage        map[string]interface{}
+	startUsage          map[string]interface{}
 }
 
 type responsesToolBlock struct {
-	anthropicIndex int
-	callID         string
-	name           string
-	started        bool
+	anthropicIndex        int
+	callID                string
+	name                  string
+	started               bool
+	consecutiveWhitespace int
+	aborted               bool
+}
+
+// feedToolArgs 检测 OpenAI Responses 流式 arguments 的连续空白异常，
+// 行为与 toolBlockState.feedToolArgs 一致。
+func (b *responsesToolBlock) feedToolArgs(args string) string {
+	if b.aborted {
+		return "skip"
+	}
+	for _, r := range args {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			b.consecutiveWhitespace++
+			if b.consecutiveWhitespace > infiniteWhitespaceThreshold {
+				b.aborted = true
+				return "abort"
+			}
+		default:
+			b.consecutiveWhitespace = 0
+		}
+	}
+	return "emit"
 }
 
 func (s *openaiResponsesToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
-	s.buffer.Write(chunk)
+	if len(s.utf8Remainder) > 0 {
+		chunk = append(s.utf8Remainder, chunk...)
+		s.utf8Remainder = nil
+	}
+	s.utf8Remainder = appendUTF8Safe(&s.buffer, chunk)
 	var output []byte
 
 	for {
@@ -568,15 +712,7 @@ func (s *openaiResponsesToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
 			continue
 		}
 
-		var eventType, dataStr string
-		for _, line := range strings.Split(block, "\n") {
-			line = strings.TrimRight(line, "\r")
-			if e, ok := stripSSEField(line, "event"); ok {
-				eventType = strings.TrimSpace(e)
-			} else if d, ok := stripSSEField(line, "data"); ok {
-				dataStr = d
-			}
-		}
+		eventType, dataStr := parseSSEBlock(block)
 		if dataStr == "" {
 			continue
 		}
@@ -592,17 +728,39 @@ func (s *openaiResponsesToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
 	return output, nil
 }
 
+func (s *openaiResponsesToAnthropicStream) ensureMessageStart(output *[]byte) {
+	if !s.hasSentMessageStart {
+		s.hasSentMessageStart = true
+		usage := s.startUsage
+		if usage == nil {
+			usage = map[string]interface{}{"input_tokens": 0, "output_tokens": 0}
+		}
+		event := map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":    s.messageID,
+				"type":  "message",
+				"role":  "assistant",
+				"model": s.model,
+				"usage": usage,
+			},
+		}
+		*output = append(*output, sseEvent("message_start", mustJSON(event))...)
+	}
+}
+
 func (s *openaiResponsesToAnthropicStream) Flush() ([]byte, error) {
 	if !s.hasSentStop {
 		s.hasSentStop = true
 		var output []byte
+		s.ensureMessageStart(&output)
 		if s.openTextBlockIndex != nil {
 			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
 				"type": "content_block_stop", "index": *s.openTextBlockIndex,
 			}))...)
 			s.openTextBlockIndex = nil
 		}
-		for idx := range s.openToolIndices {
+		for _, idx := range sortedIntKeys(s.openToolIndices) {
 			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
 				"type": "content_block_stop", "index": idx,
 			}))...)
@@ -648,21 +806,12 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 		if m, ok := asString(resp["model"]); ok {
 			s.model = m
 		}
-		s.hasSentMessageStart = true
-		startUsage := buildAnthropicUsageFromResponses(getMap(resp, "usage"))
-		event := map[string]interface{}{
-			"type": "message_start",
-			"message": map[string]interface{}{
-				"id":    s.messageID,
-				"type":  "message",
-				"role":  "assistant",
-				"model": s.model,
-				"usage": startUsage,
-			},
-		}
-		output = append(output, sseEvent("message_start", mustJSON(event))...)
+		// 懒发送：存储 startUsage 但不立即发 message_start，
+		// 等到首个内容 delta 或 emitStop 时才发。
+		s.startUsage = buildAnthropicUsageFromResponses(getMap(resp, "usage"))
 
 	case "response.output_text.delta":
+		s.ensureMessageStart(&output)
 		if s.openTextBlockIndex == nil {
 			idx := s.nextContentIndex
 			s.nextContentIndex++
@@ -712,6 +861,7 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 		}
 		if !block.started {
 			block.started = true
+			s.ensureMessageStart(&output)
 			output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
 				"type":  "content_block_start",
 				"index": block.anthropicIndex,
@@ -725,11 +875,55 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 		}
 		delta := getString(data, "delta")
 		if delta != "" {
-			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": block.anthropicIndex,
-				"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": delta},
-			}))...)
+			switch block.feedToolArgs(delta) {
+			case "abort":
+				output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": block.anthropicIndex,
+				}))...)
+				delete(s.openToolIndices, block.anthropicIndex)
+			case "emit":
+				output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": block.anthropicIndex,
+					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": delta},
+				}))...)
+			case "skip":
+				// 已中止，跳过
+			}
+		}
+
+	case "response.output_item.added":
+		// OpenAI Responses 规范：完整 item 通过 output_item.added 投递，
+		// function_call_arguments.delta 只携带 item_id/output_index/delta。
+		// 在此事件中初始化 tool block 的 callID/name，避免 content_block_start
+		// 发出空 id/name。
+		item := getMap(data, "item")
+		if item == nil || getString(item, "type") != "function_call" {
+			break
+		}
+		itemID := getString(item, "id")
+		if itemID == "" {
+			itemID = getString(data, "output_index")
+		}
+		if itemID == "" {
+			break
+		}
+		if s.toolBlocks == nil {
+			s.toolBlocks = make(map[string]*responsesToolBlock)
+		}
+		block, exists := s.toolBlocks[itemID]
+		if !exists {
+			block = &responsesToolBlock{anthropicIndex: s.nextContentIndex}
+			s.nextContentIndex++
+			s.toolBlocks[itemID] = block
+			s.openToolIndices[block.anthropicIndex] = true
+		}
+		if id, ok := asString(item["call_id"]); ok && id != "" {
+			block.callID = id
+		}
+		if name, ok := asString(item["name"]); ok && name != "" {
+			block.name = name
 		}
 
 	case "response.output_item.done":
@@ -752,9 +946,12 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 	case "response.completed":
 		resp := getMap(data, "response")
 		if resp != nil {
-			status := getString(resp, "status")
-			hasToolUse := len(s.toolBlocks) > 0
-			s.pendingStopReason = mapResponsesStopReason(status, hasToolUse)
+			if !s.hasSetStopReason {
+				s.hasSetStopReason = true
+				status := getString(resp, "status")
+				hasToolUse := len(s.toolBlocks) > 0
+				s.pendingStopReason = mapResponsesStopReason(status, hasToolUse)
+			}
 			if usage := getMap(resp, "usage"); usage != nil {
 				s.pendingUsage = buildAnthropicUsageFromResponses(usage)
 			}
@@ -763,7 +960,10 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 		output = append(output, s.emitStop()...)
 
 	case "response.incomplete":
-		s.pendingStopReason = "max_tokens"
+		if !s.hasSetStopReason {
+			s.hasSetStopReason = true
+			s.pendingStopReason = "max_tokens"
+		}
 		resp := getMap(data, "response")
 		if resp != nil {
 			if usage := getMap(resp, "usage"); usage != nil {
@@ -788,7 +988,7 @@ func (s *openaiResponsesToAnthropicStream) emitStop() []byte {
 		}))...)
 		s.openTextBlockIndex = nil
 	}
-	for idx := range s.openToolIndices {
+	for _, idx := range sortedIntKeys(s.openToolIndices) {
 		output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
 			"type": "content_block_stop", "index": idx,
 		}))...)
@@ -815,14 +1015,39 @@ func (s *openaiResponsesToAnthropicStream) emitStop() []byte {
 // ============================================================================
 
 type geminiToolCallSnapshot struct {
-	anthropicIndex int
-	id             string
-	name           string
-	args           string
+	anthropicIndex        int
+	id                    string
+	name                  string
+	args                  string
+	thoughtSignature      string
+	consecutiveWhitespace int
+	aborted               bool
+}
+
+// feedToolArgs 检测 Gemini 流式 tool args 的连续空白异常，
+// 行为与 toolBlockState.feedToolArgs 一致。
+func (b *geminiToolCallSnapshot) feedToolArgs(args string) string {
+	if b.aborted {
+		return "skip"
+	}
+	for _, r := range args {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			b.consecutiveWhitespace++
+			if b.consecutiveWhitespace > infiniteWhitespaceThreshold {
+				b.aborted = true
+				return "abort"
+			}
+		default:
+			b.consecutiveWhitespace = 0
+		}
+	}
+	return "emit"
 }
 
 type geminiToAnthropicStream struct {
 	buffer              bytes.Buffer
+	utf8Remainder       []byte
 	messageID           string
 	model               string
 	hasSentMessageStart bool
@@ -832,12 +1057,18 @@ type geminiToAnthropicStream struct {
 	toolSnapshots       []geminiToolCallSnapshot
 	openToolIndices     map[int]bool
 	hasSentStop         bool
+	hasSetStopReason    bool
 	pendingStopReason   string
 	pendingUsage        map[string]interface{}
+	startUsage          map[string]interface{}
 }
 
 func (s *geminiToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
-	s.buffer.Write(chunk)
+	if len(s.utf8Remainder) > 0 {
+		chunk = append(s.utf8Remainder, chunk...)
+		s.utf8Remainder = nil
+	}
+	s.utf8Remainder = appendUTF8Safe(&s.buffer, chunk)
 	var output []byte
 
 	for {
@@ -849,12 +1080,7 @@ func (s *geminiToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
 			continue
 		}
 
-		var dataStr string
-		for _, line := range strings.Split(block, "\n") {
-			if d, ok := stripSSEField(strings.TrimRight(line, "\r"), "data"); ok {
-				dataStr = d
-			}
-		}
+		_, dataStr := parseSSEBlock(block)
 		if dataStr == "" {
 			continue
 		}
@@ -877,19 +1103,13 @@ func (s *geminiToAnthropicStream) Flush() ([]byte, error) {
 	return nil, nil
 }
 
-func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{}) []byte {
-	var output []byte
-
-	if s.openToolIndices == nil {
-		s.openToolIndices = make(map[int]bool)
-	}
-
-	// 首次 → message_start
+func (s *geminiToAnthropicStream) ensureMessageStart(output *[]byte) {
 	if !s.hasSentMessageStart {
 		s.hasSentMessageStart = true
-		s.messageID = getString(data, "responseId")
-		s.model = getString(data, "modelVersion")
-		usage := buildAnthropicUsageFromGemini(getMap(data, "usageMetadata"))
+		usage := s.startUsage
+		if usage == nil {
+			usage = map[string]interface{}{"input_tokens": 0, "output_tokens": 0}
+		}
 		event := map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{
@@ -900,7 +1120,26 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 				"usage": usage,
 			},
 		}
-		output = append(output, sseEvent("message_start", mustJSON(event))...)
+		*output = append(*output, sseEvent("message_start", mustJSON(event))...)
+	}
+}
+
+func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{}) []byte {
+	var output []byte
+
+	if s.openToolIndices == nil {
+		s.openToolIndices = make(map[int]bool)
+	}
+
+	// 首次 chunk：存储 id/model/usage 但不立即发 message_start（懒发送）。
+	if s.messageID == "" {
+		s.messageID = getString(data, "responseId")
+	}
+	if s.model == "" {
+		s.model = getString(data, "modelVersion")
+	}
+	if s.startUsage == nil {
+		s.startUsage = buildAnthropicUsageFromGemini(getMap(data, "usageMetadata"))
 	}
 
 	candidates := getArray(data, "candidates")
@@ -920,15 +1159,22 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 
 	// 提取累积文本
 	currentText := extractGeminiVisibleText(parts)
-	// diff 取增量
+	// diff 取增量：仅当当前快照不短于已累积长度时才视为单调增长并取增量。
+	// Gemini 规范下累积快照应单调增长，但偶发短快照（非规范）时若无条件覆盖，
+	// 下一轮增长会从截断基底 diff 导致文本重复。
 	var newText string
 	if len(currentText) > len(s.accumulatedText) {
 		newText = currentText[len(s.accumulatedText):]
+		s.accumulatedText = currentText
+	} else if currentText == s.accumulatedText {
+		// 等长且相同：无增量，保持基底
+	} else if len(currentText) < len(s.accumulatedText) {
+		// 短快照：不回退基底，忽略该快照的文本差异
 	}
-	s.accumulatedText = currentText
 
 	// 输出文本增量
 	if newText != "" {
+		s.ensureMessageStart(&output)
 		if s.openTextBlockIndex == nil {
 			idx := s.nextContentIndex
 			s.nextContentIndex++
@@ -957,6 +1203,7 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 			block = &s.toolSnapshots[i]
 		} else {
 			// 新工具调用 → content_block_start
+			s.ensureMessageStart(&output)
 			idx := s.nextContentIndex
 			s.nextContentIndex++
 			s.openToolIndices[idx] = true
@@ -974,6 +1221,10 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 			if id == "" {
 				id = synthesizeToolCallID()
 			}
+			// 影子存储：抓取 thoughtSignature 供下一轮 Anthropic→Gemini 复用
+			if tc.thoughtSignature != "" {
+				storeGeminiThoughtSignature(id, tc.thoughtSignature)
+			}
 			output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
 				"type":  "content_block_start",
 				"index": idx,
@@ -988,6 +1239,7 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 			block.id = id
 			block.name = tc.name
 			block.anthropicIndex = idx
+			block.thoughtSignature = tc.thoughtSignature
 		}
 
 		// 输出 args 增量
@@ -995,17 +1247,31 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 		if len(newArgs) > len(block.args) {
 			delta := newArgs[len(block.args):]
 			block.args = newArgs
-			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
-				"type":  "content_block_delta",
-				"index": block.anthropicIndex,
-				"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": delta},
-			}))...)
+			switch block.feedToolArgs(delta) {
+			case "abort":
+				output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": block.anthropicIndex,
+				}))...)
+				delete(s.openToolIndices, block.anthropicIndex)
+			case "emit":
+				output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": block.anthropicIndex,
+					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": delta},
+				}))...)
+			case "skip":
+				// 已中止，跳过
+			}
 		}
 	}
 
 	// finishReason
 	if fr := getString(candidate, "finishReason"); fr != "" {
-		s.pendingStopReason = mapGeminiFinishReason(fr, hasToolUse)
+		if !s.hasSetStopReason {
+			s.hasSetStopReason = true
+			s.pendingStopReason = mapGeminiFinishReason(fr, hasToolUse)
+		}
 		// 更新 usage
 		if usage := getMap(data, "usageMetadata"); usage != nil {
 			s.pendingUsage = buildAnthropicUsageFromGemini(usage)
@@ -1022,6 +1288,7 @@ func (s *geminiToAnthropicStream) emitStop() []byte {
 	}
 	s.hasSentStop = true
 	var output []byte
+	s.ensureMessageStart(&output)
 
 	if s.openTextBlockIndex != nil {
 		output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
@@ -1029,7 +1296,7 @@ func (s *geminiToAnthropicStream) emitStop() []byte {
 		}))...)
 		s.openTextBlockIndex = nil
 	}
-	for idx := range s.openToolIndices {
+	for _, idx := range sortedIntKeys(s.openToolIndices) {
 		output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
 			"type": "content_block_stop", "index": idx,
 		}))...)
@@ -1080,7 +1347,13 @@ func extractGeminiToolCalls(parts []interface{}) []geminiToolCallSnapshot {
 			id := getString(fc, "id")
 			name := getString(fc, "name")
 			args := canonicalJSONString(fc["args"])
-			calls = append(calls, geminiToolCallSnapshot{id: id, name: name, args: args})
+			sig := extractGeminiThoughtSignature(fc)
+			calls = append(calls, geminiToolCallSnapshot{
+				id:               id,
+				name:             name,
+				args:             args,
+				thoughtSignature: sig,
+			})
 		}
 	}
 	return calls
@@ -1092,20 +1365,24 @@ func extractGeminiToolCalls(parts []interface{}) []geminiToolCallSnapshot {
 
 type anthropicToOpenAIChatStream struct {
 	buffer            bytes.Buffer
+	utf8Remainder     []byte
 	messageID         string
 	model             string
-	hasSentFirstChunk bool
-	currentToolIndex  *int
 	nextToolCallIndex int
-	toolCallID        string
-	toolCallName      string
-	pendingStopReason string
-	pendingUsage      map[string]interface{}
-	hasSentDone       bool
+	// anthropic block index → openai tool_calls.index，用于并行工具调用的 delta 路由
+	toolCallIdxByBlock map[int]int
+	pendingStopReason  string
+	pendingUsage       map[string]interface{}
+	startUsage         map[string]interface{} // message_start.message.usage（含 input_tokens）
+	hasSentDone        bool
 }
 
 func (s *anthropicToOpenAIChatStream) Feed(chunk []byte) ([]byte, error) {
-	s.buffer.Write(chunk)
+	if len(s.utf8Remainder) > 0 {
+		chunk = append(s.utf8Remainder, chunk...)
+		s.utf8Remainder = nil
+	}
+	s.utf8Remainder = appendUTF8Safe(&s.buffer, chunk)
 	var output []byte
 
 	for {
@@ -1117,15 +1394,7 @@ func (s *anthropicToOpenAIChatStream) Feed(chunk []byte) ([]byte, error) {
 			continue
 		}
 
-		var eventType, dataStr string
-		for _, line := range strings.Split(block, "\n") {
-			line = strings.TrimRight(line, "\r")
-			if e, ok := stripSSEField(line, "event"); ok {
-				eventType = strings.TrimSpace(e)
-			} else if d, ok := stripSSEField(line, "data"); ok {
-				dataStr = d
-			}
-		}
+		eventType, dataStr := parseSSEBlock(block)
 		if dataStr == "" {
 			continue
 		}
@@ -1157,9 +1426,13 @@ func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, dat
 		if msg != nil {
 			s.messageID = getString(msg, "id")
 			s.model = getString(msg, "model")
+			// message_start.usage 携带 input_tokens（及 cache 字段），message_delta.usage
+			// 仅含 output_tokens，需在此捕获以便最终合并。
+			if u := getMap(msg, "usage"); u != nil {
+				s.startUsage = u
+			}
 		}
 		// 发出初始 chunk（role only）
-		s.hasSentFirstChunk = true
 		chunk := map[string]interface{}{
 			"id":     s.messageID,
 			"object": "chat.completion.chunk",
@@ -1179,11 +1452,16 @@ func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, dat
 		if block != nil {
 			blockType := getString(block, "type")
 			if blockType == "tool_use" {
+				idxf, _ := data["index"].(float64)
+				blockIdx := int(idxf)
 				idx := s.nextToolCallIndex
 				s.nextToolCallIndex++
-				s.currentToolIndex = &idx
-				s.toolCallID = getString(block, "id")
-				s.toolCallName = getString(block, "name")
+				if s.toolCallIdxByBlock == nil {
+					s.toolCallIdxByBlock = make(map[int]int)
+				}
+				s.toolCallIdxByBlock[blockIdx] = idx
+				callID := getString(block, "id")
+				callName := getString(block, "name")
 				chunk := map[string]interface{}{
 					"id":     s.messageID,
 					"object": "chat.completion.chunk",
@@ -1195,10 +1473,10 @@ func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, dat
 								"tool_calls": []interface{}{
 									map[string]interface{}{
 										"index": idx,
-										"id":    s.toolCallID,
+										"id":    callID,
 										"type":  "function",
 										"function": map[string]interface{}{
-											"name":      s.toolCallName,
+											"name":      callName,
 											"arguments": "",
 										},
 									},
@@ -1237,8 +1515,12 @@ func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, dat
 				output = append(output, sseData(mustJSON(chunk))...)
 			}
 		case "input_json_delta":
+			// 按 delta 事件自身的 index 路由到对应 tool_calls 槽位，支持并行工具调用交错发送
+			idxf, _ := data["index"].(float64)
+			blockIdx := int(idxf)
+			toolIdx, ok := s.toolCallIdxByBlock[blockIdx]
 			partial := getString(delta, "partial_json")
-			if partial != "" && s.currentToolIndex != nil {
+			if partial != "" && ok {
 				chunk := map[string]interface{}{
 					"id":     s.messageID,
 					"object": "chat.completion.chunk",
@@ -1249,7 +1531,7 @@ func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, dat
 							"delta": map[string]interface{}{
 								"tool_calls": []interface{}{
 									map[string]interface{}{
-										"index":    *s.currentToolIndex,
+										"index":    toolIdx,
 										"function": map[string]interface{}{"arguments": partial},
 									},
 								},
@@ -1263,7 +1545,7 @@ func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, dat
 		}
 
 	case "content_block_stop":
-		s.currentToolIndex = nil
+		// 无状态：delta 已按自身 index 路由，无需在此调整
 
 	case "message_delta":
 		delta := getMap(data, "delta")
@@ -1305,7 +1587,9 @@ func (s *anthropicToOpenAIChatStream) emitDone() []byte {
 		},
 	}
 	if s.pendingUsage != nil {
-		chunk["usage"] = buildOpenAIUsageFromAnthropic(s.pendingUsage)
+		chunk["usage"] = buildOpenAIUsageFromAnthropic(mergeAnthropicUsage(s.startUsage, s.pendingUsage))
+	} else if s.startUsage != nil {
+		chunk["usage"] = buildOpenAIUsageFromAnthropic(s.startUsage)
 	}
 	output = append(output, sseData(mustJSON(chunk))...)
 	output = append(output, sseData("[DONE]")...)
@@ -1317,12 +1601,12 @@ func (s *anthropicToOpenAIChatStream) emitDone() []byte {
 // ============================================================================
 
 type anthropicToOpenAIResponsesStream struct {
-	buffer           bytes.Buffer
-	messageID        string
-	model            string
-	hasSentCreated   bool
-	nextOutputIndex  int
-	nextContentIndex int
+	buffer          bytes.Buffer
+	utf8Remainder   []byte
+	messageID       string
+	model           string
+	hasSentCreated  bool
+	nextOutputIndex int
 	// 当前打开的文本块 output_index（nil 表示无打开文本块）
 	openTextOutputIdx *int
 	// anthropic block index → output item index
@@ -1331,13 +1615,24 @@ type anthropicToOpenAIResponsesStream struct {
 	funcCallItems map[int]bool
 	// 跟踪哪些 output_index 已打开（未关闭）
 	openOutputIndices map[int]bool
+	// output_index → 累积文本（message item）
+	messageText map[int]string
+	// output_index → {call_id, name}（function_call item）
+	funcCallMeta map[int]map[string]string
+	// output_index → 累积 partial_json（function_call item）
+	funcCallArgs      map[int]string
 	pendingStopReason string
 	pendingUsage      map[string]interface{}
+	startUsage        map[string]interface{} // message_start.message.usage（含 input_tokens）
 	hasSentCompleted  bool
 }
 
 func (s *anthropicToOpenAIResponsesStream) Feed(chunk []byte) ([]byte, error) {
-	s.buffer.Write(chunk)
+	if len(s.utf8Remainder) > 0 {
+		chunk = append(s.utf8Remainder, chunk...)
+		s.utf8Remainder = nil
+	}
+	s.utf8Remainder = appendUTF8Safe(&s.buffer, chunk)
 	var output []byte
 
 	for {
@@ -1349,15 +1644,7 @@ func (s *anthropicToOpenAIResponsesStream) Feed(chunk []byte) ([]byte, error) {
 			continue
 		}
 
-		var eventType, dataStr string
-		for _, line := range strings.Split(block, "\n") {
-			line = strings.TrimRight(line, "\r")
-			if e, ok := stripSSEField(line, "event"); ok {
-				eventType = strings.TrimSpace(e)
-			} else if d, ok := stripSSEField(line, "data"); ok {
-				dataStr = d
-			}
-		}
+		eventType, dataStr := parseSSEBlock(block)
 		if dataStr == "" {
 			continue
 		}
@@ -1389,11 +1676,18 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 		if msg != nil {
 			s.messageID = getString(msg, "id")
 			s.model = getString(msg, "model")
+			// message_start.usage 携带 input_tokens，message_delta.usage 仅含 output_tokens
+			if u := getMap(msg, "usage"); u != nil {
+				s.startUsage = u
+			}
 		}
 		s.hasSentCreated = true
 		s.blockOutputIdx = make(map[int]int)
 		s.funcCallItems = make(map[int]bool)
 		s.openOutputIndices = make(map[int]bool)
+		s.messageText = make(map[int]string)
+		s.funcCallMeta = make(map[int]map[string]string)
+		s.funcCallArgs = make(map[int]string)
 		// response.created
 		created := map[string]interface{}{
 			"type": "response.created",
@@ -1432,13 +1726,11 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 				},
 			}
 			output = append(output, sseEvent("response.output_item.added", mustJSON(itemAdded))...)
-			// content_part.added
-			contentIdx := s.nextContentIndex
-			s.nextContentIndex++
+			// content_part.added：每个 message item 仅含一个 output_text part，content_index 恒为 0
 			partAdded := map[string]interface{}{
 				"type":          "response.content_part.added",
 				"output_index":  outputIdx,
-				"content_index": contentIdx,
+				"content_index": 0,
 				"part":          map[string]interface{}{"type": "output_text", "text": ""},
 			}
 			output = append(output, sseEvent("response.content_part.added", mustJSON(partAdded))...)
@@ -1449,6 +1741,7 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 			s.funcCallItems[outputIdx] = true
 			callID := getString(block, "id")
 			callName := getString(block, "name")
+			s.funcCallMeta[outputIdx] = map[string]string{"call_id": callID, "name": callName}
 			// output_item.added (function_call)
 			itemAdded := map[string]interface{}{
 				"type":         "response.output_item.added",
@@ -1479,6 +1772,7 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 		case "text_delta":
 			text := getString(delta, "text")
 			if text != "" {
+				s.messageText[outputIdx] += text
 				evt := map[string]interface{}{
 					"type":          "response.output_text.delta",
 					"output_index":  outputIdx,
@@ -1490,6 +1784,7 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 		case "input_json_delta":
 			partialJSON := getString(delta, "partial_json")
 			if partialJSON != "" {
+				s.funcCallArgs[outputIdx] += partialJSON
 				evt := map[string]interface{}{
 					"type":         "response.function_call_arguments.delta",
 					"output_index": outputIdx,
@@ -1509,16 +1804,14 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 		delete(s.openOutputIndices, outputIdx)
 
 		if s.funcCallItems[outputIdx] {
-			// output_item.done (function_call)
+			// output_item.done (function_call) — 回填 call_id/name/arguments/status
 			output = append(output, sseEvent("response.output_item.done", mustJSON(map[string]interface{}{
 				"type":         "response.output_item.done",
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
-					"type": "function_call",
-				},
+				"item":         s.buildDoneItem(outputIdx),
 			}))...)
 		} else {
-			// content_part.done + output_item.done (text)
+			// content_part.done + output_item.done (text) — 回填 role/content
 			output = append(output, sseEvent("response.content_part.done", mustJSON(map[string]interface{}{
 				"type":          "response.content_part.done",
 				"output_index":  outputIdx,
@@ -1527,9 +1820,7 @@ func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string
 			output = append(output, sseEvent("response.output_item.done", mustJSON(map[string]interface{}{
 				"type":         "response.output_item.done",
 				"output_index": outputIdx,
-				"item": map[string]interface{}{
-					"type": "message",
-				},
+				"item":         s.buildDoneItem(outputIdx),
 			}))...)
 		}
 		if s.openTextOutputIdx != nil && *s.openTextOutputIdx == outputIdx {
@@ -1562,13 +1853,13 @@ func (s *anthropicToOpenAIResponsesStream) emitCompleted() []byte {
 	s.hasSentCompleted = true
 	var output []byte
 
-	// 关闭所有仍打开的 output items
+	// 关闭所有仍打开的 output items（回填完整字段）
 	for outputIdx := range s.openOutputIndices {
 		if s.funcCallItems[outputIdx] {
 			output = append(output, sseEvent("response.output_item.done", mustJSON(map[string]interface{}{
 				"type":         "response.output_item.done",
 				"output_index": outputIdx,
-				"item":         map[string]interface{}{"type": "function_call"},
+				"item":         s.buildDoneItem(outputIdx),
 			}))...)
 		} else {
 			output = append(output, sseEvent("response.content_part.done", mustJSON(map[string]interface{}{
@@ -1579,7 +1870,7 @@ func (s *anthropicToOpenAIResponsesStream) emitCompleted() []byte {
 			output = append(output, sseEvent("response.output_item.done", mustJSON(map[string]interface{}{
 				"type":         "response.output_item.done",
 				"output_index": outputIdx,
-				"item":         map[string]interface{}{"type": "message"},
+				"item":         s.buildDoneItem(outputIdx),
 			}))...)
 		}
 	}
@@ -1590,9 +1881,15 @@ func (s *anthropicToOpenAIResponsesStream) emitCompleted() []byte {
 	}
 	usage := map[string]interface{}{"input_tokens": 0, "output_tokens": 0}
 	if s.pendingUsage != nil {
-		usage = buildResponsesUsageFromAnthropic(s.pendingUsage)
+		usage = buildResponsesUsageFromAnthropic(mergeAnthropicUsage(s.startUsage, s.pendingUsage))
+	} else if s.startUsage != nil {
+		usage = buildResponsesUsageFromAnthropic(s.startUsage)
 	}
-	// response.completed
+	// response.completed：output 回填所有 item（按 output_index 升序）
+	finalOutput := make([]interface{}, 0, s.nextOutputIndex)
+	for outputIdx := 0; outputIdx < s.nextOutputIndex; outputIdx++ {
+		finalOutput = append(finalOutput, s.buildDoneItem(outputIdx))
+	}
 	completed := map[string]interface{}{
 		"type": "response.completed",
 		"response": map[string]interface{}{
@@ -1600,7 +1897,7 @@ func (s *anthropicToOpenAIResponsesStream) emitCompleted() []byte {
 			"object": "response",
 			"model":  s.model,
 			"status": status,
-			"output": []interface{}{},
+			"output": finalOutput,
 			"usage":  usage,
 		},
 	}
@@ -1608,25 +1905,69 @@ func (s *anthropicToOpenAIResponsesStream) emitCompleted() []byte {
 	return output
 }
 
+// buildDoneItem 构造 output_item.done / response.completed 中完整的 item。
+// function_call 回填 call_id/name/arguments/status；message 回填 role/content。
+func (s *anthropicToOpenAIResponsesStream) buildDoneItem(outputIdx int) map[string]interface{} {
+	if s.funcCallItems[outputIdx] {
+		item := map[string]interface{}{
+			"type":   "function_call",
+			"status": "completed",
+		}
+		if meta, ok := s.funcCallMeta[outputIdx]; ok {
+			if meta["call_id"] != "" {
+				item["call_id"] = meta["call_id"]
+			}
+			if meta["name"] != "" {
+				item["name"] = meta["name"]
+			}
+		}
+		args := s.funcCallArgs[outputIdx]
+		if args == "" {
+			item["arguments"] = "{}"
+		} else {
+			item["arguments"] = args
+		}
+		return item
+	}
+	content := s.messageText[outputIdx]
+	return map[string]interface{}{
+		"type": "message",
+		"role": "assistant",
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "output_text",
+				"text": content,
+			},
+		},
+	}
+}
+
 // ============================================================================
 // Anthropic SSE → Gemini SSE（新写 inverse）
 // ============================================================================
 
 type anthropicToGeminiStream struct {
-	buffer            bytes.Buffer
-	messageID         string
-	model             string
-	accumulatedText   strings.Builder
-	toolCalls         []map[string]interface{}
-	toolArgBuf        []strings.Builder // 每个 tool call 的 partial_json 累积
-	currentToolIdx    int               // 当前 input_json_delta 对应的工具索引，-1 表示无
+	buffer          bytes.Buffer
+	utf8Remainder   []byte
+	messageID       string
+	model           string
+	accumulatedText strings.Builder
+	toolCalls       []map[string]interface{}
+	toolArgBuf      []strings.Builder // 每个 tool call 的 partial_json 累积
+	// anthropic block index → toolCalls 切片索引，用于并行工具调用的 delta 路由
+	toolBlockIdx      map[int]int
 	pendingStopReason string
 	pendingUsage      map[string]interface{}
+	startUsage        map[string]interface{} // message_start.message.usage（含 input_tokens）
 	hasSentFinal      bool
 }
 
 func (s *anthropicToGeminiStream) Feed(chunk []byte) ([]byte, error) {
-	s.buffer.Write(chunk)
+	if len(s.utf8Remainder) > 0 {
+		chunk = append(s.utf8Remainder, chunk...)
+		s.utf8Remainder = nil
+	}
+	s.utf8Remainder = appendUTF8Safe(&s.buffer, chunk)
 	var output []byte
 
 	for {
@@ -1638,15 +1979,7 @@ func (s *anthropicToGeminiStream) Feed(chunk []byte) ([]byte, error) {
 			continue
 		}
 
-		var eventType, dataStr string
-		for _, line := range strings.Split(block, "\n") {
-			line = strings.TrimRight(line, "\r")
-			if e, ok := stripSSEField(line, "event"); ok {
-				eventType = strings.TrimSpace(e)
-			} else if d, ok := stripSSEField(line, "data"); ok {
-				dataStr = d
-			}
-		}
+		eventType, dataStr := parseSSEBlock(block)
 		if dataStr == "" {
 			continue
 		}
@@ -1678,11 +2011,17 @@ func (s *anthropicToGeminiStream) handleAnthropicEvent(eventType string, data ma
 		if msg != nil {
 			s.messageID = getString(msg, "id")
 			s.model = getString(msg, "model")
+			// message_start.usage 携带 input_tokens，message_delta.usage 仅含 output_tokens
+			if u := getMap(msg, "usage"); u != nil {
+				s.startUsage = u
+			}
 		}
 
 	case "content_block_start":
 		block := getMap(data, "content_block")
 		if block != nil && getString(block, "type") == "tool_use" {
+			idxf, _ := data["index"].(float64)
+			idx := int(idxf)
 			tc := map[string]interface{}{
 				"name": getString(block, "name"),
 			}
@@ -1690,9 +2029,12 @@ func (s *anthropicToGeminiStream) handleAnthropicEvent(eventType string, data ma
 			if id != "" && !isSynthesizedToolCallID(id) {
 				tc["id"] = id
 			}
+			if s.toolBlockIdx == nil {
+				s.toolBlockIdx = make(map[int]int)
+			}
+			s.toolBlockIdx[idx] = len(s.toolCalls)
 			s.toolCalls = append(s.toolCalls, tc)
 			s.toolArgBuf = append(s.toolArgBuf, strings.Builder{})
-			s.currentToolIdx = len(s.toolCalls) - 1
 		}
 
 	case "content_block_delta":
@@ -1710,14 +2052,18 @@ func (s *anthropicToGeminiStream) handleAnthropicEvent(eventType string, data ma
 				output = append(output, sseData(mustJSON(chunk))...)
 			}
 		case "input_json_delta":
+			// 按 delta 事件自身的 index 路由到对应 tool 块，支持并行工具调用交错发送
+			idxf, _ := data["index"].(float64)
+			idx := int(idxf)
+			toolIdx, ok := s.toolBlockIdx[idx]
 			partial := getString(delta, "partial_json")
-			if partial != "" && s.currentToolIdx >= 0 && s.currentToolIdx < len(s.toolArgBuf) {
-				s.toolArgBuf[s.currentToolIdx].WriteString(partial)
+			if partial != "" && ok && toolIdx >= 0 && toolIdx < len(s.toolArgBuf) {
+				s.toolArgBuf[toolIdx].WriteString(partial)
 			}
 		}
 
 	case "content_block_stop":
-		s.currentToolIdx = -1
+		// 无状态：delta 已按自身 index 路由，无需在此调整
 
 	case "message_delta":
 		delta := getMap(data, "delta")
@@ -1799,7 +2145,9 @@ func (s *anthropicToGeminiStream) emitFinal() []byte {
 
 	usage := map[string]interface{}{"promptTokenCount": 0, "candidatesTokenCount": 0}
 	if s.pendingUsage != nil {
-		usage = buildGeminiUsageFromAnthropic(s.pendingUsage)
+		usage = buildGeminiUsageFromAnthropic(mergeAnthropicUsage(s.startUsage, s.pendingUsage))
+	} else if s.startUsage != nil {
+		usage = buildGeminiUsageFromAnthropic(s.startUsage)
 	}
 
 	chunk := map[string]interface{}{
@@ -1819,10 +2167,12 @@ func (s *anthropicToGeminiStream) emitFinal() []byte {
 // ============================================================================
 
 type transformStreamReader struct {
-	upstream  io.ReadCloser
-	converter StreamConverter
-	buf       bytes.Buffer
-	done      bool
+	upstream   io.ReadCloser
+	converter  StreamConverter
+	buf        bytes.Buffer
+	done       bool
+	pendingErr error // upstream 非 EOF 错误，待 buf 排空后再返回给调用方
+	tmpBuf     [4096]byte
 }
 
 // transformStreamReader 创建一个 io.ReadCloser，从 upstream 读取 SSE 字节，
@@ -1836,19 +2186,23 @@ func newTransformStreamReader(inFormat, outFormat string, upstream io.ReadCloser
 
 func (r *transformStreamReader) Read(p []byte) (int, error) {
 	for {
-		// 缓冲区有数据 → 立即返回
+		// 缓冲区有数据 → 立即返回（优先排空已转换数据）
 		if r.buf.Len() > 0 {
 			return r.buf.Read(p)
+		}
+		// buf 排空后再暴露 pendingErr，避免 upstream 最后一次带数据的错误读
+		// 导致已转换尾部数据被丢弃。
+		if r.pendingErr != nil {
+			return 0, r.pendingErr
 		}
 		if r.done {
 			return 0, io.EOF
 		}
 
 		// 从 upstream 读取（阻塞直到有数据或 EOF/错误）
-		tmpBuf := make([]byte, 4096)
-		n, err := r.upstream.Read(tmpBuf)
+		n, err := r.upstream.Read(r.tmpBuf[:])
 		if n > 0 {
-			out, convErr := r.converter.Feed(tmpBuf[:n])
+			out, convErr := r.converter.Feed(r.tmpBuf[:n])
 			if convErr != nil {
 				return 0, fmt.Errorf("stream convert: %w", convErr)
 			}
@@ -1870,7 +2224,9 @@ func (r *transformStreamReader) Read(p []byte) (int, error) {
 				}
 				return 0, io.EOF
 			}
-			return 0, err
+			// 非 EOF 错误：先排空已转换数据，下次 Read 再返回 err。
+			r.pendingErr = err
+			continue
 		}
 
 		// converter 可能因等待完整 SSE 事件而未输出 → 循环继续读 upstream，

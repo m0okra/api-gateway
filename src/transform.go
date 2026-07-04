@@ -22,6 +22,10 @@ const (
 	formatGemini          = "gemini"
 )
 
+// redactedThinkingPlaceholder 是 Anthropic redacted_thinking 块转其他格式时的占位文本。
+// 加密的 thinking 无法还原为明文，用占位符保留语义，避免客户端丢失 thinking 上下文。
+const redactedThinkingPlaceholder = "[redacted thinking]"
+
 var (
 	openaiChatPathRegex      = regexp.MustCompile(`(^|.*/)(chat/completions)$`)
 	openaiResponsesPathRegex = regexp.MustCompile(`(^|.*/)(responses|responses/compact)$`)
@@ -295,7 +299,21 @@ func supportsReasoningEffort(model string) bool {
 }
 
 // resolveReasoningEffort 从 Anthropic thinking 配置提取 reasoning effort。
+// 优先级：output_config.effort > thinking.budget_tokens。
+// budget_tokens 阈值与 cc-switch 对齐：<4096→low, 4096-16383→medium, >=16384→high。
+// adaptive 字符串值映射为 xhigh（OpenAI Chat/Responses 不支持，由调用方降级为 high）。
 func resolveReasoningEffort(body map[string]interface{}) string {
+	// 优先级 1：output_config.effort（Anthropic 风格）
+	if oc := getMap(body, "output_config"); oc != nil {
+		if e, ok := asString(oc["effort"]); ok && e != "" {
+			if e == "max" {
+				return "xhigh"
+			}
+			return e
+		}
+	}
+
+	// 优先级 2：thinking.budget_tokens
 	thinking := getMap(body, "thinking")
 	if thinking == nil {
 		return ""
@@ -304,16 +322,64 @@ func resolveReasoningEffort(body map[string]interface{}) string {
 	if !ok || t != "enabled" {
 		return ""
 	}
+	// adaptive 模式 → xhigh
+	if a, ok := asString(thinking["budget_tokens"]); ok && a == "adaptive" {
+		return "xhigh"
+	}
 	if budget, ok := asFloat64(thinking["budget_tokens"]); ok {
-		if budget >= 32000 {
+		if budget >= 16384 {
 			return "high"
 		}
-		if budget >= 16000 {
+		if budget >= 4096 {
 			return "medium"
 		}
 		return "low"
 	}
 	return "medium"
+}
+
+// resolveAnthropicThinkingFromReasoning 将 OpenAI reasoning_effort / reasoning.effort
+// 反向映射为 Anthropic thinking 配置。budget_tokens 取值保证与 resolveReasoningEffort
+// 的阈值往返一致（low<4096<=medium<16384<=high）。maxTokens<=budget 时返回 nil，
+// 避免违反 Anthropic "max_tokens > budget_tokens" 约束导致上游 400。
+func resolveAnthropicThinkingFromReasoning(body map[string]interface{}, maxTokens int) map[string]interface{} {
+	effort := ""
+	if e, ok := asString(body["reasoning_effort"]); ok && e != "" {
+		effort = e
+	} else if r := getMap(body, "reasoning"); r != nil {
+		if e, ok := asString(r["effort"]); ok && e != "" {
+			effort = e
+		}
+	}
+	if effort == "" {
+		return nil
+	}
+	var budget int
+	switch effort {
+	case "low":
+		// < 4096 → low（resolveReasoningEffort 阈值）
+		budget = 2048
+	case "medium":
+		// 4096-16383 → medium
+		budget = 8192
+	case "high":
+		// >= 16384 → high
+		budget = 16384
+	case "xhigh":
+		// xhigh 无法通过 budget_tokens 完整往返（resolveReasoningEffort 仅到 high），
+		// 取 32768 使其落在 high 区间，避免无限增大；xhigh 仅由 output_config.effort=max
+		// 或 budget_tokens="adaptive" 表达
+		budget = 32768
+	default:
+		return nil
+	}
+	if maxTokens > 0 && maxTokens <= budget {
+		return nil
+	}
+	return map[string]interface{}{
+		"type":          "enabled",
+		"budget_tokens": budget,
+	}
 }
 
 // stripLeadingAnthropicBillingHeader 剥离 Claude Code 的 billing header 前缀。
@@ -692,6 +758,23 @@ func intFromInterface(v interface{}) int {
 	return 0
 }
 
+// mergeAnthropicUsage 合并 Anthropic 流式用量：input_tokens 及 cache 字段取自
+// message_start.usage（start），output_tokens 取自 message_delta.usage（delta）。
+// delta 中若也带 input_tokens 则被 start 覆盖，符合 Anthropic 规范。
+func mergeAnthropicUsage(start, delta map[string]interface{}) map[string]interface{} {
+	merged := map[string]interface{}{}
+	for k, v := range start {
+		merged[k] = v
+	}
+	if delta != nil {
+		// output_tokens 以 delta 为准（start 中的为初始预占值）
+		if v, ok := delta["output_tokens"]; ok {
+			merged["output_tokens"] = v
+		}
+	}
+	return merged
+}
+
 // ============================================================================
 // Gemini schema helpers（port 自 gemini_schema.rs）
 // ============================================================================
@@ -939,18 +1022,43 @@ func anthropicToOpenAIChatRequest(body map[string]interface{}) (map[string]inter
 	}
 
 	// 透传参数
+	isStream := false
 	for _, key := range []string{"temperature", "top_p", "stream"} {
 		if v, ok := body[key]; ok {
 			result[key] = v
+			if key == "stream" {
+				if b, ok := asBool(v); ok {
+					isStream = b
+				}
+			}
 		}
 	}
 	if ss := getArray(body, "stop_sequences"); ss != nil {
 		result["stop"] = ss
 	}
 
+	// 流式请求注入 stream_options.include_usage，确保上游在末尾 chunk 返回 usage。
+	// 不注入则转换后的 Anthropic 流 input/output/cache tokens 全为 0。
+	// 先复制客户端的 stream_options（若有），再补 include_usage。
+	if so, ok := body["stream_options"].(map[string]interface{}); ok {
+		result["stream_options"] = so
+	}
+	if isStream {
+		if existing, ok := result["stream_options"].(map[string]interface{}); ok {
+			if _, exists := existing["include_usage"]; !exists {
+				existing["include_usage"] = true
+			}
+		} else {
+			result["stream_options"] = map[string]interface{}{"include_usage": true}
+		}
+	}
+
 	// reasoning effort
 	if supportsReasoningEffort(model) {
 		if effort := resolveReasoningEffort(body); effort != "" {
+			if effort == "xhigh" {
+				effort = "high"
+			}
 			result["reasoning_effort"] = effort
 		}
 	}
@@ -1075,6 +1183,8 @@ func convertAnthropicMessageToOpenAI(role string, content interface{}) []interfa
 			})
 		case "thinking":
 			// thinking blocks are not forwarded to OpenAI
+		case "redacted_thinking":
+			textParts = append(textParts, redactedThinkingPlaceholder)
 		}
 	}
 
@@ -1244,6 +1354,9 @@ func anthropicToOpenAIResponsesRequest(body map[string]interface{}) (map[string]
 	// reasoning effort
 	if supportsReasoningEffort(model) {
 		if effort := resolveReasoningEffort(body); effort != "" {
+			if effort == "xhigh" {
+				effort = "high"
+			}
 			result["reasoning"] = map[string]interface{}{"effort": effort}
 		}
 	}
@@ -1360,6 +1473,11 @@ func convertAnthropicMessagesToResponsesInput(messages []interface{}) []interfac
 				})
 			case "thinking":
 				// skip
+			case "redacted_thinking":
+				contentParts = append(contentParts, map[string]interface{}{
+					"type": "input_text",
+					"text": redactedThinkingPlaceholder,
+				})
 			}
 		}
 
@@ -1569,12 +1687,24 @@ func convertAnthropicContentToGeminiParts(content interface{}, toolNames map[str
 				}
 			}
 		case "tool_use":
+			toolCallID := getString(bm, "id")
+			functionCall := map[string]interface{}{
+				"id":   toolCallID,
+				"name": getString(bm, "name"),
+				"args": ensureArgsMap(bm["input"]),
+			}
+			// 影子存储：从历史响应中查回 thoughtSignature，附到 functionCall 上，
+			// 让 Gemini 能校验多轮工具调用的 thinking 完整性
+			if sig := lookupGeminiThoughtSignature(toolCallID); sig != "" {
+				functionCall["thoughtSignature"] = sig
+			}
 			parts = append(parts, map[string]interface{}{
-				"functionCall": map[string]interface{}{
-					"id":   getString(bm, "id"),
-					"name": getString(bm, "name"),
-					"args": ensureArgsMap(bm["input"]),
-				},
+				"functionCall": functionCall,
+			})
+		case "redacted_thinking":
+			parts = append(parts, map[string]interface{}{
+				"text":    redactedThinkingPlaceholder,
+				"thought": true,
 			})
 		case "tool_result":
 			toolUseID := getString(bm, "tool_use_id")
@@ -1868,6 +1998,10 @@ func geminiToAnthropicResponse(body map[string]interface{}) (map[string]interfac
 			if id == "" {
 				id = synthesizeToolCallID()
 			}
+			// 影子存储：抓取 thoughtSignature 供下一轮 Anthropic→Gemini 复用
+			if sig := extractGeminiThoughtSignature(fc); sig != "" {
+				storeGeminiThoughtSignature(id, sig)
+			}
 			content = append(content, map[string]interface{}{
 				"type":  "tool_use",
 				"id":    id,
@@ -1937,7 +2071,7 @@ func openaiChatToAnthropicRequest(body map[string]interface{}) (map[string]inter
 			toolResult := map[string]interface{}{
 				"type":        "tool_result",
 				"tool_use_id": getString(m, "tool_call_id"),
-				"content":     getString(m, "content"),
+				"content":     extractOpenAIToolContent(m["content"]),
 			}
 			if merged := mergeToolResultIntoLastUser(messages, toolResult); merged {
 				continue
@@ -1961,13 +2095,24 @@ func openaiChatToAnthropicRequest(body map[string]interface{}) (map[string]inter
 		result["max_tokens"] = mct
 	}
 
+	// reasoning_effort / reasoning.effort → thinking（反向映射，对称正向 resolveReasoningEffort）
+	if supportsReasoningEffort(model) {
+		maxTokens := intFromInterface(result["max_tokens"])
+		if thinking := resolveAnthropicThinkingFromReasoning(body, maxTokens); thinking != nil {
+			result["thinking"] = thinking
+		}
+	}
+
 	for _, key := range []string{"temperature", "top_p", "stream"} {
 		if v, ok := body[key]; ok {
 			result[key] = v
 		}
 	}
-	if stop := getArray(body, "stop"); stop != nil {
-		result["stop_sequences"] = stop
+	// stop：OpenAI 允许字符串或字符串数组，统一转为数组
+	if stopArr := getArray(body, "stop"); stopArr != nil {
+		result["stop_sequences"] = stopArr
+	} else if stopStr, ok := asString(body["stop"]); ok && stopStr != "" {
+		result["stop_sequences"] = []interface{}{stopStr}
 	}
 
 	// tools
@@ -2001,6 +2146,32 @@ func openaiChatToAnthropicRequest(body map[string]interface{}) (map[string]inter
 	}
 
 	return result, nil
+}
+
+// extractOpenAIToolContent 提取 OpenAI tool 角色消息的 content。
+// content 可为字符串或数组（OpenAI 规范允许 tool 角色返回多段文本），
+// 数组时拼接所有 text/input_text 段，其它类型段忽略。
+func extractOpenAIToolContent(content interface{}) string {
+	if s, ok := asString(content); ok {
+		return s
+	}
+	if arr, ok := asArray(content); ok {
+		var sb strings.Builder
+		for _, c := range arr {
+			cm, ok := asMap(c)
+			if !ok {
+				continue
+			}
+			ct := getString(cm, "type")
+			if ct == "text" || ct == "input_text" || ct == "output_text" || ct == "" {
+				if t, ok := asString(cm["text"]); ok {
+					sb.WriteString(t)
+				}
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // mergeToolResultIntoLastUser 尝试将 toolResult 合并到 messages 末尾的 user 消息中。
@@ -2168,7 +2339,19 @@ func openaiResponsesToAnthropicRequest(body map[string]interface{}) (map[string]
 		result["system"] = instructions
 	}
 
-	inputArr := getArray(body, "input")
+	// input 可为数组（标准）或字符串（单条 user 消息简写），统一成数组处理
+	var inputArr []interface{}
+	if arr := getArray(body, "input"); arr != nil {
+		inputArr = arr
+	} else if s, ok := asString(body["input"]); ok && s != "" {
+		inputArr = []interface{}{
+			map[string]interface{}{
+				"type":    "message",
+				"role":    "user",
+				"content": s,
+			},
+		}
+	}
 	messages := convertResponsesInputToAnthropicMessages(inputArr)
 	result["messages"] = messages
 
@@ -2178,6 +2361,14 @@ func openaiResponsesToAnthropicRequest(body map[string]interface{}) (map[string]
 	for _, key := range []string{"temperature", "top_p", "stream"} {
 		if v, ok := body[key]; ok {
 			result[key] = v
+		}
+	}
+
+	// reasoning_effort / reasoning.effort → thinking（反向映射）
+	if supportsReasoningEffort(model) {
+		maxTokens := intFromInterface(result["max_tokens"])
+		if thinking := resolveAnthropicThinkingFromReasoning(body, maxTokens); thinking != nil {
+			result["thinking"] = thinking
 		}
 	}
 
@@ -2373,6 +2564,13 @@ func mapResponsesToolChoiceToAnthropic(tc interface{}) interface{} {
 // geminiToAnthropicRequest 将 Gemini generateContent 请求转为 Anthropic Messages 请求。
 func geminiToAnthropicRequest(body map[string]interface{}) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
+
+	// model：Gemini body 不含 model 字段（模型名在 URL path），由 TransformRequest
+	// 兜底回写到 body["model"]。此处显式复制到 result，保证链式（gemini→anthropic→X）
+	// 下游转换器能从 anthropic body 读到 model。
+	if m := getString(body, "model"); m != "" {
+		result["model"] = m
+	}
 
 	// systemInstruction → system
 	if si := getMap(body, "systemInstruction"); si != nil {
@@ -2774,6 +2972,15 @@ func TransformRequest(inFormat, outFormat string, body []byte, model string, isS
 	}
 	if parsed == nil {
 		parsed = map[string]interface{}{}
+	}
+
+	// 归一化 model：Gemini 风格请求的模型名位于 URL path（由调用方传入 model 参数），
+	// body 中无 model 字段。此处兜底回写，确保下游转换器（含链式 anthropic 中转）
+	// 能从 body["model"] 读到模型名，避免发往上游的请求体缺失 model。
+	if m, ok := asString(parsed["model"]); !ok || m == "" {
+		if model != "" {
+			parsed["model"] = model
+		}
 	}
 
 	result, err := transformRequestBody(inFormat, outFormat, parsed)

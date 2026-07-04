@@ -432,13 +432,30 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if doTransform && hasBody {
 			newBody, newModel, terr := TransformRequest(inFormat, outFormat, bodyBytes, modelStr, isStream)
 			if terr != nil {
-				log.Printf("[TRANSFORM] request convert failed: %v", terr)
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Format transform failed: " + terr.Error()})
-				return
+				// 请求转换失败不直接 400 中断：队列中后续 upstream 可能是透传
+				// （formatTransform 为空，doTransform=false）或不同 outFormat，
+				// 本可成功处理同一请求体。改为 continue 让后续 upstream 继续尝试，
+				// 全部失败后由循环外兜底 503。此处尚未创建 reqCtx/HTTP 请求，无需 cancel。
+				log.Printf("[TRANSFORM] request convert failed (will try next upstream): %v", terr)
+				continue
 			}
 			sendBody = newBody
 			if newModel != "" {
 				sendModel = newModel
+			}
+		}
+
+		// Anthropic Prompt Caching 自动注入 cache_control 断点。
+		// 触发条件：upstream 显式配置 cacheInjection.Enabled 且发送给上游的 body 为 Anthropic 格式
+		// （转换到 anthropic，或透传 anthropic 客户端请求到 anthropic 上游）。
+		if hasBody && upstreamCfg.CacheInjection != nil && upstreamCfg.CacheInjection.Enabled {
+			isAnthropicOut := outFormat == formatAnthropic || (outFormat == "" && inFormat == formatAnthropic)
+			if isAnthropicOut {
+				if injected, err := injectCacheControlIntoBytes(sendBody, upstreamCfg.CacheInjection); err == nil {
+					sendBody = injected
+				} else {
+					log.Printf("[CACHE-INJECT] upstream=%s inject failed: %v", upstreamName, err)
+				}
 			}
 		}
 
@@ -481,6 +498,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if hasBody {
 			bodyReader = bytes.NewReader(sendBody)
 		}
+
+		// thinking signature 自动修复：仅允许同一 upstream 内重试 1 次
+		rectified := false
 
 		// Issue 1: 移除循环内 defer cancelReq()，改在每个退出分支显式调用
 		reqCtx, cancelReq := context.WithCancel(r.Context())
@@ -538,7 +558,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				// 继续尝试下一个upstream
 				continue
 			}
-			// 非exhaust但返回可用性错误 → 把错误响应返回给客户端
+			// 非exhaust但返回可用性错误 → 把错误响应返回给客户端。
+			// 转换路径下先经 TransformErrorResponse 转为客户端格式，保持错误体格式一致。
+			respBody := errBody
+			if doTransform {
+				respBody = TransformErrorResponse(inFormat, outFormat, errBody)
+			}
 			for k, vs := range resp.Header {
 				k = http.CanonicalHeaderKey(k)
 				if k == "Content-Length" || k == "Transfer-Encoding" || k == "Connection" {
@@ -549,11 +574,64 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			w.WriteHeader(resp.StatusCode)
-			if _, werr := w.Write(errBody); werr != nil {
+			if _, werr := w.Write(respBody); werr != nil {
 				log.Printf("[resp] write error response failed: %v", werr)
 			}
 			cancelReq()
 			return
+		}
+
+		// thinking signature 自动修复：检测 Anthropic 上游 400 thinking signature 错误，
+		// 剥离请求中的 thinking 块后重试同一 upstream 一次。仅当发送给上游的 body 为
+		// Anthropic 格式时触发（转换到 anthropic 或透传 anthropic 客户端请求）。
+		if resp.StatusCode == 400 && hasBody && !rectified {
+			isAnthropicOut := outFormat == formatAnthropic || (outFormat == "" && inFormat == formatAnthropic)
+			if isAnthropicOut {
+				errBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+
+				if shouldRectifyThinkingSignature(errBody) {
+					log.Printf("[THINKING-RECTIFY] upstream=%s 400 thinking signature error, retrying with thinking blocks stripped", upstreamName)
+					newBody, rerr := rectifyAnthropicRequestBytes(sendBody)
+					if rerr == nil {
+						sendBody = newBody
+						rectified = true
+						// 释放旧 context 并重建请求
+						cancelReq()
+						reqCtx, cancelReq = context.WithCancel(r.Context())
+						if isStream {
+							lifeCtx, lifeCancel := context.WithTimeout(reqCtx, maxStreamLife)
+							origCancel := cancelReq
+							reqCtx = lifeCtx
+							cancelReq = func() { lifeCancel(); origCancel() }
+						}
+						bodyReader = bytes.NewReader(sendBody)
+						retryReq, rerr2 := http.NewRequestWithContext(reqCtx, r.Method, targetURL, bodyReader)
+						if rerr2 != nil {
+							cancelReq()
+							log.Printf("[ERR] %s %s -> %v (rectify retry)", r.Method, maskURL(targetURL), rerr2)
+							writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Proxy error"})
+							return
+						}
+						retryReq.Header = outHeaders
+						resp, err = client.Do(retryReq)
+						if err != nil {
+							cancelReq()
+							log.Printf("[ERR] %s %s -> %v (rectify retry)", r.Method, maskURL(targetURL), err)
+							writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Proxy error"})
+							return
+						}
+						log.Printf("[RES] %s %s -> %d (%dms) upstream=%s (rectify retry)",
+							r.Method, maskURL(r.URL.String()), resp.StatusCode, time.Since(start).Milliseconds(), upstreamName)
+					} else {
+						// rectify 失败：还原 body 供后续错误处理
+						resp.Body = io.NopCloser(bytes.NewReader(errBody))
+					}
+				} else {
+					// 非 thinking signature 错误：还原 body 供后续错误处理
+					resp.Body = io.NopCloser(bytes.NewReader(errBody))
+				}
+			}
 		}
 
 		// count型：仅成功（2xx）且携带 model 名（计费请求）才计数。

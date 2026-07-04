@@ -19,19 +19,21 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 	defer ticker.Stop()
 	saveTicker := time.NewTicker(stateSaveInterval)
 	defer saveTicker.Stop()
+	shadowCleanupTicker := time.NewTicker(10 * time.Minute)
+	defer shadowCleanupTicker.Stop()
 	defer close(done)
 
 	for {
 		select {
 		case <-stopCh:
 			// 退出前若有未保存状态则保存
-if dirty := func() bool {
+	if dirty := func() bool {
 				mu.RLock()
 				defer mu.RUnlock()
 				return stateDirty
 			}(); dirty {
-			if err := saveState(); err != nil {
-				log.Printf("[scheduler] final save failed: %v", err)
+				if err := saveState(); err != nil {
+					log.Printf("[scheduler] final save failed: %v", err)
 				} else {
 					log.Printf("[scheduler] final state saved")
 				}
@@ -40,17 +42,19 @@ if dirty := func() bool {
 		case now := <-ticker.C:
 			checkRecovery(now)
 		case <-saveTicker.C:
-if dirty := func() bool {
+	if dirty := func() bool {
 				mu.RLock()
 				defer mu.RUnlock()
 				return stateDirty
 			}(); dirty {
-			if err := saveState(); err != nil {
-				log.Printf("[scheduler] save state failed: %v", err)
+				if err := saveState(); err != nil {
+					log.Printf("[scheduler] save state failed: %v", err)
 				} else {
 					log.Printf("[scheduler] state saved")
 				}
 			}
+		case <-shadowCleanupTicker.C:
+			cleanupExpiredGeminiShadows()
 		}
 	}
 }

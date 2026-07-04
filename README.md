@@ -253,8 +253,8 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 
 #### 限制说明
 
-- **错误响应不转换**：4xx/5xx 错误响应体按原透传逻辑返回（可用性错误分支不变）。仅对 `resp.StatusCode < 300` 的成功响应做转换。理由：各厂商错误 JSON 结构差异大，转换错误体收益低风险高。
-- **请求转换失败 → 400**：客户端请求体无法解析为目标格式时，网关返回 `400 Bad Request` 并记录 `[TRANSFORM] request convert failed` 日志。
+- **错误响应转换**：4xx/5xx 错误响应体在转换路径下会经 `TransformErrorResponse` 转为客户端格式后返回（包括可用性错误 401/402/403/429）。各厂商错误 JSON 结构差异较大，转换尽量保留 `error.message`/`type` 等通用字段，无法映射的字段按目标格式兜底。仅对 `resp.StatusCode < 300` 的成功响应走 `TransformResponse`。
+- **请求转换失败 → 继续尝试下一个 upstream**：客户端请求体无法解析为目标格式时，不直接 400 中断，而是记录 `[TRANSFORM] request convert failed (will try next upstream)` 日志后继续尝试队列中的下一个 upstream（透传 upstream 不进入转换路径，可正常处理）。全部 upstream 均失败后由循环外兜底返回 `503`。
 - **响应转换失败 → 回退原 body**：响应转换出错时记日志并原样返回上游响应（非流式）；流式转换 Feed 出错则中断流并记日志。
 - **Gemini 工具调用 ID**：Gemini `functionCall` 无独立 ID 字段，转换到 anthropic/openai 时用无状态启发式合成 ID（基于调用顺序），可能与上游真实 ID 不一致；反向（anthropic/openai→gemini）时 ID 丢失。
 - **OpenAI 同族透传**：`openai` ↔ `openai_responses` 不做结构转换，仅透传。若客户端用 chat completions 格式请求一个 `formatTransform: "openai_responses"` 的 upstream，请求/响应原样转发，需客户端自行兼容。
