@@ -429,8 +429,47 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// 避免重试到不同格式的 upstream 时对已转换的 body 二次转换。
 		sendBody := bodyBytes
 		sendModel := modelStr
+
+		// Pre-transform passes：对 Anthropic 客户端请求体做供应商兼容处理。
+		// 这些 pass 作用于原始客户端 body（转换前），需要本地副本避免污染 bodyBytes。
+		transformInput := bodyBytes
+		if hasBody && inFormat == formatAnthropic {
+			preBody := bodyBytes
+			// reasoningVendor：将 thinking 块重写为占位符（Kimi/DeepSeek/MiMo 等拒绝原始 thinking）
+			if rv := upstreamCfg.Extra["reasoningVendor"]; rv != "" {
+				shouldNormalize := false
+				if rv == "auto" {
+					shouldNormalize = isReasoningVendorIdentifier(upstreamName) || isReasoningVendorIdentifier(upstreamCfg.TargetBase)
+				} else {
+					shouldNormalize = true
+				}
+				if shouldNormalize {
+					if b, err := normalizeThinkingHistoryForVendorInBytes(preBody); err == nil {
+						preBody = b
+					} else {
+						log.Printf("[TRANSFORM] upstream=%s normalize thinking history failed: %v", upstreamName, err)
+					}
+				}
+			}
+			// stripEffortWhenThinkingDisabled：thinking 禁用时剥离 effort 参数（DeepSeek 兼容）
+			if upstreamCfg.Extra["stripEffortWhenThinkingDisabled"] == "true" {
+				if b, err := stripEffortIfThinkingDisabledInBytes(preBody); err == nil {
+					preBody = b
+				} else {
+					log.Printf("[TRANSFORM] upstream=%s strip effort failed: %v", upstreamName, err)
+				}
+			}
+			transformInput = preBody
+			if !doTransform {
+				sendBody = preBody
+			}
+		}
+
 		if doTransform && hasBody {
-			newBody, newModel, terr := TransformRequest(inFormat, outFormat, bodyBytes, modelStr, isStream)
+			opts := TransformOptions{
+				PreserveReasoningContent: upstreamCfg.Extra["preserveReasoningContent"] == "true",
+			}
+			newBody, newModel, terr := TransformRequestWithOptions(inFormat, outFormat, transformInput, modelStr, isStream, opts)
 			if terr != nil {
 				// 请求转换失败不直接 400 中断：队列中后续 upstream 可能是透传
 				// （formatTransform 为空，doTransform=false）或不同 outFormat，
@@ -442,6 +481,22 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			sendBody = newBody
 			if newModel != "" {
 				sendModel = newModel
+			}
+		}
+
+		// Codex OAuth 后端整形：对发往 ChatGPT Codex 后端的 Responses 请求做字段整形。
+		// 触发条件：extra["codexBackend"] 配置为 "true"（普通）或 "fast"（priority 模式），
+		// 且发送给上游的 body 为 Responses 格式（转换到 openai_responses，或透传 responses 客户端）。
+		if hasBody {
+			isResponsesOut := outFormat == formatOpenAIResponses || (outFormat == "" && inFormat == formatOpenAIResponses)
+			if isResponsesOut {
+				if codex := upstreamCfg.Extra["codexBackend"]; codex == "true" || codex == "fast" {
+					if shaped, err := shapeForCodexBackendInBytes(sendBody, codex == "fast"); err == nil {
+						sendBody = shaped
+					} else {
+						log.Printf("[TRANSFORM] upstream=%s codex shape failed: %v", upstreamName, err)
+					}
+				}
 			}
 		}
 

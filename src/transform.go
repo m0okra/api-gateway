@@ -68,15 +68,13 @@ func targetEndpointPath(format, model string, isStream bool) string {
 }
 
 // needsTransform 判断是否需要格式转换。
-// openai_chat 与 openai_responses 互相视为透传（按需求"透传其他"）。
+// openai_chat 与 openai_responses 结构不同（messages/choices vs input/output），
+// 需经 anthropic pivot 链式转换。
 func needsTransform(inFormat, outFormat string) bool {
 	if inFormat == formatUnknown || outFormat == formatUnknown {
 		return false
 	}
 	if inFormat == outFormat {
-		return false
-	}
-	if isOpenAIVariant(inFormat) && isOpenAIVariant(outFormat) {
 		return false
 	}
 	return true
@@ -978,7 +976,9 @@ func toGeminiSchema(schema map[string]interface{}) map[string]interface{} {
 // ============================================================================
 
 // anthropicToOpenAIChatRequest 将 Anthropic Messages 请求转为 OpenAI Chat Completions 请求。
-func anthropicToOpenAIChatRequest(body map[string]interface{}) (map[string]interface{}, error) {
+// preserveReasoningContent=true 时，assistant tool-call 消息的 thinking 块文本
+// 被提取为 reasoning_content 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 需要）。
+func anthropicToOpenAIChatRequest(body map[string]interface{}, preserveReasoningContent bool) (map[string]interface{}, error) {
 	result := make(map[string]interface{})
 	model := getString(body, "model")
 	if model != "" {
@@ -1010,7 +1010,7 @@ func anthropicToOpenAIChatRequest(body map[string]interface{}) (map[string]inter
 			if role == "" {
 				role = "user"
 			}
-			converted := convertAnthropicMessageToOpenAI(role, m["content"])
+			converted := convertAnthropicMessageToOpenAI(role, m["content"], preserveReasoningContent)
 			messages = append(messages, converted...)
 		}
 	}
@@ -1128,7 +1128,9 @@ func extractAnthropicSystemText(system interface{}) string {
 }
 
 // convertAnthropicMessageToOpenAI 将单条 Anthropic 消息转为 OpenAI 消息（可能产生多条）。
-func convertAnthropicMessageToOpenAI(role string, content interface{}) []interface{} {
+// preserveReasoningContent=true 时，assistant tool-call 消息的 thinking 块文本
+// 被提取为 reasoning_content 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 需要）。
+func convertAnthropicMessageToOpenAI(role string, content interface{}, preserveReasoningContent bool) []interface{} {
 	// content 为字符串 → 单条消息
 	if s, ok := asString(content); ok {
 		return []interface{}{map[string]interface{}{
@@ -1150,6 +1152,7 @@ func convertAnthropicMessageToOpenAI(role string, content interface{}) []interfa
 	var imageParts []interface{}
 	var toolCalls []interface{}
 	var toolResults []interface{}
+	var reasoningParts []string
 
 	for _, block := range blocks {
 		bm, ok := asMap(block)
@@ -1187,9 +1190,15 @@ func convertAnthropicMessageToOpenAI(role string, content interface{}) []interfa
 				"content":      resultContent,
 			})
 		case "thinking":
-			// thinking blocks are not forwarded to OpenAI
+			if t, ok := asString(bm["thinking"]); ok && t != "" {
+				reasoningParts = append(reasoningParts, t)
+			}
 		case "redacted_thinking":
-			textParts = append(textParts, redactedThinkingPlaceholder)
+			if preserveReasoningContent {
+				reasoningParts = append(reasoningParts, redactedThinkingPlaceholder)
+			} else {
+				textParts = append(textParts, redactedThinkingPlaceholder)
+			}
 		}
 	}
 
@@ -1207,6 +1216,13 @@ func convertAnthropicMessageToOpenAI(role string, content interface{}) []interfa
 		}
 		if len(toolCalls) > 0 {
 			msg["tool_calls"] = toolCalls
+			if preserveReasoningContent {
+				rc := reasoningVendorThinkingPlaceholder
+				if len(reasoningParts) > 0 {
+					rc = strings.Join(reasoningParts, "\n")
+				}
+				msg["reasoning_content"] = rc
+			}
 		}
 		result = append(result, msg)
 	} else if len(toolResults) > 0 {
@@ -1403,6 +1419,67 @@ func anthropicToOpenAIResponsesRequest(body map[string]interface{}) (map[string]
 	}
 
 	return result, nil
+}
+
+// shapeForCodexBackend 对发往 ChatGPT Codex OAuth 后端的 Responses 请求做字段整形。
+// Codex 后端（chatgpt.com/backend-api/codex）对 Responses API 请求有特殊要求：
+//   - 必须 store:false
+//   - 必须 include:["reasoning.encrypted_content"]
+//   - service_tier:"priority"（fast 模式）
+//   - 必须 stream:true
+//   - 拒绝 max_output_tokens/temperature/top_p
+//
+// fastMode=true 时注入 service_tier:"priority"。
+func shapeForCodexBackend(body map[string]interface{}, fastMode bool) {
+	body["store"] = false
+
+	const reasoningMarker = "reasoning.encrypted_content"
+	var includes []interface{}
+	if existing, ok := body["include"].([]interface{}); ok {
+		includes = append(includes, existing...)
+	}
+	found := false
+	for _, v := range includes {
+		if s, ok := v.(string); ok && s == reasoningMarker {
+			found = true
+			break
+		}
+	}
+	if !found {
+		includes = append(includes, reasoningMarker)
+	}
+	body["include"] = includes
+
+	if fastMode {
+		body["service_tier"] = "priority"
+	}
+
+	// 兜底必填字段
+	if _, ok := body["instructions"]; !ok {
+		body["instructions"] = ""
+	}
+	if _, ok := body["tools"]; !ok {
+		body["tools"] = []interface{}{}
+	}
+	if _, ok := body["parallel_tool_calls"]; !ok {
+		body["parallel_tool_calls"] = false
+	}
+
+	body["stream"] = true
+
+	delete(body, "max_output_tokens")
+	delete(body, "temperature")
+	delete(body, "top_p")
+}
+
+// shapeForCodexBackendInBytes 是 byte 级别的封装，供 gateway.go 调用。
+func shapeForCodexBackendInBytes(body []byte, fastMode bool) ([]byte, error) {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return body, err
+	}
+	shapeForCodexBackend(parsed, fastMode)
+	return json.Marshal(parsed)
 }
 
 // convertAnthropicMessagesToResponsesInput 将 Anthropic messages 转为 Responses API input。
@@ -3017,9 +3094,21 @@ func randomHex(n int) string {
 // 转换入口
 // ============================================================================
 
+// TransformOptions 控制请求转换的可选行为。
+type TransformOptions struct {
+	// PreserveReasoningContent=true 时，Anthropic→OpenAI Chat 转换将 thinking 块
+	// 文本提取为 reasoning_content 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 需要）。
+	PreserveReasoningContent bool
+}
+
 // TransformRequest 转换请求体。inFormat=客户端格式，outFormat=目标上游格式。
 // 返回转换后的 body、新 model（可能改变）、可能的错误。
 func TransformRequest(inFormat, outFormat string, body []byte, model string, isStream bool) ([]byte, string, error) {
+	return TransformRequestWithOptions(inFormat, outFormat, body, model, isStream, TransformOptions{})
+}
+
+// TransformRequestWithOptions 同 TransformRequest，但接受 TransformOptions。
+func TransformRequestWithOptions(inFormat, outFormat string, body []byte, model string, isStream bool, opts TransformOptions) ([]byte, string, error) {
 	if !needsTransform(inFormat, outFormat) {
 		return body, model, nil
 	}
@@ -3041,7 +3130,7 @@ func TransformRequest(inFormat, outFormat string, body []byte, model string, isS
 		}
 	}
 
-	result, err := transformRequestBody(inFormat, outFormat, parsed)
+	result, err := transformRequestBody(inFormat, outFormat, parsed, opts.PreserveReasoningContent)
 	if err != nil {
 		return nil, "", err
 	}
@@ -3064,10 +3153,10 @@ func TransformRequest(inFormat, outFormat string, body []byte, model string, isS
 	return out, newModel, nil
 }
 
-func transformRequestBody(inFormat, outFormat string, body map[string]interface{}) (map[string]interface{}, error) {
+func transformRequestBody(inFormat, outFormat string, body map[string]interface{}, preserveReasoningContent bool) (map[string]interface{}, error) {
 	// 直接转换
 	if inFormat == formatAnthropic {
-		return anthropicToXRequest(outFormat, body)
+		return anthropicToXRequest(outFormat, body, preserveReasoningContent)
 	}
 	if outFormat == formatAnthropic {
 		return xToAnthropicRequest(inFormat, body)
@@ -3077,13 +3166,13 @@ func transformRequestBody(inFormat, outFormat string, body map[string]interface{
 	if err != nil {
 		return nil, fmt.Errorf("chain %s→anthropic: %w", inFormat, err)
 	}
-	return anthropicToXRequest(outFormat, anthropicBody)
+	return anthropicToXRequest(outFormat, anthropicBody, preserveReasoningContent)
 }
 
-func anthropicToXRequest(outFormat string, body map[string]interface{}) (map[string]interface{}, error) {
+func anthropicToXRequest(outFormat string, body map[string]interface{}, preserveReasoningContent bool) (map[string]interface{}, error) {
 	switch outFormat {
 	case formatOpenAIChat:
-		return anthropicToOpenAIChatRequest(body)
+		return anthropicToOpenAIChatRequest(body, preserveReasoningContent)
 	case formatOpenAIResponses:
 		return anthropicToOpenAIResponsesRequest(body)
 	case formatGemini:
