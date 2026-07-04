@@ -548,7 +548,7 @@ func mapAnthropicStopReasonToOpenAI(stopReason string) string {
 	return "stop"
 }
 
-func mapResponsesStopReason(stopReason string, hasToolUse bool) string {
+func mapResponsesStopReason(stopReason, incompleteReason string, hasToolUse bool) string {
 	switch stopReason {
 	case "completed":
 		if hasToolUse {
@@ -556,7 +556,12 @@ func mapResponsesStopReason(stopReason string, hasToolUse bool) string {
 		}
 		return "end_turn"
 	case "incomplete":
-		return "max_tokens"
+		switch incompleteReason {
+		case "max_output_tokens", "max_tokens", "":
+			return "max_tokens"
+		default:
+			return "end_turn"
+		}
 	}
 	return "end_turn"
 }
@@ -1806,11 +1811,49 @@ func openaiChatToAnthropicResponse(body map[string]interface{}) (map[string]inte
 		if choice, ok := asMap(choices[0]); ok {
 			msg := getMap(choice, "message")
 			if msg != nil {
-				// text content
+				// reasoning_content（DeepSeek/Kimi 等 thinking）
+				if rc, ok := asString(msg["reasoning_content"]); ok && rc != "" {
+					content = append(content, map[string]interface{}{
+						"type":     "thinking",
+						"thinking": rc,
+					})
+				}
+				// content：字符串或数组
 				if s, ok := asString(msg["content"]); ok && s != "" {
 					content = append(content, map[string]interface{}{
 						"type": "text",
 						"text": s,
+					})
+				} else if contentArr := getArray(msg, "content"); contentArr != nil {
+					for _, c := range contentArr {
+						cm, ok := asMap(c)
+						if !ok {
+							continue
+						}
+						ct := getString(cm, "type")
+						switch ct {
+						case "text", "output_text":
+							if t, ok := asString(cm["text"]); ok && t != "" {
+								content = append(content, map[string]interface{}{
+									"type": "text",
+									"text": t,
+								})
+							}
+						case "refusal":
+							if t, ok := asString(cm["refusal"]); ok && t != "" {
+								content = append(content, map[string]interface{}{
+									"type": "text",
+									"text": "[refusal] " + t,
+								})
+							}
+						}
+					}
+				}
+				// 顶层 refusal（有些上游放在 message.refusal 而非 content 数组）
+				if r, ok := asString(msg["refusal"]); ok && r != "" {
+					content = append(content, map[string]interface{}{
+						"type": "text",
+						"text": "[refusal] " + r,
 					})
 				}
 				// tool_calls
@@ -1837,6 +1880,21 @@ func openaiChatToAnthropicResponse(body map[string]interface{}) (map[string]inte
 							"input": input,
 						})
 					}
+				}
+				// legacy function_call（老版 OpenAI 兼容）
+				if fc := getMap(msg, "function_call"); fc != nil {
+					hasToolUse = true
+					argsStr := canonicalizeToolArguments(fc["arguments"])
+					var input interface{}
+					if err := json.Unmarshal([]byte(argsStr), &input); err != nil {
+						input = map[string]interface{}{}
+					}
+					content = append(content, map[string]interface{}{
+						"type":  "tool_use",
+						"id":    getString(fc, "id"),
+						"name":  getString(fc, "name"),
+						"input": input,
+					})
 				}
 			}
 			if fr, ok := asString(choice["finish_reason"]); ok {
@@ -1918,7 +1976,7 @@ func openaiResponsesToAnthropicResponse(body map[string]interface{}) (map[string
 		}
 	}
 
-	stopReason := mapResponsesStopReason(getString(body, "status"), hasToolUse)
+	stopReason := mapResponsesStopReason(getString(body, "status"), getString(body, "incomplete_reason"), hasToolUse)
 
 	if content == nil {
 		content = []interface{}{}

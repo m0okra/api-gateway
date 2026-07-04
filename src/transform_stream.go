@@ -260,19 +260,20 @@ func (b *toolBlockState) feedToolArgs(args string) string {
 }
 
 type openaiChatToAnthropicStream struct {
-	buffer              bytes.Buffer
-	utf8Remainder       []byte
-	messageID           string
-	model               string
-	nextContentIndex    int
-	hasSentMessageStart bool
-	hasEmittedDelta     bool
-	pendingStopReason   string
-	pendingUsage        map[string]interface{}
-	hasSentStop         bool
-	openTextBlockIndex  *int
-	toolBlocks          map[int]*toolBlockState
-	openToolIndices     map[int]bool
+	buffer               bytes.Buffer
+	utf8Remainder        []byte
+	messageID            string
+	model                string
+	nextContentIndex     int
+	hasSentMessageStart  bool
+	hasEmittedDelta      bool
+	pendingStopReason    string
+	pendingUsage         map[string]interface{}
+	hasSentStop          bool
+	openTextBlockIndex   *int
+	openThinkingBlockIdx *int
+	toolBlocks           map[int]*toolBlockState
+	openToolIndices      map[int]bool
 }
 
 func (s *openaiChatToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
@@ -387,9 +388,49 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 			delta = map[string]interface{}{}
 		}
 
+		// reasoning / reasoning_content（DeepSeek/Kimi/o1 等 thinking 流）
+		reasoning := ""
+		if r, ok := asString(delta["reasoning"]); ok && r != "" {
+			reasoning = r
+		} else if r, ok := asString(delta["reasoning_content"]); ok && r != "" {
+			reasoning = r
+		}
+		if reasoning != "" {
+			s.ensureMessageStart(&output)
+			// thinking 与 text 互斥：先关闭已打开的 text block
+			if s.openTextBlockIndex != nil {
+				output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+					"type": "content_block_stop", "index": *s.openTextBlockIndex,
+				}))...)
+				s.openTextBlockIndex = nil
+			}
+			if s.openThinkingBlockIdx == nil {
+				idx := s.nextContentIndex
+				s.nextContentIndex++
+				s.openThinkingBlockIdx = &idx
+				output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         idx,
+					"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+				}))...)
+			}
+			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": *s.openThinkingBlockIdx,
+				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": reasoning},
+			}))...)
+		}
+
 		// text content
 		if content, ok := asString(delta["content"]); ok && content != "" {
 			s.ensureMessageStart(&output)
+			// thinking 与 text 互斥：先关闭已打开的 thinking block
+			if s.openThinkingBlockIdx != nil {
+				output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+					"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+				}))...)
+				s.openThinkingBlockIdx = nil
+			}
 			if s.openTextBlockIndex == nil {
 				idx := s.nextContentIndex
 				s.nextContentIndex++
@@ -425,6 +466,13 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 				}
 				output = append(output, sseEvent("content_block_stop", mustJSON(stopEvent))...)
 				s.openTextBlockIndex = nil
+			}
+			// 关闭已打开的 thinking block（thinking 与 tool_use 互斥）
+			if s.openThinkingBlockIdx != nil {
+				output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+					"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+				}))...)
+				s.openThinkingBlockIdx = nil
 			}
 
 			for _, tc := range toolCalls {
@@ -591,6 +639,14 @@ func (s *openaiChatToAnthropicStream) handleDone() []byte {
 	var output []byte
 	s.ensureMessageStart(&output)
 
+	// 关闭已打开的 thinking block
+	if s.openThinkingBlockIdx != nil {
+		output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+			"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+		}))...)
+		s.openThinkingBlockIdx = nil
+	}
+
 	// 关闭已打开的 text block
 	if s.openTextBlockIndex != nil {
 		stopEvent := map[string]interface{}{
@@ -649,20 +705,21 @@ func (s *openaiChatToAnthropicStream) handleDone() []byte {
 // ============================================================================
 
 type openaiResponsesToAnthropicStream struct {
-	buffer              bytes.Buffer
-	utf8Remainder       []byte
-	messageID           string
-	model               string
-	hasSentMessageStart bool
-	nextContentIndex    int
-	openTextBlockIndex  *int
-	toolBlocks          map[string]*responsesToolBlock
-	openToolIndices     map[int]bool
-	hasSentStop         bool
-	hasSetStopReason    bool
-	pendingStopReason   string
-	pendingUsage        map[string]interface{}
-	startUsage          map[string]interface{}
+	buffer               bytes.Buffer
+	utf8Remainder        []byte
+	messageID            string
+	model                string
+	hasSentMessageStart  bool
+	nextContentIndex     int
+	openTextBlockIndex   *int
+	openThinkingBlockIdx *int
+	toolBlocks           map[string]*responsesToolBlock
+	openToolIndices      map[int]bool
+	hasSentStop          bool
+	hasSetStopReason     bool
+	pendingStopReason    string
+	pendingUsage         map[string]interface{}
+	startUsage           map[string]interface{}
 }
 
 type responsesToolBlock struct {
@@ -754,6 +811,12 @@ func (s *openaiResponsesToAnthropicStream) Flush() ([]byte, error) {
 		s.hasSentStop = true
 		var output []byte
 		s.ensureMessageStart(&output)
+		if s.openThinkingBlockIdx != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+			}))...)
+			s.openThinkingBlockIdx = nil
+		}
 		if s.openTextBlockIndex != nil {
 			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
 				"type": "content_block_stop", "index": *s.openTextBlockIndex,
@@ -812,6 +875,13 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 
 	case "response.output_text.delta":
 		s.ensureMessageStart(&output)
+		// thinking 与 text 互斥：先关闭已打开的 thinking block
+		if s.openThinkingBlockIdx != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+			}))...)
+			s.openThinkingBlockIdx = nil
+		}
 		if s.openTextBlockIndex == nil {
 			idx := s.nextContentIndex
 			s.nextContentIndex++
@@ -837,6 +907,41 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 				"type": "content_block_stop", "index": *s.openTextBlockIndex,
 			}))...)
 			s.openTextBlockIndex = nil
+		}
+
+	case "response.reasoning.delta":
+		s.ensureMessageStart(&output)
+		// thinking 与 text 互斥：先关闭已打开的 text block
+		if s.openTextBlockIndex != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openTextBlockIndex,
+			}))...)
+			s.openTextBlockIndex = nil
+		}
+		if s.openThinkingBlockIdx == nil {
+			idx := s.nextContentIndex
+			s.nextContentIndex++
+			s.openThinkingBlockIdx = &idx
+			output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]interface{}{"type": "thinking", "thinking": ""},
+			}))...)
+		}
+		if delta := getString(data, "delta"); delta != "" {
+			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": *s.openThinkingBlockIdx,
+				"delta": map[string]interface{}{"type": "thinking_delta", "thinking": delta},
+			}))...)
+		}
+
+	case "response.reasoning.done":
+		if s.openThinkingBlockIdx != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+			}))...)
+			s.openThinkingBlockIdx = nil
 		}
 
 	case "response.function_call_arguments.delta":
@@ -950,7 +1055,7 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 				s.hasSetStopReason = true
 				status := getString(resp, "status")
 				hasToolUse := len(s.toolBlocks) > 0
-				s.pendingStopReason = mapResponsesStopReason(status, hasToolUse)
+				s.pendingStopReason = mapResponsesStopReason(status, "", hasToolUse)
 			}
 			if usage := getMap(resp, "usage"); usage != nil {
 				s.pendingUsage = buildAnthropicUsageFromResponses(usage)
@@ -960,11 +1065,16 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 		output = append(output, s.emitStop()...)
 
 	case "response.incomplete":
+		resp := getMap(data, "response")
 		if !s.hasSetStopReason {
 			s.hasSetStopReason = true
-			s.pendingStopReason = "max_tokens"
+			hasToolUse := len(s.toolBlocks) > 0
+			incompleteReason := ""
+			if resp != nil {
+				incompleteReason = getString(resp, "incomplete_reason")
+			}
+			s.pendingStopReason = mapResponsesStopReason("incomplete", incompleteReason, hasToolUse)
 		}
-		resp := getMap(data, "response")
 		if resp != nil {
 			if usage := getMap(resp, "usage"); usage != nil {
 				s.pendingUsage = buildAnthropicUsageFromResponses(usage)
@@ -982,6 +1092,12 @@ func (s *openaiResponsesToAnthropicStream) emitStop() []byte {
 	}
 	s.hasSentStop = true
 	var output []byte
+	if s.openThinkingBlockIdx != nil {
+		output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+			"type": "content_block_stop", "index": *s.openThinkingBlockIdx,
+		}))...)
+		s.openThinkingBlockIdx = nil
+	}
 	if s.openTextBlockIndex != nil {
 		output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
 			"type": "content_block_stop", "index": *s.openTextBlockIndex,
@@ -2167,12 +2283,13 @@ func (s *anthropicToGeminiStream) emitFinal() []byte {
 // ============================================================================
 
 type transformStreamReader struct {
-	upstream   io.ReadCloser
-	converter  StreamConverter
-	buf        bytes.Buffer
-	done       bool
-	pendingErr error // upstream 非 EOF 错误，待 buf 排空后再返回给调用方
-	tmpBuf     [4096]byte
+	upstream             io.ReadCloser
+	converter            StreamConverter
+	buf                  bytes.Buffer
+	done                 bool
+	pendingErr           error // upstream 非 EOF 错误，待 buf 排空后再返回给调用方
+	tmpBuf               [4096]byte
+	streamEndedWithError bool // upstream 以错误结束，抑制合成的成功终止事件
 }
 
 // transformStreamReader 创建一个 io.ReadCloser，从 upstream 读取 SSE 字节，
@@ -2211,12 +2328,15 @@ func (r *transformStreamReader) Read(p []byte) (int, error) {
 
 		if err != nil {
 			if err == io.EOF {
-				// 刷新转换器（输出残留状态，如 message_stop 等）
-				flushOut, flushErr := r.converter.Flush()
-				if flushErr != nil {
-					return 0, fmt.Errorf("stream flush: %w", flushErr)
+				// 若上游先出错再 EOF，不再 Flush 合成的成功终止事件，
+				// 避免把失败伪装成正常完成。
+				if !r.streamEndedWithError {
+					flushOut, flushErr := r.converter.Flush()
+					if flushErr != nil {
+						return 0, fmt.Errorf("stream flush: %w", flushErr)
+					}
+					r.buf.Write(flushOut)
 				}
-				r.buf.Write(flushOut)
 				r.done = true
 				// 不在此处 Close upstream，由 Close() 统一处理，避免双重关闭
 				if r.buf.Len() > 0 {
@@ -2224,7 +2344,19 @@ func (r *transformStreamReader) Read(p []byte) (int, error) {
 				}
 				return 0, io.EOF
 			}
-			// 非 EOF 错误：先排空已转换数据，下次 Read 再返回 err。
+			// 非 EOF 错误：发 Anthropic 格式 error 事件，让客户端看到错误而非静默断流。
+			// 同时标记 streamEndedWithError，抑制后续 Flush 的 message_delta/message_stop。
+			if !r.streamEndedWithError {
+				r.streamEndedWithError = true
+				errEvent := map[string]interface{}{
+					"type": "error",
+					"error": map[string]interface{}{
+						"type":    "stream_error",
+						"message": fmt.Sprintf("upstream stream error: %v", err),
+					},
+				}
+				r.buf.Write(sseEvent("error", mustJSON(errEvent)))
+			}
 			r.pendingErr = err
 			continue
 		}
