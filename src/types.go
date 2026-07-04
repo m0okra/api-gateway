@@ -22,6 +22,9 @@ type UpstreamConfig struct {
 	// Extra 持久储存provider所需的额外内容（如opencode-go的cookie/workspace_id）
 	// 对于从文件读取的内容（如gemini oauth_creds）则不储存
 	Extra map[string]string `json:"extra,omitempty"`
+	// FormatTransform 控制网关在转发前/后做 API 格式转换。
+	// 取值：openai | openai_responses | anthropic | gemini | ""（空=透传）
+	FormatTransform string `json:"formatTransform,omitempty"`
 }
 
 // AvailabilityConfig 可用性配置，对应5种基础类型

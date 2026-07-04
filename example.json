@@ -51,6 +51,7 @@
       "gemini": {
         "realToken": "***",
         "targetBase": "https://generativelanguage.googleapis.com",
+        "formatTransform": "gemini",
         "availability": {
           "type": "count",
           "limit": 250,

@@ -16,7 +16,9 @@ src/
 ├── state.go           状态管理：从 SQLite 加载/保存（锁外 I/O 快照写）、一致性协调
 ├── scheduler.go       定时调度：exhaust 恢复检查 + 状态持久化触发
 ├── aliases.go         模型别名：从 aliases.json 加载别名映射（不存在则禁用）
-└── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、流式响应
+├── transform.go       API 格式转换：4 格式 × 请求/响应转换器（openai/anthropic/gemini 互转，anthropic pivot）
+├── transform_stream.go SSE 流式转换状态机（6 方向 + 链式，经 anthropic pivot）
+└── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、格式转换、流式响应
 ```
 
 ## 编译说明
@@ -206,6 +208,57 @@ client → 网关 (带 fakeToken)
 - **不处理模型列表请求**（如 `GET /v1/models`）：此类请求无模型名，天然跳过替换。
 - body 非 JSON 或 `model` 字段非字符串时静默跳过 body 重写（不影响 URL path 重写）。
 - 仅在启动时一次性加载，运行期只读；修改 `aliases.json` 后需重启生效。文件解析失败时记录错误日志并禁用别名功能（不阻断启动）。
+
+### API 格式转换（formatTransform）
+
+每个 upstream 可选配置 `formatTransform` 字段，使网关在转发前将客户端请求体转换为目标上游的 API 格式，并在响应返回时反向转换回客户端格式。**不配置或留空时完全透传**（字节级零改动，向后兼容）。
+
+#### 可选值
+
+| 值 | 目标格式 | 说明 |
+|---|---|---|
+| `openai` | OpenAI Chat Completions | 上游走 `/v1/chat/completions` |
+| `openai_responses` | OpenAI Responses API | 上游走 `/v1/responses` |
+| `anthropic` | Anthropic Messages | 上游走 `/v1/messages` |
+| `gemini` | Google Gemini | 上游走 `/v1beta/models/{model}:generateContent`（流式 `:streamGenerateContent?alt=sse`） |
+| 不指定 | — | 透传所有请求/响应 |
+
+#### 转换规则
+
+- **目标格式** = upstream 配置的 `formatTransform`。
+- **客户端格式** 按请求 URL path 自动检测：`/v1/chat/completions`→openai、`/v1/responses`→openai_responses、`/v1/messages`→anthropic、`/v1beta/models/{model}:...`→gemini，其他→unknown（透传）。
+- **同族透传**：`openai` 与 `openai_responses` 互转视为同族，原样透传（两者请求/响应结构差异在转换层忽略，按需求"透传其他"）。
+- **链式转换**：跨族转换（如 openai↔gemini）经 anthropic 作为 pivot 中间格式两步完成，对调用方透明。
+- **目标 path 重写**：转换路径下，目标 URL path 按目标格式规范端点替换；透传路径保留原始 `r.URL.Path`。
+- **认证头重写**：转换路径下，按目标格式注入认证（gemini→`X-Goog-Api-Key`/`?key=`；anthropic→`x-api-key`+`anthropic-version`；openai→`Authorization: Bearer`）；透传路径沿用原 token 注入优先级（`X-Goog-Api-Key`/`?key=`/`X-Api-Key`/`Authorization`）。
+
+#### 流式支持
+
+6 个跨族方向全部支持 SSE 流式转换（openai_chat↔anthropic、openai_responses↔anthropic、gemini↔anthropic，以及经 anthropic pivot 的 openai↔gemini 链式）。流式转换器实现为状态机，按 SSE 事件块增量转换，保持上游→客户端的低延迟。Gemini 流式输出采用累积快照 diff 语义（每个 chunk 携带截至当前的完整内容）。
+
+#### 配置示例
+
+`example.json` 片段（让 OpenAI/Anthropic 客户端复用 Gemini 上游）：
+
+```json
+"gemini": {
+  "realToken": "***",
+  "targetBase": "https://generativelanguage.googleapis.com",
+  "formatTransform": "gemini",
+  "availability": { "type": "count", "limit": 250, "refreshCron": "0 0 16 * * *" }
+}
+```
+
+DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（`openai`/`openai_responses`/`anthropic`/`gemini`/空）。`/status` 端点的响应中 `upstreams[].formatTransform` 字段会回显当前配置。
+
+#### 限制说明
+
+- **错误响应不转换**：4xx/5xx 错误响应体按原透传逻辑返回（可用性错误分支不变）。仅对 `resp.StatusCode < 300` 的成功响应做转换。理由：各厂商错误 JSON 结构差异大，转换错误体收益低风险高。
+- **请求转换失败 → 400**：客户端请求体无法解析为目标格式时，网关返回 `400 Bad Request` 并记录 `[TRANSFORM] request convert failed` 日志。
+- **响应转换失败 → 回退原 body**：响应转换出错时记日志并原样返回上游响应（非流式）；流式转换 Feed 出错则中断流并记日志。
+- **Gemini 工具调用 ID**：Gemini `functionCall` 无独立 ID 字段，转换到 anthropic/openai 时用无状态启发式合成 ID（基于调用顺序），可能与上游真实 ID 不一致；反向（anthropic/openai→gemini）时 ID 丢失。
+- **OpenAI 同族透传**：`openai` ↔ `openai_responses` 不做结构转换，仅透传。若客户端用 chat completions 格式请求一个 `formatTransform: "openai_responses"` 的 upstream，请求/响应原样转发，需客户端自行兼容。
+- **非法值兜底**：`formatTransform` 配置为非上述 4 个合法值时，记 `[TRANSFORM] invalid formatTransform ... -> passthrough` 警告日志后按透传处理，不报错。
 
 ### 状态查询（/status）
 

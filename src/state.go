@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS upstreams (
   recovery_cron      TEXT,
   recovery_at        DATETIME,
   last_recovery      DATETIME,
-  last_checked       DATETIME
+  last_checked       DATETIME,
+  format_transform   TEXT
 );
 CREATE TABLE IF NOT EXISTS upstream_tiers (
   upstream_name TEXT NOT NULL,
@@ -75,6 +76,35 @@ func openDB(path string) (*sql.DB, error) {
 		conn.Close()
 		return nil, fmt.Errorf("ensure schema: %w", err)
 	}
+	// 旧库迁移：upstreams 表可能缺少 format_transform 列（新增字段）。
+	// PRAGMA table_info 预查列名，缺失则 ALTER TABLE ADD COLUMN，零破坏兼容。
+	rows, err := conn.Query(`PRAGMA table_info(upstreams)`)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("inspect upstreams schema: %w", err)
+	}
+	hasFormatTransform := false
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			conn.Close()
+			return nil, fmt.Errorf("scan table_info: %w", err)
+		}
+		if name == "format_transform" {
+			hasFormatTransform = true
+		}
+	}
+	rows.Close()
+	if !hasFormatTransform {
+		if _, err := conn.Exec(`ALTER TABLE upstreams ADD COLUMN format_transform TEXT`); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("add format_transform column: %w", err)
+		}
+	}
 	return conn, nil
 }
 
@@ -99,7 +129,8 @@ func loadFromDB() error {
 	// 1. upstreams 行 → 同时填充 tokenMap.Upstreams（配置列）与 stateMap（状态列）
 	upstreamRows, err := conn.Query(`SELECT name, real_token, target_base,
 		avail_type, avail_limit, avail_refresh_cron, avail_provider,
-		exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked
+		exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked,
+		format_transform
 		FROM upstreams`)
 	if err != nil {
 		return fmt.Errorf("query upstreams: %w", err)
@@ -123,14 +154,16 @@ func loadFromDB() error {
 			balance                          float64
 			recoveryCron                     sql.NullString
 			recoveryAt, lastRecovery, lastChecked sql.NullString
+			formatTransform                  sql.NullString
 		)
 		if err := upstreamRows.Scan(&name, &realToken, &targetBase,
 			&availType, &availLimit, &availRefreshCron, &availProvider,
-			&exhausted, &count, &balance, &recoveryCron, &recoveryAt, &lastRecovery, &lastChecked); err != nil {
+			&exhausted, &count, &balance, &recoveryCron, &recoveryAt, &lastRecovery, &lastChecked,
+			&formatTransform); err != nil {
 			return fmt.Errorf("scan upstream: %w", err)
 		}
 
-		upstream := UpstreamConfig{RealToken: realToken, TargetBase: targetBase, Extra: map[string]string{}}
+		upstream := UpstreamConfig{RealToken: realToken, TargetBase: targetBase, Extra: map[string]string{}, FormatTransform: formatTransform.String}
 		var avail *AvailabilityConfig
 		if availType.Valid {
 			avail = &AvailabilityConfig{Type: availType.String}
@@ -571,8 +604,8 @@ func importFromJSON(inPath string) error {
 	// 2. INSERT upstreams（配置列 + 状态列全写）
 	upstreamStmt, err := tx.Prepare(`INSERT INTO upstreams
 		(name, real_token, target_base, avail_type, avail_limit, avail_refresh_cron, avail_provider,
-		 exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		 exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked, format_transform)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare upstream insert: %w", err)
 	}
@@ -625,10 +658,15 @@ func importFromJSON(inPath string) error {
 		if st.RecoveryCron != "" {
 			recoveryCron = sql.NullString{String: st.RecoveryCron, Valid: true}
 		}
+		var formatTransform sql.NullString
+		if upstream.FormatTransform != "" {
+			formatTransform = sql.NullString{String: upstream.FormatTransform, Valid: true}
+		}
 		if _, err := upstreamStmt.Exec(name, upstream.RealToken, upstream.TargetBase,
 			availType, availLimit, availRefreshCron, availProvider,
 			exhausted, st.Count, st.Balance, recoveryCron,
-			formatTime(st.RecoveryAt), formatTime(st.LastRecovery), formatTime(st.LastChecked)); err != nil {
+			formatTime(st.RecoveryAt), formatTime(st.LastRecovery), formatTime(st.LastChecked),
+			formatTransform); err != nil {
 			return fmt.Errorf("insert upstream %q: %w", name, err)
 		}
 		upstreamCount++

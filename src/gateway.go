@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -411,10 +412,47 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		outHeaders := r.Header.Clone()
 		removeHopHeaders(outHeaders)
 
-		// Issue 11: Token 注入简化（语义与原实现等价）
-		// 仅当对应输入存在时注入对应的输出字段；两者都存在则同时注入；
-		// 若两者都不在则回退到 X-Api-Key 或 Authorization。
-		if useGoogHeader || useQueryKey {
+		// 格式转换上下文：outFormat 来自 upstream 配置，inFormat 按 URL path 检测。
+		// doTransform=false 时（未配置 / 同格式 / openai 两变体互转 / unknown）走原透传逻辑。
+		outFormat := mapFormatTransform(upstreamCfg.FormatTransform)
+		if upstreamCfg.FormatTransform != "" && outFormat == "" {
+			log.Printf("[TRANSFORM] upstream=%s invalid formatTransform=%q -> passthrough",
+				upstreamName, upstreamCfg.FormatTransform)
+		}
+		inFormat := detectInputFormat(r.URL.Path)
+		doTransform := outFormat != "" && needsTransform(inFormat, outFormat)
+		if doTransform {
+			log.Printf("[TRANSFORM] upstream=%s %s -> %s", upstreamName, inFormat, outFormat)
+		}
+
+		// 请求体转换。bodyBytes/modelStr 为原始值且跨 attempt 复用，故用局部 sendBody/sendModel，
+		// 避免重试到不同格式的 upstream 时对已转换的 body 二次转换。
+		sendBody := bodyBytes
+		sendModel := modelStr
+		if doTransform && hasBody {
+			newBody, newModel, terr := TransformRequest(inFormat, outFormat, bodyBytes, modelStr, isStream)
+			if terr != nil {
+				log.Printf("[TRANSFORM] request convert failed: %v", terr)
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Format transform failed: " + terr.Error()})
+				return
+			}
+			sendBody = newBody
+			if newModel != "" {
+				sendModel = newModel
+			}
+		}
+
+		// Token 注入：转换路径用 swapAuthForTarget 重置 auth 头；透传路径沿用原逻辑
+		// （仅当对应输入存在时注入对应输出字段，两者都存在则同时注入，否则回退 X-Api-Key / Authorization）。
+		if doTransform {
+			swapAuthForTarget(outHeaders, query, upstreamCfg.RealToken, outFormat)
+			if outFormat == formatGemini && isStream {
+				query.Set("alt", "sse")
+			}
+			if outFormat != formatGemini {
+				query.Del("alt")
+			}
+		} else if useGoogHeader || useQueryKey {
 			if useGoogHeader {
 				outHeaders.Set("X-Goog-Api-Key", upstreamCfg.RealToken)
 			}
@@ -427,14 +465,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			outHeaders.Set("Authorization", "Bearer "+upstreamCfg.RealToken)
 		}
 
-		targetURL := upstreamCfg.TargetBase + r.URL.Path
+		// 目标 path：转换路径按目标格式重写；透传路径用原始 r.URL.Path。
+		targetPath := r.URL.Path
+		if doTransform {
+			if p := targetEndpointPath(outFormat, sendModel, isStream); p != "" {
+				targetPath = p
+			}
+		}
+		targetURL := upstreamCfg.TargetBase + targetPath
 		if encoded := query.Encode(); encoded != "" {
 			targetURL += "?" + encoded
 		}
 
 		var bodyReader io.Reader
 		if hasBody {
-			bodyReader = bytes.NewReader(bodyBytes)
+			bodyReader = bytes.NewReader(sendBody)
 		}
 
 		// Issue 1: 移除循环内 defer cancelReq()，改在每个退出分支显式调用
@@ -474,6 +519,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			// 先把错误响应体读出来（错误响应通常很小）
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			log.Printf("[TRANSFORM] upstream=%s returned error %d: %s", upstreamName, resp.StatusCode, string(errBody))
 
 			// 调用可用性检查（count型走自身判断；其它调用provider），用 singleflight 合并同 upstream 并发调用
 			res := availSF.Do(upstreamName, func() AvailabilityResult {
@@ -525,8 +571,83 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// 响应转换：整读 → TransformResponse/TransformErrorResponse → 写回。
+		// 覆盖非流式响应，以及流式请求的错误响应（错误响应通常为 JSON 而非 SSE，
+		// 不能用 SSE 流式转换器处理）。可用性错误（401/402/403/429）已在上方单独处理。
+		if doTransform && (!isStream || resp.StatusCode >= 300) {
+			rawBody, rerr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if rerr != nil {
+				log.Printf("[resp] read upstream response failed: %v", rerr)
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Bad gateway"})
+				cancelReq()
+				return
+			}
+			var tBody []byte
+			if resp.StatusCode < 300 {
+				converted, terr := TransformResponse(inFormat, outFormat, rawBody)
+				if terr != nil {
+					log.Printf("[TRANSFORM] response convert failed: %v (fallback raw)", terr)
+					tBody = rawBody
+				} else {
+					tBody = converted
+				}
+			} else {
+				log.Printf("[TRANSFORM] upstream=%s returned error %d: %s", upstreamName, resp.StatusCode, string(rawBody))
+				// 解析请求体提取诊断摘要
+				var reqParsed map[string]interface{}
+				if err := json.Unmarshal(sendBody, &reqParsed); err == nil {
+					msgs := getArray(reqParsed, "messages")
+					msgSummary := fmt.Sprintf("total=%d", len(msgs))
+					// 取最后 3 条的 role 摘要
+					start := len(msgs) - 3
+					if start < 0 {
+						start = 0
+					}
+					var roles []string
+					for i := start; i < len(msgs); i++ {
+						if m, ok := asMap(msgs[i]); ok {
+							r := getString(m, "role")
+							if r == "assistant" && getArray(m, "tool_calls") != nil {
+								r += "(tools)"
+							}
+							if r == "tool" {
+								r += "(" + getString(m, "tool_call_id") + ")"
+							}
+							roles = append(roles, r)
+						}
+					}
+					msgSummary += fmt.Sprintf(", last=%v", roles)
+					log.Printf("[TRANSFORM] upstream=%s request model=%s messages=%s",
+						upstreamName, getString(reqParsed, "model"), msgSummary)
+				} else {
+					log.Printf("[TRANSFORM] upstream=%s sent request body (truncated): %s",
+						upstreamName, string(sendBody))
+				}
+				tBody = TransformErrorResponse(inFormat, outFormat, rawBody)
+			}
+			for k, vs := range resp.Header {
+				k = http.CanonicalHeaderKey(k)
+				if k == "Content-Length" || k == "Transfer-Encoding" || k == "Connection" {
+					continue
+				}
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			if _, werr := w.Write(tBody); werr != nil {
+				log.Printf("[resp] write transformed response failed: %v", werr)
+			}
+			cancelReq()
+			return
+		}
+
 		// 成功或其它状态 → 转发响应（不重试）
 		if isStream {
+			if doTransform {
+				resp.Body = newTransformStreamReader(inFormat, outFormat, resp.Body)
+			}
 			forwardStreamHeaders(resp.Header, w.Header())
 			w.WriteHeader(resp.StatusCode)
 			flusher, _ := w.(http.Flusher)
@@ -597,19 +718,20 @@ func maskFakeToken(t string) string {
 // statusUpstream 单个 upstream 的运行时视图（给 /status 用）。
 // realToken 脱敏为首尾各 4 字符，targetBase 完整暴露便于排查路由。
 type statusUpstream struct {
-	Name           string         `json:"name"`
-	TargetBase     string         `json:"targetBase"`
-	RealToken      string         `json:"realToken"`
-	AvailType      string         `json:"availType,omitempty"`
-	Exhausted      bool           `json:"exhausted"`
-	Count          int            `json:"count,omitempty"`
-	Balance        float64        `json:"balance,omitempty"`
-	Tiers          []TierState    `json:"tiers,omitempty"`
-	RecoveryCron   string         `json:"recoveryCron,omitempty"`
-	RecoveryAt     time.Time      `json:"recoveryAt,omitempty"`
-	LastRecovery   time.Time      `json:"lastRecovery,omitempty"`
-	LastChecked    time.Time      `json:"lastChecked,omitempty"`
-	QueueFor       []string       `json:"queueFor,omitempty"` // 出现在哪些 fakeToken 队列中（脱敏）
+	Name            string      `json:"name"`
+	TargetBase      string      `json:"targetBase"`
+	RealToken       string      `json:"realToken"`
+	AvailType       string      `json:"availType,omitempty"`
+	Exhausted       bool        `json:"exhausted"`
+	Count           int         `json:"count,omitempty"`
+	Balance         float64     `json:"balance,omitempty"`
+	Tiers           []TierState `json:"tiers,omitempty"`
+	RecoveryCron    string      `json:"recoveryCron,omitempty"`
+	RecoveryAt      time.Time   `json:"recoveryAt,omitempty"`
+	LastRecovery    time.Time   `json:"lastRecovery,omitempty"`
+	LastChecked     time.Time   `json:"lastChecked,omitempty"`
+	QueueFor        []string    `json:"queueFor,omitempty"` // 出现在哪些 fakeToken 队列中（脱敏）
+	FormatTransform string      `json:"formatTransform,omitempty"`
 }
 
 // statusResponse /status 的响应体。
@@ -644,9 +766,10 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	for name, upstream := range tokenMap.Upstreams {
 		st := stateMap[name]
 		sa := statusUpstream{
-			Name:       name,
-			TargetBase: upstream.TargetBase,
-			RealToken:  maskToken(upstream.RealToken),
+			Name:            name,
+			TargetBase:      upstream.TargetBase,
+			RealToken:       maskToken(upstream.RealToken),
+			FormatTransform: upstream.FormatTransform,
 		}
 		if upstream.Availability != nil {
 			sa.AvailType = upstream.Availability.Type
