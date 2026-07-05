@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // ============================================================================
@@ -47,6 +48,320 @@ func detectInputFormat(path string) string {
 		return formatGemini
 	}
 	return formatUnknown
+}
+
+// openaiModelsListPathRegex 匹配 OpenAI/Anthropic 风格的模型列表端点 /v1/models。
+// OpenAI 与 Anthropic 列表共享同一 path，由 detectListFormat 按 auth header 区分。
+var openaiModelsListPathRegex = regexp.MustCompile(`(^|.*/)(v1/models)$`)
+
+// geminiModelsListPathRegex 匹配 Gemini 风格的模型列表端点 /v1beta/models。
+var geminiModelsListPathRegex = regexp.MustCompile(`(^|.*/)(v1beta/models)$`)
+
+// detectListFormat 按 URL path + auth header 判定客户端模型列表请求的格式。
+// 返回 formatXxx 之一；非列表请求返回 formatUnknown。
+//
+// 客户端格式判定：
+//   - /v1beta/models → gemini（path 自带上游风格信号）
+//   - /v1/models + X-Api-Key 或 anthropic-version 头任一 → anthropic
+//   - /v1/models + 其余（Bearer / 兜底）→ openai_chat（openai_responses 复用同一列表端点）
+//
+// Anthropic 头兜底同时识别 X-Api-Key（Anthropic SDK 默认 auth 头）与
+// anthropic-version（部分客户端即使 token 走 Bearer 也会带 version 头）。
+func detectListFormat(path string, headers http.Header) string {
+	if geminiModelsListPathRegex.MatchString(path) {
+		return formatGemini
+	}
+	if openaiModelsListPathRegex.MatchString(path) {
+		if headers != nil {
+			if headers.Get("X-Api-Key") != "" || headers.Get("anthropic-version") != "" {
+				return formatAnthropic
+			}
+		}
+		return formatOpenAIChat
+	}
+	return formatUnknown
+}
+
+// targetListEndpointPath 返回目标上游格式对应的模型列表端点 path。
+// openai_chat / openai_responses / anthropic 共用 /v1/models，gemini 用 /v1beta/models。
+func targetListEndpointPath(format string) string {
+	switch format {
+	case formatOpenAIChat, formatOpenAIResponses, formatAnthropic:
+		return "/v1/models"
+	case formatGemini:
+		return "/v1beta/models"
+	}
+	return ""
+}
+
+// ============================================================================
+// 模型列表响应转换（4 格式 6 向直转）
+//
+// 列表响应结构简单（id + 元数据），采用直接两两转换而非 anthropic pivot 链式，
+// 避免 inputTokenLimit/outputTokenLimit 等字段经 anthropic 中转后丢失。
+// openai_chat 与 openai_responses 列表响应结构完全相同，互转直接透传。
+// ============================================================================
+
+// modelsListEntry 中性列表条目，承载 4 种格式共有字段。
+type modelsListEntry struct {
+	ID               string
+	Created          int64  // unix 秒（openai_chat 用）
+	CreatedAt        string // anthropic ISO 字符串（保留原值）
+	OwnedBy          string // openai_chat 用（转 anthropic/gemini 时不写入，丢弃）
+	DisplayName      string // gemini / anthropic 用
+	Version          string // gemini 用
+	InputTokenLimit  int64  // gemini 用
+	OutputTokenLimit int64  // gemini 用
+}
+
+// modelsList 中性模型列表。
+type modelsList struct {
+	Entries []modelsListEntry
+}
+
+func parseOpenAIModelsList(body map[string]interface{}) (modelsList, error) {
+	ml := modelsList{}
+	data := getArray(body, "data")
+	if data == nil {
+		return ml, fmt.Errorf("openai models list: missing data[]")
+	}
+	for _, e := range data {
+		em, ok := asMap(e)
+		if !ok {
+			continue
+		}
+		entry := modelsListEntry{
+			ID: getString(em, "id"),
+		}
+		if c, ok := asFloat64(em["created"]); ok {
+			entry.Created = int64(c)
+		}
+		entry.OwnedBy = getString(em, "owned_by")
+		// OpenAI 列表响应无 display_name 字段，转 anthropic/gemini 时用 id 兜底，
+		// 避免下游客户端看到空 displayName 字段。
+		if entry.DisplayName == "" {
+			entry.DisplayName = entry.ID
+		}
+		ml.Entries = append(ml.Entries, entry)
+	}
+	return ml, nil
+}
+
+func parseAnthropicModelsList(body map[string]interface{}) (modelsList, error) {
+	ml := modelsList{}
+	data := getArray(body, "data")
+	if data == nil {
+		return ml, fmt.Errorf("anthropic models list: missing data[]")
+	}
+	for _, e := range data {
+		em, ok := asMap(e)
+		if !ok {
+			continue
+		}
+		entry := modelsListEntry{
+			ID:          getString(em, "id"),
+			CreatedAt:   getString(em, "created_at"),
+			DisplayName: getString(em, "display_name"),
+		}
+		// Anthropic 列表只有 ISO 字符串 created_at，无 Unix 时间戳。
+		// 解析为 Unix 秒填入 Created，使转 OpenAI 列表时 created 字段非 0，
+		// 避免客户端按 created>0 过滤时丢模型。解析失败保持 0（兜底）。
+		if entry.CreatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, entry.CreatedAt); err == nil {
+				entry.Created = t.Unix()
+			}
+		}
+		if entry.DisplayName == "" {
+			entry.DisplayName = entry.ID
+		}
+		ml.Entries = append(ml.Entries, entry)
+	}
+	return ml, nil
+}
+
+func parseGeminiModelsList(body map[string]interface{}) (modelsList, error) {
+	ml := modelsList{}
+	models := getArray(body, "models")
+	if models == nil {
+		return ml, fmt.Errorf("gemini models list: missing models[]")
+	}
+	for _, e := range models {
+		em, ok := asMap(e)
+		if !ok {
+			continue
+		}
+		// name 形如 "models/gemini-2.0-flash"，取尾段作为 ID
+		name := getString(em, "name")
+		id := name
+		if idx := strings.LastIndex(name, "/"); idx >= 0 && idx < len(name)-1 {
+			id = name[idx+1:]
+		}
+		entry := modelsListEntry{
+			ID:          id,
+			DisplayName: getString(em, "displayName"),
+			Version:     getString(em, "version"),
+		}
+		if entry.DisplayName == "" {
+			entry.DisplayName = id
+		}
+		if v, ok := asFloat64(em["inputTokenLimit"]); ok {
+			entry.InputTokenLimit = int64(v)
+		}
+		if v, ok := asFloat64(em["outputTokenLimit"]); ok {
+			entry.OutputTokenLimit = int64(v)
+		}
+		ml.Entries = append(ml.Entries, entry)
+	}
+	return ml, nil
+}
+
+// parseModelsListByFormat 按上游格式解析列表响应。
+func parseModelsListByFormat(format string, body map[string]interface{}) (modelsList, error) {
+	switch format {
+	case formatOpenAIChat, formatOpenAIResponses:
+		return parseOpenAIModelsList(body)
+	case formatAnthropic:
+		return parseAnthropicModelsList(body)
+	case formatGemini:
+		return parseGeminiModelsList(body)
+	}
+	return modelsList{}, fmt.Errorf("unknown models list format %q", format)
+}
+
+func buildOpenAIModelsList(ml modelsList) map[string]interface{} {
+	data := make([]interface{}, 0, len(ml.Entries))
+	for _, e := range ml.Entries {
+		data = append(data, map[string]interface{}{
+			"id":       e.ID,
+			"object":   "model",
+			"created":  e.Created,
+			"owned_by": e.OwnedBy,
+		})
+	}
+	return map[string]interface{}{
+		"object": "list",
+		"data":   data,
+	}
+}
+
+func buildAnthropicModelsList(ml modelsList) map[string]interface{} {
+	data := make([]interface{}, 0, len(ml.Entries))
+	for _, e := range ml.Entries {
+		entry := map[string]interface{}{
+			"type":         "model",
+			"id":           e.ID,
+			"display_name": e.DisplayName,
+			"created_at":   e.CreatedAt,
+		}
+		data = append(data, entry)
+	}
+	return map[string]interface{}{
+		"object": "list",
+		"data":   data,
+	}
+}
+
+func buildGeminiModelsList(ml modelsList) map[string]interface{} {
+	methods := []string{"generateContent", "streamGenerateContent"}
+	models := make([]interface{}, 0, len(ml.Entries))
+	for _, e := range ml.Entries {
+		entry := map[string]interface{}{
+			"name":                       "models/" + e.ID,
+			"displayName":                e.DisplayName,
+			"version":                    e.Version,
+			"inputTokenLimit":            e.InputTokenLimit,
+			"outputTokenLimit":           e.OutputTokenLimit,
+			"supportedGenerationMethods": methods,
+		}
+		models = append(models, entry)
+	}
+	return map[string]interface{}{
+		"models": models,
+	}
+}
+
+// buildModelsListByFormat 按客户端格式构造列表响应。
+func buildModelsListByFormat(format string, ml modelsList) map[string]interface{} {
+	switch format {
+	case formatOpenAIChat, formatOpenAIResponses:
+		return buildOpenAIModelsList(ml)
+	case formatAnthropic:
+		return buildAnthropicModelsList(ml)
+	case formatGemini:
+		return buildGeminiModelsList(ml)
+	}
+	return map[string]interface{}{"error": "unknown models list format"}
+}
+
+// reverseAliasesMap 由 aliases（key→value，client→upstream）构造反向映射
+// value→[]key（同一上游真实名可能有多个 alias 指向它）。
+func reverseAliasesMap(aliases map[string]string) map[string][]string {
+	rev := make(map[string][]string)
+	for k, v := range aliases {
+		if v == "" || k == "" {
+			continue
+		}
+		rev[v] = append(rev[v], k)
+	}
+	return rev
+}
+
+// applyAliasesReverseToList 对中性 modelsList 应用反向别名：
+// 对每条 entry，若其 ID 命中 aliases 的 value（即上游真实模型名），
+// 则为每个指向它的 alias key 追加一条新 entry，字段与原 entry 完全相同（仅 ID 改为 alias key）。
+// 原 ID 条目保留不变，使客户端既能看到真实名也能看到 alias。
+// aliases=nil 时不做任何处理。
+func applyAliasesReverseToList(ml *modelsList, aliases map[string]string) {
+	if aliases == nil || len(aliases) == 0 {
+		return
+	}
+	rev := reverseAliasesMap(aliases)
+	if len(rev) == 0 {
+		return
+	}
+	n := len(ml.Entries)
+	for i := 0; i < n; i++ {
+		revIDs, ok := rev[ml.Entries[i].ID]
+		if !ok {
+			continue
+		}
+		for _, aliasKey := range revIDs {
+			if aliasKey == ml.Entries[i].ID {
+				continue // alias 与真实名相同，无需重复
+			}
+			dup := ml.Entries[i] // 值拷贝：所有字段保持一致
+			dup.ID = aliasKey
+			ml.Entries = append(ml.Entries, dup)
+		}
+	}
+}
+
+// TransformModelsListResponse 转换模型列表响应。outFormat=上游响应格式，inFormat=客户端格式。
+// 等价于 TransformResponse 但作用于列表端点，采用 6 向直接两两转换。
+// aliases 为该 upstream 的别名配置（nil=未启用），用于反向展开 alias 条目。
+func TransformModelsListResponse(inFormat, outFormat string, body []byte, aliases map[string]string) ([]byte, error) {
+	if !needsTransform(inFormat, outFormat) {
+		return body, nil
+	}
+	// openai_chat 与 openai_responses 列表结构完全一致，fast path 透传
+	if isOpenAIVariant(inFormat) && isOpenAIVariant(outFormat) {
+		return body, nil
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse models list: %w", err)
+	}
+	ml, err := parseModelsListByFormat(outFormat, parsed)
+	if err != nil {
+		return nil, err
+	}
+	applyAliasesReverseToList(&ml, aliases)
+	out := buildModelsListByFormat(inFormat, ml)
+	data, err := json.Marshal(out)
+	if err != nil {
+		return nil, fmt.Errorf("marshal models list: %w", err)
+	}
+	return data, nil
 }
 
 // targetEndpointPath 返回目标格式对应的 URL path。
@@ -316,47 +631,57 @@ var openaiExtraPassthroughFields = []string{
 
 // resolveReasoningEffort 从 Anthropic thinking 配置提取 reasoning effort。
 // 优先级：output_config.effort > thinking.budget_tokens。
-// budget_tokens 阈值与 cc-switch 对齐：<4096→low, 4096-16383→medium, >=16384→high。
-// adaptive 字符串值映射为 xhigh（OpenAI Chat/Responses 不支持，由调用方降级为 high）。
+// budget_tokens 阈值与 cc-switch 对齐：<4000→low, 4000-15999→medium, >=16000→high。
+// adaptive 模式（type=="adaptive" 或 budget_tokens=="adaptive"）映射为 xhigh。
+// enabled 无 budget → high（与 Rust 参考一致）。
 func resolveReasoningEffort(body map[string]interface{}) string {
 	// 优先级 1：output_config.effort（Anthropic 风格）
 	if oc := getMap(body, "output_config"); oc != nil {
 		if e, ok := asString(oc["effort"]); ok && e != "" {
-			if e == "max" {
+			switch e {
+			case "low", "medium", "high":
+				return e
+			case "max":
 				return "xhigh"
 			}
-			return e
+			return "" // 未知值不注入
 		}
 	}
 
-	// 优先级 2：thinking.budget_tokens
+	// 优先级 2：thinking.type + budget_tokens
 	thinking := getMap(body, "thinking")
 	if thinking == nil {
 		return ""
 	}
 	t, ok := asString(thinking["type"])
-	if !ok || t != "enabled" {
+	if !ok {
 		return ""
 	}
-	// adaptive 模式 → xhigh
+	// adaptive 模式 → xhigh：兼容 type=="adaptive" 和 budget_tokens=="adaptive" 两种 schema
+	if t == "adaptive" {
+		return "xhigh"
+	}
+	if t != "enabled" {
+		return ""
+	}
 	if a, ok := asString(thinking["budget_tokens"]); ok && a == "adaptive" {
 		return "xhigh"
 	}
 	if budget, ok := asFloat64(thinking["budget_tokens"]); ok {
-		if budget >= 16384 {
+		if budget >= 16000 {
 			return "high"
 		}
-		if budget >= 4096 {
+		if budget >= 4000 {
 			return "medium"
 		}
 		return "low"
 	}
-	return "medium"
+	return "high"
 }
 
 // resolveAnthropicThinkingFromReasoning 将 OpenAI reasoning_effort / reasoning.effort
 // 反向映射为 Anthropic thinking 配置。budget_tokens 取值保证与 resolveReasoningEffort
-// 的阈值往返一致（low<4096<=medium<16384<=high）。maxTokens<=budget 时返回 nil，
+// 的阈值往返一致（low<4000<=medium<16000<=high）。maxTokens<=budget 时返回 nil，
 // 避免违反 Anthropic "max_tokens > budget_tokens" 约束导致上游 400。
 func resolveAnthropicThinkingFromReasoning(body map[string]interface{}, maxTokens int) map[string]interface{} {
 	effort := ""
@@ -373,19 +698,19 @@ func resolveAnthropicThinkingFromReasoning(body map[string]interface{}, maxToken
 	var budget int
 	switch effort {
 	case "low":
-		// < 4096 → low（resolveReasoningEffort 阈值）
+		// < 4000 → low（resolveReasoningEffort 阈值）
 		budget = 2048
 	case "medium":
-		// 4096-16383 → medium
-		budget = 8192
+		// 4000-15999 → medium
+		budget = 8000
 	case "high":
-		// >= 16384 → high
-		budget = 16384
+		// >= 16000 → high
+		budget = 16000
 	case "xhigh":
 		// xhigh 无法通过 budget_tokens 完整往返（resolveReasoningEffort 仅到 high），
-		// 取 32768 使其落在 high 区间，避免无限增大；xhigh 仅由 output_config.effort=max
-		// 或 budget_tokens="adaptive" 表达
-		budget = 32768
+		// 取 32000 使其落在 high 区间，避免无限增大；xhigh 仅由 output_config.effort=max
+		// 或 type="adaptive"/budget_tokens="adaptive" 表达
+		budget = 32000
 	default:
 		return nil
 	}
@@ -422,8 +747,23 @@ func normalizeOpenAISystemMessages(messages []interface{}) []interface{} {
 			continue
 		}
 		if getString(m, "role") == "system" {
-			if s, ok := asString(m["content"]); ok && s != "" {
-				systemTexts = append(systemTexts, s)
+			switch c := m["content"].(type) {
+			case string:
+				if c != "" {
+					systemTexts = append(systemTexts, c)
+				}
+			case []interface{}:
+				// 数组形式：提取每个 text part
+				for _, part := range c {
+					if pm, ok := asMap(part); ok {
+						pt := getString(pm, "type")
+						if pt == "text" || pt == "" {
+							if t, ok := asString(pm["text"]); ok && t != "" {
+								systemTexts = append(systemTexts, t)
+							}
+						}
+					}
+				}
 			}
 		} else {
 			rest = append(rest, msg)
@@ -434,7 +774,7 @@ func normalizeOpenAISystemMessages(messages []interface{}) []interface{} {
 	}
 	systemMsg := map[string]interface{}{
 		"role":    "system",
-		"content": strings.Join(systemTexts, "\n\n"),
+		"content": strings.Join(systemTexts, "\n"),
 	}
 	return append([]interface{}{systemMsg}, rest...)
 }
@@ -587,7 +927,7 @@ func mapGeminiFinishReason(reason string, hasToolUse bool) string {
 	case "MAX_TOKENS":
 		return "max_tokens"
 	case "SAFETY", "RECITATION", "SPII", "BLOCKLIST", "PROHIBITED_CONTENT":
-		return "end_turn"
+		return "refusal"
 	case "STOP":
 		if hasToolUse {
 			return "tool_use"
@@ -1510,20 +1850,6 @@ func shapeForCodexBackendInBytes(body []byte, fastMode bool) ([]byte, error) {
 	return json.Marshal(parsed)
 }
 
-// injectPromptCacheKeyInBytes 向 Responses 格式请求体注入 prompt_cache_key 字段。
-// 空值时不注入。用于利用上游的缓存路由优化。
-func injectPromptCacheKeyInBytes(body []byte, cacheKey string) ([]byte, error) {
-	if cacheKey == "" {
-		return body, nil
-	}
-	var parsed map[string]interface{}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return body, err
-	}
-	parsed["prompt_cache_key"] = cacheKey
-	return json.Marshal(parsed)
-}
-
 // convertAnthropicMessagesToResponsesInput 将 Anthropic messages 转为 Responses API input。
 // tool_use 提升为顶层 function_call 项，tool_result 提升为 function_call_output 项。
 func convertAnthropicMessagesToResponsesInput(messages []interface{}) []interface{} {
@@ -2245,7 +2571,7 @@ func geminiToAnthropicResponse(body map[string]interface{}) (map[string]interfac
 				id = synthesizeToolCallID()
 			}
 			// 影子存储：抓取 thoughtSignature 供下一轮 Anthropic→Gemini 复用
-			if sig := extractGeminiThoughtSignature(fc); sig != "" {
+			if sig := extractGeminiThoughtSignature(pm); sig != "" {
 				storeGeminiThoughtSignature(id, sig)
 			}
 			content = append(content, map[string]interface{}{
@@ -2268,6 +2594,22 @@ func geminiToAnthropicResponse(body map[string]interface{}) (map[string]interfac
 			if fc := getMap(pm, "functionCall"); fc != nil {
 				if id := getString(fc, "id"); id != "" {
 					storeGeminiAssistantTurn(id, parts)
+					break
+				}
+			}
+		}
+	} else {
+		// thinking-only turn（无 tool_use）：提取纯文本 part 的 thoughtSignature，
+		// 用 responseId 作键存入 shadow store 供后续回放
+		respID := getString(body, "responseId")
+		if respID != "" {
+			for _, part := range parts {
+				pm, ok := asMap(part)
+				if !ok {
+					continue
+				}
+				if sig := extractGeminiTextPartThoughtSignature(pm); sig != "" {
+					storeGeminiThoughtSignature(respID, sig)
 					break
 				}
 			}
@@ -3169,7 +3511,7 @@ func anthropicToGeminiResponse(body map[string]interface{}) (map[string]interfac
 				"args": ensureArgsMap(bm["input"]),
 			}
 			id := getString(bm, "id")
-			if id != "" && !strings.HasPrefix(id, "gemini_synth_") {
+			if id != "" && !isSynthesizedToolCallID(id) {
 				fc["id"] = id
 			}
 			parts = append(parts, map[string]interface{}{
@@ -3209,12 +3551,16 @@ func anthropicToGeminiResponse(body map[string]interface{}) (map[string]interfac
 
 const synthesizedIDPrefix = "gemini_synth_"
 
+// synthesizedIDLen 是合成 ID 的固定总长度：前缀 + 16 字节 hex（32 字符）。
+// isSynthesizedToolCallID 同时校验前缀与长度，避免真实 Gemini ID 偶以同前缀开头时被误判。
+const synthesizedIDLen = len(synthesizedIDPrefix) + 32
+
 func synthesizeToolCallID() string {
 	return synthesizedIDPrefix + randomHex(16)
 }
 
 func isSynthesizedToolCallID(id string) bool {
-	return strings.HasPrefix(id, synthesizedIDPrefix)
+	return strings.HasPrefix(id, synthesizedIDPrefix) && len(id) == synthesizedIDLen
 }
 
 func randomHex(n int) string {
@@ -3378,10 +3724,12 @@ func transformResponseBody(inFormat, outFormat string, body map[string]interface
 }
 
 // TransformErrorResponse 转换错误响应体。inFormat=客户端格式，outFormat=上游格式。
+// statusCode 为上游 HTTP 状态码，用于 Gemini 错误 body 的 code 字段与 gRPC status 映射；
+// 传 0 时 Gemini code 字段兜底为 500。
 // 上游错误响应结构各异（OpenAI/Anthropic/Gemini 各有不同 error 包装），
 // 此函数提取 message 后按客户端期望格式重建，避免客户端解析失败。
 // 解析失败或无法提取 message 时原样返回。
-func TransformErrorResponse(inFormat, outFormat string, body []byte) []byte {
+func TransformErrorResponse(inFormat, outFormat string, body []byte, statusCode int) []byte {
 	if !needsTransform(inFormat, outFormat) {
 		return body
 	}
@@ -3398,7 +3746,7 @@ func TransformErrorResponse(inFormat, outFormat string, body []byte) []byte {
 		return body
 	}
 
-	result := buildErrorForFormat(inFormat, msg, errType)
+	result := buildErrorForFormat(inFormat, msg, errType, statusCode)
 	out, err := json.Marshal(result)
 	if err != nil {
 		return body
@@ -3432,8 +3780,11 @@ func extractErrorMessage(body map[string]interface{}, outFormat string) (message
 	return
 }
 
-// buildErrorForFormat 按目标格式构建错误响应。
-func buildErrorForFormat(inFormat, message, errType string) map[string]interface{} {
+// buildErrorForFormat 按目标格式构建错误响应。statusCode 为上游 HTTP 状态码，
+// 用于 Gemini 错误 body 的 code 字段与 gRPC status 映射；为 0 时兜底为 500。
+// errType 来自上游错误体（如 OpenAI 的 type、Gemini 的 status、Anthropic 的 type），
+// 为空时按 inFormat 给定默认值。
+func buildErrorForFormat(inFormat, message, errType string, statusCode int) map[string]interface{} {
 	switch inFormat {
 	case formatAnthropic:
 		if errType == "" {
@@ -3451,14 +3802,57 @@ func buildErrorForFormat(inFormat, message, errType string) map[string]interface
 			"error": map[string]interface{}{"message": message, "type": errType},
 		}
 	case formatGemini:
-		if errType == "" {
-			errType = "INTERNAL"
+		if statusCode == 0 {
+			statusCode = 500
 		}
+		// Gemini 错误 body 的 status 字段必须是 gRPC Code 大写名（如 INVALID_ARGUMENT）。
+		// 上游 errType（Anthropic/OpenAI 的 type 字段）不是 gRPC status，故始终按
+		// HTTP status 派生，保证客户端按 status 路由时与 HTTP 语义一致。
 		return map[string]interface{}{
-			"error": map[string]interface{}{"code": 500, "message": message, "status": errType},
+			"error": map[string]interface{}{
+				"code":    statusCode,
+				"message": message,
+				"status":  httpStatusToGRPCStatus(statusCode),
+			},
 		}
 	}
 	return map[string]interface{}{"error": map[string]interface{}{"message": message}}
+}
+
+// httpStatusToGRPCStatus 把 HTTP 状态码映射为 Gemini 错误 body 期望的 gRPC status
+// 字符串。Gemini 上游错误 body 的 status 字段使用 gRPC Code 大写名（如 INVALID_ARGUMENT），
+// 直接复用上游 HTTP status 可让客户端按 status 字段路由时与 HTTP 语义一致。
+// 未识别的 status 兜底为 INTERNAL。
+func httpStatusToGRPCStatus(statusCode int) string {
+	switch {
+	case statusCode >= 400 && statusCode < 500:
+		switch statusCode {
+		case 400:
+			return "INVALID_ARGUMENT"
+		case 401:
+			return "UNAUTHENTICATED"
+		case 403:
+			return "PERMISSION_DENIED"
+		case 404:
+			return "NOT_FOUND"
+		case 409:
+			return "ABORTED"
+		case 429:
+			return "RESOURCE_EXHAUSTED"
+		}
+		return "FAILED_PRECONDITION"
+	case statusCode == 500:
+		return "INTERNAL"
+	case statusCode == 501:
+		return "UNIMPLEMENTED"
+	case statusCode == 502, statusCode == 503:
+		return "UNAVAILABLE"
+	case statusCode == 504:
+		return "DEADLINE_EXCEEDED"
+	case statusCode >= 500:
+		return "INTERNAL"
+	}
+	return "INTERNAL"
 }
 
 func xToAnthropicResponse(outFormat string, body map[string]interface{}) (map[string]interface{}, error) {

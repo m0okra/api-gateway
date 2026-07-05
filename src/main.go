@@ -19,7 +19,6 @@ import (
 func main() {
 	var port int
 	var exportPath, importPath string
-	var aliasesPath string
 	flag.IntVar(&port, "p", 9090, "运行端口")
 	flag.IntVar(&port, "port", 9090, "运行端口")
 	flag.StringVar(&dbPath, "db", "gateway.db", "SQLite 数据库文件路径")
@@ -27,7 +26,6 @@ func main() {
 	flag.StringVar(&exportPath, "export", "", "导出：将 -db 库全量导出为该 JSON 文件后退出")
 	flag.StringVar(&importPath, "i", "", "导入：将该 JSON 文件全量导入 -db 库后退出")
 	flag.StringVar(&importPath, "import", "", "导入：将该 JSON 文件全量导入 -db 库后退出")
-	flag.StringVar(&aliasesPath, "aliases", "aliases.json", "模型别名配置文件路径（不存在则禁用别名功能）")
 	flag.Parse()
 
 	// 管理操作分支：导出/导入互斥，执行后立即退出，不启动 HTTP 服务器
@@ -63,15 +61,6 @@ func main() {
 		len(tokenMap.FakeTokens), len(tokenMap.Upstreams))
 	if !dbExisted || len(tokenMap.Upstreams) == 0 {
 		log.Printf("请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。")
-	}
-
-	// 加载模型别名配置（aliases.json 不存在或解析失败则禁用别名功能，不阻断启动）
-	// loadAliases 内部已处理文件缺失/解析错误的日志，此处仅按结果打印启用状态
-	loadAliases(aliasesPath)
-	if aliases != nil {
-		log.Printf("Aliases enabled from %s (entries=%d)", aliasesPath, len(aliases))
-	} else {
-		log.Printf("Aliases disabled (no %s found or parse failed)", aliasesPath)
 	}
 
 	// 2. 启动调度goroutine（exhaust恢复 + 状态保存）

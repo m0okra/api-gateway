@@ -350,33 +350,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  model: %s", modelStr)
 	}
 
-	// 模型别名替换：仅在 aliases.json 已加载（aliases != nil）且提取到模型名时执行。
-	// /v1/models 等无模型名请求因 modelStr == "" 天然跳过，无需额外特判。
-	// 同时处理 body 的 model 字段（OpenAI/Anthropic 风格）与 URL path 中的模型名
-	// （Gemini 风格 /v1beta/models/{name}:generateContent），二者独立检查，
-	// 仅当源值与提取到的 modelStr 一致时才重写，避免误改无关字段。
-	// body 重写后 bodyBytes 更新，由于 removeHopHeaders 已剔除 Content-Length，
-	// bytes.NewReader 会让 http.NewRequestWithContext 自动重算长度，无尺寸不一致风险。
-	if aliases != nil && modelStr != "" {
-		if alias, ok := aliases[modelStr]; ok && alias != "" && alias != modelStr {
-			log.Printf("[ALIAS] %s -> %s", modelStr, alias)
-			if hasBody {
-				var bm map[string]interface{}
-				if json.Unmarshal(bodyBytes, &bm) == nil {
-					if cur, ok := bm["model"].(string); ok && cur == modelStr {
-						bm["model"] = alias
-						if nb, merr := json.Marshal(bm); merr == nil {
-							bodyBytes = nb
-						}
-					}
-				}
-			}
-			if m := geminiModelRegex.FindStringSubmatch(r.URL.Path); m != nil && m[1] == modelStr {
-				r.URL.Path = geminiModelRegex.ReplaceAllString(r.URL.Path, "/models/"+alias)
-			}
-			modelStr = alias
-		}
-	}
+	// 模型别名替换已迁移至 attempt 循环内：aliases 现为 per-upstream 配置（UpstreamConfig.Aliases），
+	// 不同 upstream 可能有不同别名映射，故不能在循环外对共享的 bodyBytes/r.URL.Path/modelStr 做一次性重写。
+	// 此处保留原始 client 输入原值，由每次 attempt 内按选中 upstream 的 aliases 各自计算 sendBody/sendModel/targetPath。
 
 	// 判断 token 注入方式（与原实现一致：query key / goog header / x-api-key / bearer）
 	useGoogHeader := googHeader != ""
@@ -420,21 +396,63 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				upstreamName, upstreamCfg.FormatTransform)
 		}
 		inFormat := detectInputFormat(r.URL.Path)
-		doTransform := outFormat != "" && needsTransform(inFormat, outFormat)
-		if doTransform {
-			log.Printf("[TRANSFORM] upstream=%s %s -> %s", upstreamName, inFormat, outFormat)
-		}
+		// 列表请求检测：/v1/models（按 auth 头区分 openai/anthropic）或 /v1beta/models（gemini）。
+		// 列表请求 inFormat == formatUnknown（detectInputFormat 不识别列表端点），需用 detectListFormat 旁路。
+		listFormat := detectListFormat(r.URL.Path, r.Header)
+		isListRequest := listFormat != formatUnknown
 
-		// 请求体转换。bodyBytes/modelStr 为原始值且跨 attempt 复用，故用局部 sendBody/sendModel，
-		// 避免重试到不同格式的 upstream 时对已转换的 body 二次转换。
+		// per-upstream 别名替换：仅在 upstreamCfg.Aliases 配置启用且提取到模型名时执行。
+		// 列表请求 modelStr=="" 天然跳过。
+		// 同时处理 body 的 model 字段（OpenAI/Anthropic 风格）与 URL path 中的模型名（Gemini 风格），
+		// 二者独立检查，仅当源值与提取到的 modelStr 一致时才重写，避免误改无关字段。
+		// 仅作用于本次 attempt 的局部 sendBody/sendModel/basePath，
+		// 不污染跨 attempt 复用的原始 bodyBytes/r.URL.Path/modelStr（不同 upstream 别名不同）。
+		basePath := r.URL.Path
 		sendBody := bodyBytes
 		sendModel := modelStr
+		if upstreamCfg.Aliases != nil && modelStr != "" {
+			if real, ok := upstreamCfg.Aliases[modelStr]; ok && real != "" && real != modelStr {
+				log.Printf("[ALIAS] upstream=%s %s -> %s", upstreamName, modelStr, real)
+				sendModel = real
+				if hasBody {
+					var bm map[string]interface{}
+					if json.Unmarshal(bodyBytes, &bm) == nil {
+						if cur, ok := bm["model"].(string); ok && cur == modelStr {
+							bm["model"] = real
+							if nb, merr := json.Marshal(bm); merr == nil {
+								sendBody = nb
+							}
+						}
+					}
+				}
+				if m := geminiModelRegex.FindStringSubmatch(r.URL.Path); m != nil && m[1] == modelStr {
+					basePath = geminiModelRegex.ReplaceAllString(r.URL.Path, "/models/"+real)
+				}
+			}
+		}
+
+		// 列表请求需以 listFormat 覆盖 inFormat（用于错误响应转换），并选择列表转换分支
+		// （不走业务端点 TransformRequest/Response）。非列表请求走原有 doTransform 逻辑。
+		doTransform := false
+		doListTransform := false
+		if isListRequest {
+			inFormat = listFormat
+			doListTransform = outFormat != "" && needsTransform(listFormat, outFormat)
+			if doListTransform {
+				log.Printf("[TRANSFORM-LIST] upstream=%s %s -> %s", upstreamName, listFormat, outFormat)
+			}
+		} else {
+			doTransform = outFormat != "" && needsTransform(inFormat, outFormat)
+			if doTransform {
+				log.Printf("[TRANSFORM] upstream=%s %s -> %s", upstreamName, inFormat, outFormat)
+			}
+		}
 
 		// Pre-transform passes：对 Anthropic 客户端请求体做供应商兼容处理。
-		// 这些 pass 作用于原始客户端 body（转换前），需要本地副本避免污染 bodyBytes。
-		transformInput := bodyBytes
+		// 这些 pass 作用于客户端请求体（转换前，已应用 alias 后的 sendBody），需要本地副本避免污染 bodyBytes。
+		transformInput := sendBody
 		if hasBody && inFormat == formatAnthropic {
-			preBody := bodyBytes
+			preBody := sendBody
 			// reasoningVendor：将 thinking 块重写为占位符（Kimi/DeepSeek/MiMo 等拒绝原始 thinking）
 			if rv := upstreamCfg.Extra["reasoningVendor"]; rv != "" {
 				shouldNormalize := false
@@ -469,7 +487,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			opts := TransformOptions{
 				PreserveReasoningContent: upstreamCfg.Extra["preserveReasoningContent"] == "true",
 			}
-			newBody, newModel, terr := TransformRequestWithOptions(inFormat, outFormat, transformInput, modelStr, isStream, opts)
+			// 用 sendModel（post-alias）作为转换输入，确保发往上游的 body/path 用真实模型名
+			newBody, newModel, terr := TransformRequestWithOptions(inFormat, outFormat, transformInput, sendModel, isStream, opts)
 			if terr != nil {
 				// 请求转换失败不直接 400 中断：队列中后续 upstream 可能是透传
 				// （formatTransform 为空，doTransform=false）或不同 outFormat，
@@ -497,14 +516,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 						log.Printf("[TRANSFORM] upstream=%s codex shape failed: %v", upstreamName, err)
 					}
 				}
-				// prompt_cache_key 注入：利用上游的缓存路由优化。
-				if cacheKey := upstreamCfg.Extra["promptCacheKey"]; cacheKey != "" {
-					if injected, err := injectPromptCacheKeyInBytes(sendBody, cacheKey); err == nil {
-						sendBody = injected
-					} else {
-						log.Printf("[TRANSFORM] upstream=%s prompt_cache_key inject failed: %v", upstreamName, err)
-					}
-				}
 			}
 		}
 
@@ -524,7 +535,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		// Token 注入：转换路径用 swapAuthForTarget 重置 auth 头；透传路径沿用原逻辑
 		// （仅当对应输入存在时注入对应输出字段，两者都存在则同时注入，否则回退 X-Api-Key / Authorization）。
-		if doTransform {
+		// 列表转换（doListTransform）与业务端点转换共享同一 auth 头处理。
+		if doTransform || doListTransform {
 			swapAuthForTarget(outHeaders, query, upstreamCfg.RealToken, outFormat)
 			if outFormat == formatGemini && isStream {
 				query.Set("alt", "sse")
@@ -545,9 +557,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			outHeaders.Set("Authorization", "Bearer "+upstreamCfg.RealToken)
 		}
 
-		// 目标 path：转换路径按目标格式重写；透传路径用原始 r.URL.Path。
-		targetPath := r.URL.Path
-		if doTransform {
+		// 目标 path：列表转换走 targetListEndpointPath；业务端点转换走 targetEndpointPath；
+		// 透传路径用 basePath（已应用 per-upstream alias 的 Gemini 风格 path 重写）。
+		targetPath := basePath
+		if doListTransform {
+			if p := targetListEndpointPath(outFormat); p != "" {
+				targetPath = p
+			}
+		} else if doTransform {
 			if p := targetEndpointPath(outFormat, sendModel, isStream); p != "" {
 				targetPath = p
 			}
@@ -623,9 +640,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 			// 非exhaust但返回可用性错误 → 把错误响应返回给客户端。
 			// 转换路径下先经 TransformErrorResponse 转为客户端格式，保持错误体格式一致。
+			// 列表请求（doListTransform）同样按客户端列表格式重建错误响应。
 			respBody := errBody
-			if doTransform {
-				respBody = TransformErrorResponse(inFormat, outFormat, errBody)
+			if doTransform || doListTransform {
+				respBody = TransformErrorResponse(inFormat, outFormat, errBody, resp.StatusCode)
 			}
 			for k, vs := range resp.Header {
 				k = http.CanonicalHeaderKey(k)
@@ -715,6 +733,52 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// 响应转换：整读 → TransformResponse/TransformErrorResponse → 写回。
 		// 覆盖非流式响应，以及流式请求的错误响应（错误响应通常为 JSON 而非 SSE，
 		// 不能用 SSE 流式转换器处理）。可用性错误（401/402/403/429）已在上方单独处理。
+
+		// 列表请求分支：模型列表响应永远非流式，独立于业务端点转换分支处理。
+		// 成功响应走 TransformModelsListResponse（含 alias 反向展开），错误响应走 TransformErrorResponse。
+		// 可用性错误（401/402/403/429）已在上分支单独处理（exhaust 路径 continue，非 exhaust 已 return）。
+		if doListTransform {
+			rawBody, rerr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if rerr != nil {
+				log.Printf("[resp] read upstream list response failed: %v", rerr)
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "Bad gateway"})
+				cancelReq()
+				return
+			}
+			var tBody []byte
+			if resp.StatusCode < 300 {
+				converted, terr := TransformModelsListResponse(listFormat, outFormat, rawBody, upstreamCfg.Aliases)
+				if terr != nil {
+					log.Printf("[TRANSFORM-LIST] response convert failed: %v (fallback raw)", terr)
+					tBody = rawBody
+				} else {
+					tBody = converted
+				}
+			} else {
+				log.Printf("[TRANSFORM-LIST] upstream=%s returned error %d: %s",
+					upstreamName, resp.StatusCode, string(rawBody))
+				tBody = TransformErrorResponse(listFormat, outFormat, rawBody, resp.StatusCode)
+			}
+			for k, vs := range resp.Header {
+				k = http.CanonicalHeaderKey(k)
+				if k == "Content-Length" || k == "Transfer-Encoding" || k == "Connection" {
+					continue
+				}
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			// 转换后 body 长度变化，需重设 Content-Length（无下游透传会沿用上游长度导致截断/超长）
+			w.Header().Del("Content-Length")
+			w.WriteHeader(resp.StatusCode)
+			if _, werr := w.Write(tBody); werr != nil {
+				log.Printf("[resp] write transformed list response failed: %v", werr)
+			}
+			cancelReq()
+			return
+		}
+
 		if doTransform && (!isStream || resp.StatusCode >= 300) {
 			rawBody, rerr := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -765,7 +829,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 					log.Printf("[TRANSFORM] upstream=%s sent request body (truncated): %s",
 						upstreamName, string(sendBody))
 				}
-				tBody = TransformErrorResponse(inFormat, outFormat, rawBody)
+				tBody = TransformErrorResponse(inFormat, outFormat, rawBody, resp.StatusCode)
 			}
 			for k, vs := range resp.Header {
 				k = http.CanonicalHeaderKey(k)

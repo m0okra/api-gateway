@@ -129,17 +129,35 @@ func cleanupExpiredGeminiShadows() {
 	}
 }
 
-// extractGeminiThoughtSignature 从 Gemini functionCall part 提取 thoughtSignature。
+// extractGeminiThoughtSignature 从 Gemini part 提取 thoughtSignature。
+// thoughtSignature 与 functionCall/text 在 part 层级平级：
+//   {"functionCall":{...}, "thoughtSignature":"sig-1"}
+//   {"text":"...", "thoughtSignature":"sig-2"}
 // 兼容 camelCase（thoughtSignature）与 snake_case（thought_signature）。
-func extractGeminiThoughtSignature(functionCall map[string]interface{}) string {
-	if functionCall == nil {
+func extractGeminiThoughtSignature(part map[string]interface{}) string {
+	if part == nil {
 		return ""
 	}
-	if sig, ok := asString(functionCall["thoughtSignature"]); ok && sig != "" {
+	if sig, ok := asString(part["thoughtSignature"]); ok && sig != "" {
 		return sig
 	}
-	if sig, ok := asString(functionCall["thought_signature"]); ok && sig != "" {
+	if sig, ok := asString(part["thought_signature"]); ok && sig != "" {
 		return sig
 	}
 	return ""
+}
+
+// extractGeminiTextPartThoughtSignature 从纯文本 part（有 text 无 functionCall）提取 thoughtSignature。
+// functionCall part 的 signature 由 extractGeminiToolCalls 处理；此处只覆盖 thinking-only turn。
+func extractGeminiTextPartThoughtSignature(part map[string]interface{}) string {
+	if part == nil {
+		return ""
+	}
+	if _, hasFC := part["functionCall"]; hasFC {
+		return ""
+	}
+	if _, hasText := part["text"]; !hasText {
+		return ""
+	}
+	return extractGeminiThoughtSignature(part)
 }

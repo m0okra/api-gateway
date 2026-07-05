@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS upstreams (
   recovery_at        DATETIME,
   last_recovery      DATETIME,
   last_checked       DATETIME,
-  format_transform   TEXT
+  format_transform   TEXT,
+  aliases            TEXT
 );
 CREATE TABLE IF NOT EXISTS upstream_tiers (
   upstream_name TEXT NOT NULL,
@@ -84,6 +85,7 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("inspect upstreams schema: %w", err)
 	}
 	hasFormatTransform := false
+	hasAliases := false
 	for rows.Next() {
 		var cid int
 		var name, ctype string
@@ -97,12 +99,21 @@ func openDB(path string) (*sql.DB, error) {
 		if name == "format_transform" {
 			hasFormatTransform = true
 		}
+		if name == "aliases" {
+			hasAliases = true
+		}
 	}
 	rows.Close()
 	if !hasFormatTransform {
 		if _, err := conn.Exec(`ALTER TABLE upstreams ADD COLUMN format_transform TEXT`); err != nil {
 			conn.Close()
 			return nil, fmt.Errorf("add format_transform column: %w", err)
+		}
+	}
+	if !hasAliases {
+		if _, err := conn.Exec(`ALTER TABLE upstreams ADD COLUMN aliases TEXT`); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("add aliases column: %w", err)
 		}
 	}
 	return conn, nil
@@ -130,7 +141,7 @@ func loadFromDB() error {
 	upstreamRows, err := conn.Query(`SELECT name, real_token, target_base,
 		avail_type, avail_limit, avail_refresh_cron, avail_provider,
 		exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked,
-		format_transform
+		format_transform, aliases
 		FROM upstreams`)
 	if err != nil {
 		return fmt.Errorf("query upstreams: %w", err)
@@ -144,26 +155,34 @@ func loadFromDB() error {
 	metas := make(map[string]upstreamMeta)
 
 	for upstreamRows.Next() {
-		var (
+var (
 			name, realToken, targetBase      string
 			availType                        sql.NullString
 			availLimit                       sql.NullInt64
-			availRefreshCron, availProvider  sql.NullString
+			availRefreshCron, availProvider   sql.NullString
 			exhausted                        int
 			count                            int
 			balance                          float64
 			recoveryCron                     sql.NullString
 			recoveryAt, lastRecovery, lastChecked sql.NullString
 			formatTransform                  sql.NullString
+			aliasesBlob                      sql.NullString
 		)
 		if err := upstreamRows.Scan(&name, &realToken, &targetBase,
 			&availType, &availLimit, &availRefreshCron, &availProvider,
 			&exhausted, &count, &balance, &recoveryCron, &recoveryAt, &lastRecovery, &lastChecked,
-			&formatTransform); err != nil {
+			&formatTransform, &aliasesBlob); err != nil {
 			return fmt.Errorf("scan upstream: %w", err)
 		}
 
 		upstream := UpstreamConfig{RealToken: realToken, TargetBase: targetBase, Extra: map[string]string{}, FormatTransform: formatTransform.String}
+		// aliases 列存 JSON 编码的 map[string]string；空串/NULL 视为该 upstream 未启用别名
+		if aliasesBlob.Valid && aliasesBlob.String != "" {
+			var am map[string]string
+			if err := json.Unmarshal([]byte(aliasesBlob.String), &am); err == nil && len(am) > 0 {
+				upstream.Aliases = am
+			}
+		}
 		var avail *AvailabilityConfig
 		if availType.Valid {
 			avail = &AvailabilityConfig{Type: availType.String}
@@ -604,8 +623,8 @@ func importFromJSON(inPath string) error {
 	// 2. INSERT upstreams（配置列 + 状态列全写）
 	upstreamStmt, err := tx.Prepare(`INSERT INTO upstreams
 		(name, real_token, target_base, avail_type, avail_limit, avail_refresh_cron, avail_provider,
-		 exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked, format_transform)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		 exhausted, count, balance, recovery_cron, recovery_at, last_recovery, last_checked, format_transform, aliases)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare upstream insert: %w", err)
 	}
@@ -662,11 +681,18 @@ func importFromJSON(inPath string) error {
 		if upstream.FormatTransform != "" {
 			formatTransform = sql.NullString{String: upstream.FormatTransform, Valid: true}
 		}
+		// aliases JSON 编码；空 map / nil → NULL
+		var aliasesBlob sql.NullString
+		if len(upstream.Aliases) > 0 {
+			if data, err := json.Marshal(upstream.Aliases); err == nil {
+				aliasesBlob = sql.NullString{String: string(data), Valid: true}
+			}
+		}
 		if _, err := upstreamStmt.Exec(name, upstream.RealToken, upstream.TargetBase,
 			availType, availLimit, availRefreshCron, availProvider,
 			exhausted, st.Count, st.Balance, recoveryCron,
 			formatTime(st.RecoveryAt), formatTime(st.LastRecovery), formatTime(st.LastChecked),
-			formatTransform); err != nil {
+			formatTransform, aliasesBlob); err != nil {
 			return fmt.Errorf("insert upstream %q: %w", name, err)
 		}
 		upstreamCount++

@@ -31,6 +31,10 @@ func injectCacheControlIntoBytes(body []byte, cfg *CacheInjectorConfig) ([]byte,
 
 // injectCacheControl 在 Anthropic 请求体的关键位置注入 cache_control 断点。
 // 最多注入 4 个断点（Anthropic 上限）。cfg.Enabled=false 时直接返回。
+//
+// 注入前先统计 body 中已有的 cache_control 断点数（覆盖所有位置，含非标准位置
+// 如 messages 数组中间的断点），并升级现有断点的 TTL 为配置值。这样即使客户端
+// 在非标准位置已设断点，也不会让总数超 4 触发 Anthropic 400。
 func injectCacheControl(body map[string]interface{}, cfg *CacheInjectorConfig) {
 	if cfg == nil || !cfg.Enabled {
 		return
@@ -43,9 +47,14 @@ func injectCacheControl(body map[string]interface{}, cfg *CacheInjectorConfig) {
 		cacheControl = map[string]interface{}{"type": "ephemeral", "ttl": cfg.TTL}
 	}
 
-	remaining := 4
+	// 1. 统计现有断点数 + 升级现有断点 TTL 为配置值
+	existing := countAndUpgradeCacheControl(body, cfg.TTL)
+	remaining := 4 - existing
+	if remaining <= 0 {
+		return
+	}
 
-	// 1. tools 末尾
+	// 2. tools 末尾
 	if remaining > 0 {
 		if tools, ok := body["tools"].([]interface{}); ok && len(tools) > 0 {
 			if lastTool, ok := tools[len(tools)-1].(map[string]interface{}); ok {
@@ -57,14 +66,82 @@ func injectCacheControl(body map[string]interface{}, cfg *CacheInjectorConfig) {
 		}
 	}
 
-	// 2. system 末尾
+	// 3. system 末尾
 	if remaining > 0 {
 		injectCacheControlToSystem(body, cacheControl, &remaining)
 	}
 
-	// 3 & 4. 消息中的最后 assistant / user
+	// 4 & 5. 消息中的最后 assistant / user
 	if remaining > 0 {
 		injectCacheControlToMessages(body, cacheControl, &remaining)
+	}
+}
+
+// countAndUpgradeCacheControl 遍历 body 的 tools / system / messages 所有
+// cache_control 断点：统计数量并把 TTL 升级为 ttl 配置值（"5m" 时移除 ttl 字段，
+// 保持 {"type":"ephemeral"} 形态）。返回现有断点总数。
+//
+// 字符串 system 无 cache_control，按数组路径处理时直接跳过（与 Rust 行为一致）。
+func countAndUpgradeCacheControl(body map[string]interface{}, ttl string) int {
+	count := 0
+
+	// tools[]
+	if tools, ok := body["tools"].([]interface{}); ok {
+		for _, t := range tools {
+			if tm, ok := t.(map[string]interface{}); ok {
+				if cc, ok := tm["cache_control"].(map[string]interface{}); ok {
+					count++
+					upgradeCacheControlTTL(cc, ttl)
+				}
+			}
+		}
+	}
+
+	// system[]（数组形态）
+	if system, ok := body["system"].([]interface{}); ok {
+		for _, b := range system {
+			if bm, ok := b.(map[string]interface{}); ok {
+				if cc, ok := bm["cache_control"].(map[string]interface{}); ok {
+					count++
+					upgradeCacheControlTTL(cc, ttl)
+				}
+			}
+		}
+	}
+
+	// messages[].content[]
+	if messages, ok := body["messages"].([]interface{}); ok {
+		for _, m := range messages {
+			mm, ok := m.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			content, ok := mm["content"].([]interface{})
+			if !ok {
+				continue
+			}
+			for _, b := range content {
+				if bm, ok := b.(map[string]interface{}); ok {
+					if cc, ok := bm["cache_control"].(map[string]interface{}); ok {
+						count++
+						upgradeCacheControlTTL(cc, ttl)
+					}
+				}
+			}
+		}
+	}
+
+	return count
+}
+
+// upgradeCacheControlTTL 把单个 cache_control map 的 TTL 升级为配置值。
+// ttl=="5m" 时移除 ttl 字段（保持 {"type":"ephemeral"} 形态，与 Anthropic 默认一致）；
+// 其他值设置 "ttl": ttl。type 字段保持不变。
+func upgradeCacheControlTTL(cc map[string]interface{}, ttl string) {
+	if ttl == "" || ttl == "5m" {
+		delete(cc, "ttl")
+	} else {
+		cc["ttl"] = ttl
 	}
 }
 

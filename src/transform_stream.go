@@ -269,6 +269,7 @@ type openaiChatToAnthropicStream struct {
 	hasEmittedDelta      bool
 	pendingStopReason    string
 	pendingUsage         map[string]interface{}
+	firstUsage           map[string]interface{} // 缓存首个 chunk 的 usage，供 message_start 注入 cache token
 	hasSentStop          bool
 	openTextBlockIndex   *int
 	openThinkingBlockIdx *int
@@ -346,6 +347,17 @@ func (s *openaiChatToAnthropicStream) Flush() ([]byte, error) {
 func (s *openaiChatToAnthropicStream) ensureMessageStart(output *[]byte) {
 	if !s.hasSentMessageStart {
 		s.hasSentMessageStart = true
+		usage := map[string]interface{}{"input_tokens": 0, "output_tokens": 0}
+		if s.firstUsage != nil {
+			// 从首个 chunk 的 usage 提取 cache token 注入 message_start
+			built := buildAnthropicUsageFromOpenAI(s.firstUsage)
+			if _, ok := built["cache_read_input_tokens"]; ok {
+				usage["cache_read_input_tokens"] = built["cache_read_input_tokens"]
+			}
+			if _, ok := built["cache_creation_input_tokens"]; ok {
+				usage["cache_creation_input_tokens"] = built["cache_creation_input_tokens"]
+			}
+		}
 		event := map[string]interface{}{
 			"type": "message_start",
 			"message": map[string]interface{}{
@@ -353,7 +365,7 @@ func (s *openaiChatToAnthropicStream) ensureMessageStart(output *[]byte) {
 				"type":  "message",
 				"role":  "assistant",
 				"model": s.model,
-				"usage": map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
+				"usage": usage,
 			},
 		}
 		*output = append(*output, sseEvent("message_start", mustJSON(event))...)
@@ -375,6 +387,14 @@ func (s *openaiChatToAnthropicStream) handleChunk(chunk map[string]interface{}) 
 	}
 	if s.openToolIndices == nil {
 		s.openToolIndices = make(map[int]bool)
+	}
+
+	// 缓存首个 chunk 的 usage，供 ensureMessageStart 注入 cache token。
+	// 部分提供商（如 DeepSeek）在首个 chunk 携带 usage，此时 message_start 尚未发送。
+	if s.firstUsage == nil {
+		if usage := getMap(chunk, "usage"); usage != nil {
+			s.firstUsage = usage
+		}
 	}
 
 	choices := getArray(chunk, "choices")
@@ -808,9 +828,24 @@ func (s *openaiResponsesToAnthropicStream) ensureMessageStart(output *[]byte) {
 }
 
 func (s *openaiResponsesToAnthropicStream) Flush() ([]byte, error) {
+	var output []byte
+	// 处理 buffer 残留：最后一个 SSE 事件可能不带 \n\n 结尾。
+	if s.buffer.Len() > 0 {
+		block := s.buffer.String()
+		s.buffer.Reset()
+		block = strings.TrimSpace(block)
+		if block != "" {
+			eventType, dataStr := parseSSEBlock(block)
+			if dataStr != "" {
+				var data map[string]interface{}
+				if json.Unmarshal([]byte(dataStr), &data) == nil {
+					output = append(output, s.handleEvent(eventType, data)...)
+				}
+			}
+		}
+	}
 	if !s.hasSentStop {
 		s.hasSentStop = true
-		var output []byte
 		s.ensureMessageStart(&output)
 		if s.openThinkingBlockIdx != nil {
 			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
@@ -1090,6 +1125,56 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 			}
 		}
 
+	case "response.function_call_arguments.done":
+		// 关闭对应 tool block（与 output_item.done 一致）。
+		// 上游可能不发 output_item.done，仅靠此事件关闭 tool block。
+		itemID := getString(data, "item_id")
+		if itemID == "" {
+			itemID = getString(data, "output_index")
+		}
+		if itemID != "" {
+			if block, exists := s.toolBlocks[itemID]; exists {
+				if s.openToolIndices[block.anthropicIndex] {
+					s.ensureMessageStart(&output)
+					output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+						"type": "content_block_stop", "index": block.anthropicIndex,
+					}))...)
+					delete(s.openToolIndices, block.anthropicIndex)
+				}
+			}
+		}
+
+	case "response.refusal.delta":
+		// 安全拒绝文本作为 text_delta 发出，让客户端看到拒绝内容。
+		delta := getString(data, "delta")
+		s.ensureMessageStart(&output)
+		if s.openTextBlockIndex == nil {
+			idx := s.nextContentIndex
+			s.nextContentIndex++
+			s.openTextBlockIndex = &idx
+			output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         idx,
+				"content_block": map[string]interface{}{"type": "text", "text": ""},
+			}))...)
+		}
+		if delta != "" {
+			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": *s.openTextBlockIndex,
+				"delta": map[string]interface{}{"type": "text_delta", "text": delta},
+			}))...)
+		}
+
+	case "response.refusal.done":
+		// 关闭 refusal text block；后续 response.completed 会发 stop。
+		if s.openTextBlockIndex != nil {
+			output = append(output, sseEvent("content_block_stop", mustJSON(map[string]interface{}{
+				"type": "content_block_stop", "index": *s.openTextBlockIndex,
+			}))...)
+			s.openTextBlockIndex = nil
+		}
+
 	case "response.output_item.added":
 		// OpenAI Responses 规范：完整 item 通过 output_item.added 投递，
 		// function_call_arguments.delta 只携带 item_id/output_index/delta。
@@ -1147,7 +1232,13 @@ func (s *openaiResponsesToAnthropicStream) handleEvent(eventType string, data ma
 				s.hasSetStopReason = true
 				status := getString(resp, "status")
 				hasToolUse := len(s.toolBlocks) > 0
-				s.pendingStopReason = mapResponsesStopReason(status, "", hasToolUse)
+				incompleteReason := ""
+				if status == "incomplete" {
+					if details := getMap(resp, "incomplete_details"); details != nil {
+						incompleteReason = getString(details, "reason")
+					}
+				}
+				s.pendingStopReason = mapResponsesStopReason(status, incompleteReason, hasToolUse)
 			}
 			if usage := getMap(resp, "usage"); usage != nil {
 				s.pendingUsage = buildAnthropicUsageFromResponses(usage)
@@ -1254,21 +1345,22 @@ func (b *geminiToolCallSnapshot) feedToolArgs(args string) string {
 }
 
 type geminiToAnthropicStream struct {
-	buffer              bytes.Buffer
-	utf8Remainder       []byte
-	messageID           string
-	model               string
-	hasSentMessageStart bool
-	nextContentIndex    int
-	accumulatedText     string
-	openTextBlockIndex  *int
-	toolSnapshots       []geminiToolCallSnapshot
-	openToolIndices     map[int]bool
-	hasSentStop         bool
-	hasSetStopReason    bool
-	pendingStopReason   string
-	pendingUsage        map[string]interface{}
-	startUsage          map[string]interface{}
+	buffer                bytes.Buffer
+	utf8Remainder         []byte
+	messageID             string
+	model                 string
+	hasSentMessageStart   bool
+	nextContentIndex      int
+	accumulatedText       string
+	openTextBlockIndex    *int
+	toolSnapshots         []geminiToolCallSnapshot
+	openToolIndices       map[int]bool
+	hasSentStop           bool
+	hasSetStopReason      bool
+	hasEmittedBlockNotice bool
+	pendingStopReason     string
+	pendingUsage          map[string]interface{}
+	startUsage            map[string]interface{}
 }
 
 func (s *geminiToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
@@ -1305,10 +1397,26 @@ func (s *geminiToAnthropicStream) Feed(chunk []byte) ([]byte, error) {
 }
 
 func (s *geminiToAnthropicStream) Flush() ([]byte, error) {
-	if !s.hasSentStop {
-		return s.emitStop(), nil
+	var output []byte
+	// 处理 buffer 残留：最后一个 SSE 事件可能不带 \n\n 结尾。
+	if s.buffer.Len() > 0 {
+		block := s.buffer.String()
+		s.buffer.Reset()
+		block = strings.TrimSpace(block)
+		if block != "" {
+			_, dataStr := parseSSEBlock(block)
+			if dataStr != "" {
+				var data map[string]interface{}
+				if json.Unmarshal([]byte(dataStr), &data) == nil {
+					output = append(output, s.handleGeminiChunk(data)...)
+				}
+			}
+		}
 	}
-	return nil, nil
+	if !s.hasSentStop {
+		output = append(output, s.emitStop()...)
+	}
+	return output, nil
 }
 
 func (s *geminiToAnthropicStream) ensureMessageStart(output *[]byte) {
@@ -1359,6 +1467,33 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 		return output
 	}
 
+	// promptFeedback.blockReason：流式下也发出安全屏蔽提示文本。
+	// 不发独立 stop_reason（由 finishReason 路径统一处理），但确保客户端看到屏蔽原因。
+	if pf := getMap(data, "promptFeedback"); pf != nil {
+		if reason := getString(pf, "blockReason"); reason != "" && !s.hasEmittedBlockNotice {
+			s.hasEmittedBlockNotice = true
+			s.ensureMessageStart(&output)
+			if s.openTextBlockIndex == nil {
+				idx := s.nextContentIndex
+				s.nextContentIndex++
+				s.openTextBlockIndex = &idx
+				output = append(output, sseEvent("content_block_start", mustJSON(map[string]interface{}{
+					"type":          "content_block_start",
+					"index":         idx,
+					"content_block": map[string]interface{}{"type": "text", "text": ""},
+				}))...)
+			}
+			output = append(output, sseEvent("content_block_delta", mustJSON(map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": *s.openTextBlockIndex,
+				"delta": map[string]interface{}{
+					"type": "text_delta",
+					"text": "Request blocked by Gemini safety filters: " + reason,
+				},
+			}))...)
+		}
+	}
+
 	contentObj := getMap(candidate, "content")
 	var parts []interface{}
 	if contentObj != nil {
@@ -1367,17 +1502,22 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 
 	// 提取累积文本
 	currentText := extractGeminiVisibleText(parts)
-	// diff 取增量：仅当当前快照不短于已累积长度时才视为单调增长并取增量。
-	// Gemini 规范下累积快照应单调增长，但偶发短快照（非规范）时若无条件覆盖，
-	// 下一轮增长会从截断基底 diff 导致文本重复。
+	// diff 取增量：Gemini 累积快照应单调增长，取 currentText 相对 accumulatedText 的增量。
+	// 当 currentText 不是 accumulatedText 的前缀延伸时（非单调快照，偶发于上游异常），
+	// 参照 Rust streaming_gemini.rs 重新发射完整 currentText 作为 fresh delta，
+	// 避免直接丢弃导致客户端丢失文本。
 	var newText string
-	if len(currentText) > len(s.accumulatedText) {
-		newText = currentText[len(s.accumulatedText):]
-		s.accumulatedText = currentText
+	if strings.HasPrefix(currentText, s.accumulatedText) {
+		if currentText != s.accumulatedText {
+			newText = currentText[len(s.accumulatedText):]
+			s.accumulatedText = currentText
+		}
 	} else if currentText == s.accumulatedText {
 		// 等长且相同：无增量，保持基底
-	} else if len(currentText) < len(s.accumulatedText) {
-		// 短快照：不回退基底，忽略该快照的文本差异
+	} else {
+		// 非前缀（非单调快照）：重新发射完整 currentText
+		newText = currentText
+		s.accumulatedText = currentText
 	}
 
 	// 输出文本增量
@@ -1403,6 +1543,20 @@ func (s *geminiToAnthropicStream) handleGeminiChunk(data map[string]interface{})
 	// 处理工具调用
 	incomingToolCalls := extractGeminiToolCalls(parts)
 	hasToolUse := len(incomingToolCalls) > 0
+
+	// 提取纯文本 part 的 thoughtSignature（thinking-only turn 场景）。
+	// 有 tool_use 时 signature 已随 storeGeminiAssistantTurn(id, parts) 全量保留；
+	// 无 tool_use 时用 messageID 作键存入 shadow store 供后续回放。
+	if !hasToolUse {
+		for _, part := range parts {
+			if pm, ok := asMap(part); ok {
+				if sig := extractGeminiTextPartThoughtSignature(pm); sig != "" && s.messageID != "" {
+					storeGeminiThoughtSignature(s.messageID, sig)
+					break
+				}
+			}
+		}
+	}
 
 	// 合并快照并输出增量
 	for i, tc := range incomingToolCalls {
@@ -1559,7 +1713,7 @@ func extractGeminiToolCalls(parts []interface{}) []geminiToolCallSnapshot {
 			id := getString(fc, "id")
 			name := getString(fc, "name")
 			args := canonicalJSONString(fc["args"])
-			sig := extractGeminiThoughtSignature(fc)
+			sig := extractGeminiThoughtSignature(pm)
 			calls = append(calls, geminiToolCallSnapshot{
 				id:               id,
 				name:             name,
@@ -1623,10 +1777,26 @@ func (s *anthropicToOpenAIChatStream) Feed(chunk []byte) ([]byte, error) {
 }
 
 func (s *anthropicToOpenAIChatStream) Flush() ([]byte, error) {
-	if !s.hasSentDone {
-		return s.emitDone(), nil
+	var output []byte
+	// 处理 buffer 残留：最后一个 SSE 事件可能不带 \n\n 结尾。
+	if s.buffer.Len() > 0 {
+		block := s.buffer.String()
+		s.buffer.Reset()
+		block = strings.TrimSpace(block)
+		if block != "" {
+			eventType, dataStr := parseSSEBlock(block)
+			if dataStr != "" {
+				var data map[string]interface{}
+				if json.Unmarshal([]byte(dataStr), &data) == nil {
+					output = append(output, s.handleAnthropicEvent(eventType, data)...)
+				}
+			}
+		}
 	}
-	return nil, nil
+	if !s.hasSentDone {
+		output = append(output, s.emitDone()...)
+	}
+	return output, nil
 }
 
 func (s *anthropicToOpenAIChatStream) handleAnthropicEvent(eventType string, data map[string]interface{}) []byte {
@@ -1873,10 +2043,26 @@ func (s *anthropicToOpenAIResponsesStream) Feed(chunk []byte) ([]byte, error) {
 }
 
 func (s *anthropicToOpenAIResponsesStream) Flush() ([]byte, error) {
-	if !s.hasSentCompleted {
-		return s.emitCompleted(), nil
+	var output []byte
+	// 处理 buffer 残留：最后一个 SSE 事件可能不带 \n\n 结尾。
+	if s.buffer.Len() > 0 {
+		block := s.buffer.String()
+		s.buffer.Reset()
+		block = strings.TrimSpace(block)
+		if block != "" {
+			eventType, dataStr := parseSSEBlock(block)
+			if dataStr != "" {
+				var data map[string]interface{}
+				if json.Unmarshal([]byte(dataStr), &data) == nil {
+					output = append(output, s.handleAnthropicEvent(eventType, data)...)
+				}
+			}
+		}
 	}
-	return nil, nil
+	if !s.hasSentCompleted {
+		output = append(output, s.emitCompleted()...)
+	}
+	return output, nil
 }
 
 func (s *anthropicToOpenAIResponsesStream) handleAnthropicEvent(eventType string, data map[string]interface{}) []byte {
@@ -2208,10 +2394,26 @@ func (s *anthropicToGeminiStream) Feed(chunk []byte) ([]byte, error) {
 }
 
 func (s *anthropicToGeminiStream) Flush() ([]byte, error) {
-	if !s.hasSentFinal {
-		return s.emitFinal(), nil
+	var output []byte
+	// 处理 buffer 残留：最后一个 SSE 事件可能不带 \n\n 结尾。
+	if s.buffer.Len() > 0 {
+		block := s.buffer.String()
+		s.buffer.Reset()
+		block = strings.TrimSpace(block)
+		if block != "" {
+			eventType, dataStr := parseSSEBlock(block)
+			if dataStr != "" {
+				var data map[string]interface{}
+				if json.Unmarshal([]byte(dataStr), &data) == nil {
+					output = append(output, s.handleAnthropicEvent(eventType, data)...)
+				}
+			}
+		}
 	}
-	return nil, nil
+	if !s.hasSentFinal {
+		output = append(output, s.emitFinal()...)
+	}
+	return output, nil
 }
 
 func (s *anthropicToGeminiStream) handleAnthropicEvent(eventType string, data map[string]interface{}) []byte {
@@ -2378,9 +2580,46 @@ func (s *anthropicToGeminiStream) emitFinal() []byte {
 // transformStreamReader：将 StreamConverter 包装为 io.ReadCloser
 // ============================================================================
 
+// renderStreamErrorEvent 按客户端格式（inFormat）渲染流式错误事件。
+// 不同格式的客户端期望不同的错误事件形状：
+//   - Anthropic: event: error\ndata: {"type":"error","error":{"type":"stream_error","message":"..."}}
+//   - OpenAI Chat/Responses: data: {"error":{"message":"...","type":"stream_error"}}\n\ndata: [DONE]
+//   - Gemini: data: {"error":{"code":500,"message":"...","status":"INTERNAL"}}
+func renderStreamErrorEvent(inFormat, message string) []byte {
+	switch inFormat {
+	case formatOpenAIChat, formatOpenAIResponses:
+		data, _ := json.Marshal(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": message,
+				"type":    "stream_error",
+			},
+		})
+		return []byte("data: " + string(data) + "\n\ndata: [DONE]\n\n")
+	case formatGemini:
+		data, _ := json.Marshal(map[string]interface{}{
+			"error": map[string]interface{}{
+				"code":    500,
+				"message": message,
+				"status":  "INTERNAL",
+			},
+		})
+		return []byte("data: " + string(data) + "\n\n")
+	default: // formatAnthropic
+		data, _ := json.Marshal(map[string]interface{}{
+			"type": "error",
+			"error": map[string]interface{}{
+				"type":    "stream_error",
+				"message": message,
+			},
+		})
+		return []byte("event: error\ndata: " + string(data) + "\n\n")
+	}
+}
+
 type transformStreamReader struct {
 	upstream             io.ReadCloser
 	converter            StreamConverter
+	inFormat             string // 客户端格式，用于错误事件渲染
 	buf                  bytes.Buffer
 	done                 bool
 	pendingErr           error // upstream 非 EOF 错误，待 buf 排空后再返回给调用方
@@ -2394,6 +2633,7 @@ func newTransformStreamReader(inFormat, outFormat string, upstream io.ReadCloser
 	return &transformStreamReader{
 		upstream:  upstream,
 		converter: NewStreamConverter(inFormat, outFormat),
+		inFormat:  inFormat,
 	}
 }
 
@@ -2440,18 +2680,12 @@ func (r *transformStreamReader) Read(p []byte) (int, error) {
 				}
 				return 0, io.EOF
 			}
-			// 非 EOF 错误：发 Anthropic 格式 error 事件，让客户端看到错误而非静默断流。
+			// 非 EOF 错误：按客户端格式渲染 error 事件，让客户端看到错误而非静默断流。
 			// 同时标记 streamEndedWithError，抑制后续 Flush 的 message_delta/message_stop。
 			if !r.streamEndedWithError {
 				r.streamEndedWithError = true
-				errEvent := map[string]interface{}{
-					"type": "error",
-					"error": map[string]interface{}{
-						"type":    "stream_error",
-						"message": fmt.Sprintf("upstream stream error: %v", err),
-					},
-				}
-				r.buf.Write(sseEvent("error", mustJSON(errEvent)))
+				errMsg := fmt.Sprintf("upstream stream error: %v", err)
+				r.buf.Write(renderStreamErrorEvent(r.inFormat, errMsg))
 			}
 			r.pendingErr = err
 			continue

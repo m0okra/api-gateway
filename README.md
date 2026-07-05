@@ -15,8 +15,7 @@ src/
 ├── providers.go       可用性 Provider：DeepSeek 余额、OpenCode-Go 用量等检查实现
 ├── state.go           状态管理：从 SQLite 加载/保存（锁外 I/O 快照写）、一致性协调
 ├── scheduler.go       定时调度：exhaust 恢复检查 + 状态持久化触发
-├── aliases.go         模型别名：从 aliases.json 加载别名映射（不存在则禁用）
-├── transform.go       API 格式转换：4 格式 × 请求/响应转换器（openai/anthropic/gemini 互转，anthropic pivot）
+├── transform.go       API 格式转换：4 格式 × 请求/响应转换器（openai/anthropic/gemini 互转，anthropic pivot）+ 模型列表 6 向直转
 ├── transform_stream.go SSE 流式转换状态机（4 格式两两互转，经 anthropic pivot）
 ├── gemini_shadow.go   Gemini thoughtSignature 影子存储（按 tool_call_id 存完整 parts，多轮回放）
 ├── reasoning_vendor.go reasoning vendor 兼容（thinking 历史重写、thinking 禁用时剥离 effort）
@@ -45,7 +44,6 @@ go build -o api-gateway.exe .
 |---|---|
 | `-p` / `-port` | 运行端口，默认 `9090` |
 | `-db` | SQLite 数据库文件路径，默认 `gateway.db` |
-| `-aliases` | 模型别名配置文件路径，默认 `aliases.json`（文件不存在则禁用别名功能） |
 | `-e <file>` / `-export <file>` | 将 `-db` 库全量导出为 JSON 文件后退出（不启动服务器） |
 | `-i <file>` / `-import <file>` | 将 JSON 文件全量导入 `-db` 库后退出（不启动服务器，全量覆盖） |
 
@@ -165,7 +163,7 @@ client → 网关 (带 fakeToken)
 ### 状态持久化
 
 - 所有配置与运行时状态统一存储在 `gateway.db`（SQLite，WAL 模式，明文不加密，依赖文件权限保护）。
-- 表结构：`upstreams`（配置列 + 运行时状态列同行）、`upstream_tiers`（usage 型层级配置+状态）、`upstream_extra`（Extra map）、`fake_tokens`（fakeToken→有序 upstream 队列，priority=队列下标）。
+- 表结构：`upstreams`（配置列 + 运行时状态列同行，含 per-upstream `aliases` JSON 列）、`upstream_tiers`（usage 型层级配置+状态）、`upstream_extra`（Extra map）、`fake_tokens`（fakeToken→有序 upstream 队列，priority=队列下标）。
 - 恢复调度依据按类型二选一：
   - **count 型**：`RecoveryCron`（cron 表达式，对应配置的 `RefreshCron`）
   - **usage/balance/exhaust 型**：`RecoveryAt`（精确时间点 `time.Time`，由 provider 在 exhaust 时设定）
@@ -189,33 +187,37 @@ client → 网关 (带 fakeToken)
 
 典型用途：备份/恢复 `gateway.db`、手工编辑配置后导入、跨环境迁移。导出文件含明文 `realToken`，需自行保护文件权限。
 
-### 模型别名
+### 模型别名（per-upstream）
 
-通过 `aliases.json` 文件提供请求模型名 → 上游真实模型名的映射，用于在转发前重写请求中的模型名。**默认不启用**：仅当 `-aliases` 指定的文件（默认 `aliases.json`，相对工作目录）存在时启用；文件不存在则别名功能保持禁用，请求原样转发。
+每个 upstream 可选配置 `aliases` 字段，提供客户端请求模型名 → 上游真实模型名的映射，用于在转发前重写请求中的模型名。**该字段缺省时该 upstream 不启用别名**（请求原样转发）；不同 upstream 可独立配置不同 alias 映射，互不干扰。**别名替换不依赖 `formatTransform`**——未配置格式转换时同样生效（body 的 `model` 字段或 Gemini path 会被改写，非字节级零改动）。
 
-文件格式为 `map[string]string`，key 与 value 均为字符串：
+`aliases` 结构为 `map[string]string`，key 与 value 均为字符串：
 
 ```json
-{
-  "gpt-4-turbo": "gpt-4",
-  "claude-3-opus": "claude-3-opus-20240229",
-  "gemini-pro": "gemini-1.5-pro"
+"deepseek": {
+  "realToken": "***",
+  "targetBase": "https://api.deepseek.com",
+  "aliases": {
+    "gpt-4-turbo": "deepseek-chat",
+    "claude-3-opus": "deepseek-chat"
+  }
 }
 ```
 
 替换规则：
 
-- 仅当请求中提取到模型名（body 的 `model` 字段，或 Gemini 风格 URL path `/models/{name}`）且该模型名命中 `aliases.json` 的 key 时，替换为对应 value。
+- 仅当请求中提取到模型名（body 的 `model` 字段，或 Gemini 风格 URL path `/models/{name}`）且该模型名命中当前 upstream 的 `aliases` 的 key 时，替换为对应 value。
 - 同时覆盖三种 API 风格：
   - OpenAI/Anthropic 风格：重写请求体 JSON 的 `model` 字段（重新序列化 body，`Content-Length` 由 transport 自动重算）。
   - Gemini 风格：重写 URL path 中的模型名段（如 `/v1beta/models/gemini-pro:generateContent` → `/v1beta/models/gemini-1.5-pro:generateContent`）。
-- **不处理模型列表请求**（如 `GET /v1/models`）：此类请求无模型名，天然跳过替换。
 - body 非 JSON 或 `model` 字段非字符串时静默跳过 body 重写（不影响 URL path 重写）。
-- 仅在启动时一次性加载，运行期只读；修改 `aliases.json` 后需重启生效。文件解析失败时记录错误日志并禁用别名功能（不阻断启动）。
+- **作用于 attempt 循环内**：alias 重写仅作用于本次 attempt 的局部 `sendBody`/`sendModel`/`basePath`，不污染跨 attempt 复用的原始 `bodyBytes`/`r.URL.Path`/`modelStr`。重试到另一个 different-format upstream 时按其各自的 `aliases` 重新计算，避免跨 upstream 串污染。
+- **DB 持久化**：`upstreams` 表 `aliases` 列存 JSON 编码的 map 字符串；导入导出（`-e`/`-i`）跟着 upstream 配置一起序列化。旧库无此列时启动自动 `ALTER TABLE ADD COLUMN` 兼容。
+- **模型列表响应反向展开**：上游返回模型列表时，按 value→key 反向展开——见下文「模型列表请求转换」。
 
 ### API 格式转换（formatTransform）
 
-每个 upstream 可选配置 `formatTransform` 字段，使网关在转发前将客户端请求体转换为目标上游的 API 格式，并在响应返回时反向转换回客户端格式。**不配置或留空时完全透传**（字节级零改动，向后兼容）。
+每个 upstream 可选配置 `formatTransform` 字段，使网关在转发前将客户端请求体转换为目标上游的 API 格式，并在响应返回时反向转换回客户端格式。**不配置或留空时，formatTransform 相关逻辑完全跳过**，请求体/path 多数情况下字节级透传（视 `aliases` / `extra` / `cacheInjection` 等独立配置而定，见下文「高级转换特性」）。
 
 #### 可选值
 
@@ -225,7 +227,7 @@ client → 网关 (带 fakeToken)
 | `openai_responses` | OpenAI Responses API | 上游走 `/v1/responses` |
 | `anthropic` | Anthropic Messages | 上游走 `/v1/messages` |
 | `gemini` | Google Gemini | 上游走 `/v1beta/models/{model}:generateContent`（流式 `:streamGenerateContent?alt=sse`） |
-| 不指定 | — | 透传所有请求/响应 |
+| 不指定 | — | formatTransform 透传（body/path 不变）；但 `aliases`/`extra` 增强项/cacheInjection 仍独立生效 |
 
 #### 转换规则
 
@@ -234,6 +236,26 @@ client → 网关 (带 fakeToken)
 - **链式转换**：任何两种不同格式间都经 anthropic 作为 pivot 中间格式两步完成（含 `openai_chat` ↔ `openai_responses`），对调用方透明。仅当客户端格式 == 目标格式时才透传。
 - **目标 path 重写**：转换路径下，目标 URL path 按目标格式规范端点替换；透传路径保留原始 `r.URL.Path`。
 - **认证头重写**：转换路径下，按目标格式注入认证（gemini→`X-Goog-Api-Key`/`?key=`；anthropic→`x-api-key`+`anthropic-version`；openai→`Authorization: Bearer`）；透传路径沿用原 token 注入优先级（`X-Goog-Api-Key`/`?key=`/`X-Api-Key`/`Authorization`）。
+
+#### 模型列表请求转换
+
+模型列表端点（`GET /v1/models` / `GET /v1beta/models`）也走格式转换路径，但与业务端点（chat/messages/responses/gemini generate）不同——不经 anthropic pivot，4 种格式 6 个方向**直接两两转换**，保留 `inputTokenLimit`/`outputTokenLimit` 等元数据，避免经 anthropic 中转丢失。
+
+- **客户端格式判定**（按 path + auth header）：
+  - `/v1beta/models` → gemini（path 自带上游风格信号）。
+  - `/v1/models` + `X-Api-Key` 或 `anthropic-version` 头任一 → anthropic。
+  - `/v1/models` + 其余（Bearer / 兜底） → openai_chat（openai_responses 复用同一列表端点）。
+- **目标 path 重写**：gemini 上游走 `/v1beta/models`，其余走 `/v1/models`。
+- **认证头**：与业务端点共用 `swapAuthForTarget` 按目标格式注入。
+- **6 向直转**：openai↔anthropic、openai↔gemini、anthropic↔gemini（每对两向）共 6 个方向各自实现经中性 `modelsList` 结构；openai_chat ↔ openai_responses 列表结构完全相同走 fast path 透传。
+- **字段映射约定**：
+  - OpenAI → Anthropic：`id`→`id`，`display_name` 用 `id` 兜底，`owned_by` **丢弃**。
+  - Anthropic → OpenAI：`id`→`id`，`owned_by` 留空。
+  - Gemini → OpenAI/Anthropic：从 `name="models/x"` 提取尾段作为 `id`，`displayName` 直接保留为 `display_name`/`displayName`。
+  - 反向 OpenAI/Anthropic → Gemini：`id` 拼回 `name="models/"+id`，`displayName` 兜底用 `id`，固定填 `supportedGenerationMethods: ["generateContent","streamGenerateContent"]`，`inputTokenLimit`/`outputTokenLimit` 在 openai/anthropic 源无对应字段时填 0。
+- **别名反向展开**：upstream 配置 `aliases` 时，模型列表响应里若上游真实模型名命中 `aliases` 的 value，则为每个指向它的 alias key 追加一条 entry，所有字段与原真实名条目完全相同（仅 `id`/`name`/`display_name`/`displayName` 改为 alias key）。原真实名条目保留，客户端既能从列表命中真实名也能命中 alias。一对多（多个 alias key → 同一真实名）会展开为多条 alias entry。
+- **错误响应**：列表请求的 4xx/5xx 错误响应同样走 `TransformErrorResponse` 转为客户端列表格式后返回（inFormat 此时被覆写为客户端列表格式）。
+- **未配置 `formatTransform` 时**完全透传（`outFormat==""` → `doListTransform=false`），行为同现状。上游格式 == 客户端列表判定格式时也透传。
 
 #### 流式支持
 
@@ -271,25 +293,22 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 - **链式转换语义损耗**：`openai_chat` ↔ `openai_responses` 等跨子格式转换经 anthropic pivot 两步完成，工具调用、reasoning 等字段经历两次映射，可能出现语义损耗（如 Responses 的 namespace tool 经 anthropic 中转后降级为普通 function tool）。
 - **非法值兜底**：`formatTransform` 配置为非上述 4 个合法值时，记 `[TRANSFORM] invalid formatTransform ... -> passthrough` 警告日志后按透传处理，不报错。
 
-#### 高级转换特性
+#### 高级增强特性
 
-除基础格式转换外，网关还内置以下增强能力（多数通过 `upstreams[].extra` map 的字符串参数按 upstream 单独启用）。`extra` map 同时承载可用性检查参数（如 OpenCode-Go 的 `cookie`/`workspaceId`，见上文），以下仅列格式转换相关的 5 个参数：
+除 `formatTransform` 外，网关还内置以下增强能力（多数通过 `upstreams[].extra` map 的字符串参数按 upstream 单独启用）。`extra` map 同时承载可用性检查参数（如 OpenCode-Go 的 `cookie`/`workspaceId`，见上文）。以下 4 个 `extra` 参数**不依赖 `formatTransform` 开启**——即使透传（`formatTransform` 为空），只要客户端格式匹配各自的目标格式，仍会改写请求体：
 
-**格式转换相关 `extra` 参数（5 个）**：
+| key | 取值 | 作用 | 生效条件 |
+|---|---|---|---|
+| `codexBackend` | `"true"` / `"fast"` | 对发往 ChatGPT Codex 后端的 Responses 请求做字段整形（注入 `store:false`/`include`/`stream:true`/兜底字段，剥离 `max_output_tokens`/`temperature`/`top_p`；`fast` 额外注入 `service_tier:"priority"`） | 上游实际发送格式为 `openai_responses`（转换后或 Responses→Responses 透传） |
+| `preserveReasoningContent` | `"true"` | Anthropic→OpenAI Chat 转换时把 `thinking` 块提取为 `reasoning_content` 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 兼容） | 仅 formatTransform 开启时生效（需跨格式转换） |
+| `reasoningVendor` | `"auto"` 或 `"kimi"`/`"deepseek"`/`"mimo"` 等非空值 | 重写 thinking 历史为占位符，兼容拒绝原始 thinking 块的供应商（`auto` 按 upstream 名/`targetBase` 自动检测） | 客户端格式为 `anthropic`（透传或转换前均可） |
+| `stripEffortWhenThinkingDisabled` | `"true"` | `thinking.type != enabled` 时剥离 `reasoning_effort`/`output_config.effort` 参数（DeepSeek Anthropic 兼容端点要求） | 客户端格式为 `anthropic`（透传或转换前均可） |
 
-| key | 取值 | 作用 |
-|---|---|---|
-| `codexBackend` | `"true"` / `"fast"` | 对发往 ChatGPT Codex 后端的 Responses 请求做字段整形（注入 `store:false`/`include`/`stream:true`/兜底字段，剥离 `max_output_tokens`/`temperature`/`top_p`；`fast` 额外注入 `service_tier:"priority"`） |
-| `preserveReasoningContent` | `"true"` | Anthropic→OpenAI Chat 转换时把 `thinking` 块提取为 `reasoning_content` 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 兼容） |
-| `reasoningVendor` | `"auto"` 或 `"kimi"`/`"deepseek"`/`"mimo"` 等非空值 | 重写 thinking 历史为占位符，兼容拒绝原始 thinking 块的供应商（`auto` 按 upstream 名/`targetBase` 自动检测） |
-| `stripEffortWhenThinkingDisabled` | `"true"` | `thinking.type != enabled` 时剥离 `reasoning_effort`/`output_config.effort` 参数（DeepSeek Anthropic 兼容端点要求） |
-| `promptCacheKey` | 任意非空字符串 | 对发往 Responses 上游的请求注入 `prompt_cache_key` 字段，改善上游缓存路由 |
-
-`extra` 中 `codexBackend` 与 `promptCacheKey` 作用于转换后的 `sendBody`（post-transform pass）；`preserveReasoningContent` 通过 `TransformOptions` 透传到转换函数；`reasoningVendor` 与 `stripEffortWhenThinkingDisabled` 作用于转换前的客户端请求体副本（pre-transform pass），不污染跨 attempt 复用的原始 `bodyBytes`。
+4 个参数在 attempt 内的作用时点分两类：`reasoningVendor` 与 `stripEffortWhenThinkingDisabled` 属于 **pre-transform pass**（作用于转换前的客户端请求体副本，再将结果写回 `sendBody`；`!doTransform` 时同样生效）；`codexBackend` 属于 **post-transform pass**（作用于转换后的 `sendBody` 或透传路径下直接改写）；`preserveReasoningContent` 仅通过 `TransformOptions` 透传到跨格式转换函数内部，透传路径无效果。
 
 **其他内置增强**（无需配置，默认启用）：
 
-- **cache_control 自动注入**：upstream 配置 `cacheInjection: { enabled: true, ttl: "5m" }` 时，自动在 tools/system/最后 assistant/最后 user 消息末尾注入最多 4 个 `cache_control: {"type":"ephemeral"}` 断点，享受 Anthropic Prompt Caching 折扣。
+- **cache_control 自动注入**：upstream 配置 `cacheInjection: { enabled: true, ttl: "5m" }` 时，自动在 tools/system/最后 assistant/最后 user 消息末尾注入最多 4 个 `cache_control: {"type":"ephemeral"}` 断点，享受 Anthropic Prompt Caching 折扣。**不依赖 `formatTransform`**，透传 Anthropic→Anthropic 时同样生效。
 - **Gemini thoughtSignature 影子存储**：按 `tool_call_id` 维度存储 Gemini 的 `thoughtSignature` 与完整 assistant turn `parts` 数组（含 `thought:true` 块），多轮工具调用时原样回放，避免 Gemini 签名校验失败 400。
 - **thinking signature 自动修复**：上游返回 thinking signature 相关 400 错误时，自动剥离 thinking/redacted_thinking 块与残留 `signature` 字段后重试同一 upstream（最多 1 次）。
 - **reasoning effort 4 档映射**：`thinking.budget_tokens` 与 `output_config.effort` 映射到 `low`/`medium`/`high`/`xhigh` 四档（`adaptive` → `xhigh`），`xhigh` 在转 OpenAI 时降级为 `high`。
@@ -441,10 +460,6 @@ curl http://localhost:9090/status
   - 统一受 `recoveryMinGap`（60s）约束，避免短时间重复触发
 - `recoverUpstream`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
 
-### aliases.go
-
-- `loadAliases`：启动期一次性加载 `-aliases` 指定的 JSON 文件为 `map[string]string` 并赋值全局 `aliases`。文件不存在 → `aliases` 保持 nil（禁用，非错误）；解析失败 → 记录错误日志且 `aliases` 保持 nil（禁用，不阻断启动）；加载成功 → `aliases` 非 nil（含空 map）视为已启用。运行期只读，无锁。
-
 ### gateway.go
 
 - handler：核心请求处理函数，以 `reqSem <- struct{}{}` 获取并发令牌（defer 释放），完成后返回
@@ -452,7 +467,8 @@ curl http://localhost:9090/status
 - 状态查询：`incrementCount`（count 型自增）、`applyAvailabilityResult`（写入检查结果；按类型分流：count 写 `RecoveryCron`、其余写 `RecoveryAt`，并清理另一调度依据的残留）
 - 可用性错误（401/402/403/429）路径通过 `availSF.Do()` singleflight 去重 checkAvailability，避免并发请求重复调用 provider
 - 流式响应：idle 监控 goroutine + `maxStreamLife` context 超时硬上限，双保险
-- 格式转换集成：按 `inFormat`/`outFormat` 决定是否转换（`needsTransform`）。pre-transform pass 对客户端请求体副本应用 `reasoningVendor` 重写与 `stripEffortWhenThinkingDisabled` 剥离（不污染跨 attempt 复用的 `bodyBytes`）；post-transform pass 对转换后的 `sendBody` 应用 `codexBackend` 整形与 `promptCacheKey` 注入。`preserveReasoningContent` 通过 `TransformOptions` 透传到转换函数
+- 格式转换集成：在 attempt 循环内按 `inFormat`/`outFormat` 决定是否转换（`needsTransform`）。每次 attempt 先按选中 upstream 的 `aliases`（per-upstream）重写请求模型名，作用于本次 attempt 的局部 `sendBody`/`sendModel`/`basePath`（不污染跨 attempt 复用的 `bodyBytes`/`r.URL.Path`/`modelStr`，避免重试到不同名称上游时串污染）。pre-transform pass 对客户端请求体副本应用 `reasoningVendor` 重写与 `stripEffortWhenThinkingDisabled` 剥离（透传路径下同样执行）；post-transform pass 对转换后（或透传）的 `sendBody` 应用 `codexBackend` 整形。`preserveReasoningContent` 通过 `TransformOptions` 透传到跨格式转换函数。
+- 模型列表旁路：`detectListFormat` 识别列表请求并按客户端列表格式转换（6 向直转，不经 anthropic pivot），列表响应里反向展开 alias 条目；列表错误响应同样按客户端列表格式重建
 - thinking signature 重试：上游返回 400 且 `shouldRectifyThinkingSignature` 命中时，调用 `rectifyAnthropicRequest` 清理 thinking 块后重试同一 upstream（最多 1 次）
 - `writeJSON` 统一 JSON 响应写入（`globals.go` 中定义）
 - 辅助函数：`maskURL` / `maskHeadersStr` / `forwardStreamHeaders` / `removeHopHeaders` / `maskFakeToken` 用于日志脱敏和头处理
@@ -477,13 +493,21 @@ curl http://localhost:9090/status
 
 - `injectCacheControl`：在 Anthropic 请求体注入最多 4 个 `cache_control: {"type":"ephemeral"}` 断点（tools 末尾、system 末尾、最后 assistant 消息末尾非 thinking block、最后 user 消息末尾）
 - 已有断点不覆盖；`ttl` 为空或 `"5m"` 时不带 ttl 字段，其他值带 `"ttl"` 字段
-- byte 级封装 `injectCacheControlIntoBytes` 供 `gateway.go` 在发送 body 为 Anthropic 格式时调用（含转换到 anthropic 与透传 anthropic→anthropic 两条路径）
+- byte 级封装 `injectCacheControlIntoBytes` 供 `gateway.go` 在发送 body 为 Anthropic 格式时调用（含转换到 anthropic 与透传 anthropic→anthropic 两条路径）。`formatTransform` 为空时，若客户端格式为 anthropic 且 cacheInjection 启用，仍会注入断点。
 
 ### thinking_rectifier.go
 
 - `thinkingSignatureErrorPatterns`：7 个正则匹配 Anthropic thinking signature 错误消息（`signature.*not.*valid`、`must start with a thinking block` 等）
 - `shouldRectifyThinkingSignature`：检测错误响应体是否为 thinking signature 问题
 - `rectifyAnthropicRequest`：移除所有 thinking/redacted_thinking 块、剥离非 thinking 块的 `signature` 字段、若最后一条 assistant 消息移除 thinking 后则移除顶层 `thinking` 配置
+
+### transform.go（模型列表转换部分）
+
+- `detectListFormat` + `targetListEndpointPath`：列表端点 path + auth header 判定客户端格式与对应上游端点路径（见上文「模型列表请求转换」）。
+- 中性结构 `modelsList`/`modelsListEntry`：承载 4 种格式共有字段（ID/Created/CreatedAt/OwnedBy/DisplayName/Version/InputTokenLimit/OutputTokenLimit），作为 6 向直转的中间表示。
+- 4 个解析器 `parseOpenAIModelsList`/`parseAnthropicModelsList`/`parseGeminiModelsList`（openai_chat 与 openai_responses 共用同一解析器）+ 3 个 builder `buildOpenAIModelsList`/`buildAnthropicModelsList`/`buildGeminiModelsList`，dispatch 由 `parseModelsListByFormat`/`buildModelsListByFormat` 完成。
+- `reverseAliasesMap` + `applyAliasesReverseToList`：按 per-upstream `aliases` 的 value→key 反向展开模型列表 entry（一对多生成多条 alias entry，alias 与真实名相同时跳过）。
+- `TransformModelsListResponse`：列表响应转换主入口，调用 parse → 反向别名展开 → build → marshal；同格式或 openai_chat↔openai_responses 走 fast path 透传。
 
 ## 许可证
 

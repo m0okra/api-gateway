@@ -28,6 +28,11 @@ type UpstreamConfig struct {
 	// CacheInjection 控制 Anthropic Prompt Caching 自动断点注入。
 	// 仅在目标格式为 anthropic 时生效。nil 或 Enabled=false 时不注入。
 	CacheInjection *CacheInjectorConfig `json:"cacheInjection,omitempty"`
+	// Aliases 模型别名映射（per-upstream）：key 为客户端请求中的模型名，
+	// value 为转发到上游时替换后的真实模型名。nil 表示该 upstream 不启用别名。
+	// 在模型列表响应中按 value→key 反向展开：同时保留真实模型名条目与 alias 条目，
+	// 二者字段完全相同，客户端能从列表命中 alias 并请求。
+	Aliases map[string]string `json:"aliases,omitempty"`
 }
 
 // CacheInjectorConfig 控制 Anthropic Prompt Caching 自动 cache_control 断点注入。
