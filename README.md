@@ -1,6 +1,6 @@
 # api-gateway
 
-Go + SQLite 轻量级 API 反向代理网关，兼容三大主流AI API（OpenAI/Anthropic/Google Gemini），支持多 token 轮转、可用性检查、自动恢复与状态持久化。
+Go + SQLite 轻量级 API 反向代理网关，兼容三大主流AI API（OpenAI/Anthropic/Google Gemini）并支持 API 格式转换，支持多 token 轮转、可用性检查、自动恢复与状态持久化。
 
 ## 目录结构
 
