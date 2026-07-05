@@ -433,13 +433,31 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		// 列表请求需以 listFormat 覆盖 inFormat（用于错误响应转换），并选择列表转换分支
 		// （不走业务端点 TransformRequest/Response）。非列表请求走原有 doTransform 逻辑。
+		//
+		// alias 与模型列表的一致性：
+		//   - formatTransform 场景（outFormat != ""）：由 TransformModelsListResponse 统一处理
+		//     （内部对同格式但配了 alias 的请求也会跳过 fast-path 进行 parse/build + alias 反向展开）。
+		//   - 直连场景（outFormat == ""）：就地 JSON 处理（applyAliasesReverseToListInPlace），
+		//     保留上游原始 JSON 全部字段，仅按 alias 改写条目数组。
+		//
+		// 两种路径均执行"删除被覆盖真实条目 + 追加 alias 克隆条目"，使列表显示与请求路由一致。
 		doTransform := false
 		doListTransform := false
+		listInPlace := false // 直连场景下仅因 alias 启用就地改写时置真
 		if isListRequest {
 			inFormat = listFormat
-			doListTransform = outFormat != "" && needsTransform(listFormat, outFormat)
+			hasAliases := upstreamCfg.Aliases != nil && len(upstreamCfg.Aliases) > 0
+			if outFormat == "" {
+				// 直连无格式转换：只有配了 alias 才需要改写列表（就地 JSON 路径）
+				doListTransform = hasAliases
+				listInPlace = hasAliases
+			} else {
+				// formatTransform：跨格式或同格式都需要进入列表转换分支（含 alias 反向展开）
+				doListTransform = needsTransform(listFormat, outFormat) || hasAliases
+			}
 			if doListTransform {
-				log.Printf("[TRANSFORM-LIST] upstream=%s %s -> %s", upstreamName, listFormat, outFormat)
+				log.Printf("[TRANSFORM-LIST] upstream=%s %s -> %s (inPlace=%v)",
+					upstreamName, listFormat, outFormat, listInPlace)
 			}
 		} else {
 			doTransform = outFormat != "" && needsTransform(inFormat, outFormat)
@@ -533,10 +551,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Token 注入：转换路径用 swapAuthForTarget 重置 auth 头；透传路径沿用原逻辑
-		// （仅当对应输入存在时注入对应输出字段，两者都存在则同时注入，否则回退 X-Api-Key / Authorization）。
+// Token 注入：转换路径用 swapAuthForTarget 重置 auth 头；透传路径沿用原逻辑
+		// （仅当对应输入存在时注入对应输出字段，两者都存在时同时注入，否则回退 X-Api-Key / Authorization）。
+		// formatTransform 场景（doTransform/doListTransform 且非直连就地路径）用 swapAuthForTarget；
+		// 直连就地路径（listInPlace）与纯透传走原 auth 头处理逻辑，保持客户端原始 auth 风格。
 		// 列表转换（doListTransform）与业务端点转换共享同一 auth 头处理。
-		if doTransform || doListTransform {
+		if (doTransform || doListTransform) && !listInPlace {
 			swapAuthForTarget(outHeaders, query, upstreamCfg.RealToken, outFormat)
 			if outFormat == formatGemini && isStream {
 				query.Set("alt", "sse")
@@ -641,8 +661,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			// 非exhaust但返回可用性错误 → 把错误响应返回给客户端。
 			// 转换路径下先经 TransformErrorResponse 转为客户端格式，保持错误体格式一致。
 			// 列表请求（doListTransform）同样按客户端列表格式重建错误响应。
+			// 直连就地路径（listInPlace）无格式转换可行：错误响应原样透传。
 			respBody := errBody
-			if doTransform || doListTransform {
+			if (doTransform || doListTransform) && !listInPlace {
 				respBody = TransformErrorResponse(inFormat, outFormat, errBody, resp.StatusCode)
 			}
 			for k, vs := range resp.Header {
@@ -735,7 +756,10 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// 不能用 SSE 流式转换器处理）。可用性错误（401/402/403/429）已在上方单独处理。
 
 		// 列表请求分支：模型列表响应永远非流式，独立于业务端点转换分支处理。
-		// 成功响应走 TransformModelsListResponse（含 alias 反向展开），错误响应走 TransformErrorResponse。
+		//   - formatTransform 场景：成功响应走 TransformModelsListResponse（中性结构 + alias 反向展开），
+		//     错误响应走 TransformErrorResponse。
+		//   - 直连场景（listInPlace）：成功响应走 ApplyAliasesReverseToListInPlaceBytes（就地 JSON 改写，
+		//     保留上游全部字段），错误响应原样透传（无格式转换可行）。
 		// 可用性错误（401/402/403/429）已在上分支单独处理（exhaust 路径 continue，非 exhaust 已 return）。
 		if doListTransform {
 			rawBody, rerr := io.ReadAll(resp.Body)
@@ -748,17 +772,34 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 			var tBody []byte
 			if resp.StatusCode < 300 {
-				converted, terr := TransformModelsListResponse(listFormat, outFormat, rawBody, upstreamCfg.Aliases)
-				if terr != nil {
-					log.Printf("[TRANSFORM-LIST] response convert failed: %v (fallback raw)", terr)
-					tBody = rawBody
+				if listInPlace {
+					converted, terr := ApplyAliasesReverseToListInPlaceBytes(rawBody, listFormat, upstreamCfg.Aliases)
+					if terr != nil {
+						log.Printf("[TRANSFORM-LIST] in-place alias failed: %v (fallback raw)", terr)
+						tBody = rawBody
+					} else {
+						tBody = converted
+					}
 				} else {
-					tBody = converted
+					converted, terr := TransformModelsListResponse(listFormat, outFormat, rawBody, upstreamCfg.Aliases)
+					if terr != nil {
+						log.Printf("[TRANSFORM-LIST] response convert failed: %v (fallback raw)", terr)
+						tBody = rawBody
+					} else {
+						tBody = converted
+					}
 				}
 			} else {
-				log.Printf("[TRANSFORM-LIST] upstream=%s returned error %d: %s",
-					upstreamName, resp.StatusCode, string(rawBody))
-				tBody = TransformErrorResponse(listFormat, outFormat, rawBody, resp.StatusCode)
+				if listInPlace {
+					// 直连场景无格式转换：错误响应原样透传。
+					log.Printf("[TRANSFORM-LIST] upstream=%s returned error %d: %s (in-place passthrough)",
+						upstreamName, resp.StatusCode, string(rawBody))
+					tBody = rawBody
+				} else {
+					log.Printf("[TRANSFORM-LIST] upstream=%s returned error %d: %s",
+						upstreamName, resp.StatusCode, string(rawBody))
+					tBody = TransformErrorResponse(listFormat, outFormat, rawBody, resp.StatusCode)
+				}
 			}
 			for k, vs := range resp.Header {
 				k = http.CanonicalHeaderKey(k)

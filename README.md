@@ -506,8 +506,13 @@ curl http://localhost:9090/status
 - `detectListFormat` + `targetListEndpointPath`：列表端点 path + auth header 判定客户端格式与对应上游端点路径（见上文「模型列表请求转换」）。
 - 中性结构 `modelsList`/`modelsListEntry`：承载 4 种格式共有字段（ID/Created/CreatedAt/OwnedBy/DisplayName/Version/InputTokenLimit/OutputTokenLimit），作为 6 向直转的中间表示。
 - 4 个解析器 `parseOpenAIModelsList`/`parseAnthropicModelsList`/`parseGeminiModelsList`（openai_chat 与 openai_responses 共用同一解析器）+ 3 个 builder `buildOpenAIModelsList`/`buildAnthropicModelsList`/`buildGeminiModelsList`，dispatch 由 `parseModelsListByFormat`/`buildModelsListByFormat` 完成。
-- `reverseAliasesMap` + `applyAliasesReverseToList`：按 per-upstream `aliases` 的 value→key 反向展开模型列表 entry（一对多生成多条 alias entry，alias 与真实名相同时跳过）。
-- `TransformModelsListResponse`：列表响应转换主入口，调用 parse → 反向别名展开 → build → marshal；同格式或 openai_chat↔openai_responses 走 fast path 透传。
+- `reverseAliasesMap` + `applyAliasesReverseToList`：按 per-upstream `aliases` 的 value→key 反向展开模型列表 entry。两阶段实现使列表与请求路由一致：
+  1. 先删除"被覆盖"条目——若某 entry 的 ID 等于某个 alias key（该客户端名已被重定向到另一真实模型），删除其原条目，避免显示与路由行为不符的字段。
+  2. 再为每个指向真实名的 alias key 追加一条克隆 entry（字段全相同，仅 ID 改为 alias key）。
+  alias 与真实名相同时（`k==v`）跳过；空字符串自指无效果。
+- `applyAliasesReverseToListInPlace` + `ApplyAliasesReverseToListInPlaceBytes`：**直连场景**（无 `formatTransform`）的就地 JSON 实现——不经中性结构中转，直接改写 `data[]`/`models[]` 数组，保留供应商特有字段（中性结构未承载的字段不丢失）。`gemini` 的 `name` 字段以 `"models/x"` 尾段作为 ID 进行比较与还原。
+- `TransformModelsListResponse`：**formatTransform 场景**的列表响应转换主入口，调用 parse → `applyAliasesReverseToList` → build → marshal。fast-path 规则：无 alias 且同格式（`needsTransform=false`）或 `openai_chat↔openai_responses` 间原样透传；有 alias 或需跨格式时统一走 parse→build（含 alias 反向展开）。
+- 网关列表分支选择（`gateway.go`）：列表请求按 `outFormat` 区分两条路径——`outFormat != ""` 走 `TransformModelsListResponse`（中性结构 + alias）；`outFormat == ""` 但配置了 alias 时走 `ApplyAliasesReverseToListInPlaceBytes`（就地 JSON + alias），无 auth 头重置、错误响应原样透传。两条路径均执行"删除覆盖条目 + 追加 alias 克隆"，使模型列表显示与请求路由的 alias 行为完全一致。
 
 ## 许可证
 

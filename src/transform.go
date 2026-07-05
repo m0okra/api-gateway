@@ -306,29 +306,58 @@ func reverseAliasesMap(aliases map[string]string) map[string][]string {
 	return rev
 }
 
-// applyAliasesReverseToList 对中性 modelsList 应用反向别名：
-// 对每条 entry，若其 ID 命中 aliases 的 value（即上游真实模型名），
-// 则为每个指向它的 alias key 追加一条新 entry，字段与原 entry 完全相同（仅 ID 改为 alias key）。
-// 原 ID 条目保留不变，使客户端既能看到真实名也能看到 alias。
-// aliases=nil 时不做任何处理。
+// applyAliasesReverseToList 对中性 modelsList 应用反向别名，使列表与请求路由一致：
+//   - 阶段1（删除被覆盖真实条目）：若某 entry 的 ID 等于某个 alias key（即客户端可见名被
+//     重定向到另一真实模型），则删除该 entry——保留其原始字段会与路由行为不符。
+//   - 阶段2（追加 alias 克隆条目）：对每条幸存 entry，若其 ID 命中 aliases 的 value
+//     （即上游真实模型名有别名指向它），则为每个指向它的 alias key 追加一条新 entry，
+//     字段与原 entry 完全相同（仅 ID 改为 alias key）。
+//
+// k==v 自指别名与空串条目不产生任何效果（既不删除也不克隆）。
+// aliases=nil 或空 map 时不做任何处理。
+//
+// 用于 formatTransform 场景（跨格式或同格式但配了格式转换）；与请求路由的 alias 表现一致。
 func applyAliasesReverseToList(ml *modelsList, aliases map[string]string) {
-	if aliases == nil || len(aliases) == 0 {
+	if len(aliases) == 0 {
 		return
 	}
 	rev := reverseAliasesMap(aliases)
 	if len(rev) == 0 {
 		return
 	}
+	// aliasKeySet：所有客户端可见的别名键（排除 k==v 自指与空串）。
+	// reverseAliasesMap 已过滤空 k/v；这里显式排除 k==v，避免删除有效同名条目。
+	aliasKeySet := make(map[string]struct{}, len(aliases))
+	for k, v := range aliases {
+		if k != "" && v != "" && k != v {
+			aliasKeySet[k] = struct{}{}
+		}
+	}
+	if len(aliasKeySet) == 0 {
+		return // 全为自指或空，无需任何处理
+	}
+
+	// 阶段1：删除被覆盖的真实条目（ID == alias key）
+	filtered := ml.Entries[:0] // 原地复用底层数组
+	for _, e := range ml.Entries {
+		if _, drop := aliasKeySet[e.ID]; drop {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	ml.Entries = filtered
+
+	// 阶段2：追加 alias 克隆条目（ID 命中 rev 的真实名）
+	// 仅扫描阶段1幸存的前 n 条，避免扫描到新追加的克隆条目导致递归展开。
 	n := len(ml.Entries)
 	for i := 0; i < n; i++ {
-		revIDs, ok := rev[ml.Entries[i].ID]
+		revKeys, ok := rev[ml.Entries[i].ID]
 		if !ok {
 			continue
 		}
-		for _, aliasKey := range revIDs {
-			if aliasKey == ml.Entries[i].ID {
-				continue // alias 与真实名相同，无需重复
-			}
+		for _, aliasKey := range revKeys {
+			// aliasKey 已保证 != 当前 ID：当前 ID 不在 aliasKeySet 中（阶段1已删），
+			// 故 aliasKey 不会等于当前 ID，无需再次判等。
 			dup := ml.Entries[i] // 值拷贝：所有字段保持一致
 			dup.ID = aliasKey
 			ml.Entries = append(ml.Entries, dup)
@@ -336,16 +365,141 @@ func applyAliasesReverseToList(ml *modelsList, aliases map[string]string) {
 	}
 }
 
+// applyAliasesReverseToListInPlace 就地修改已解析的列表 JSON，应用 alias 反向展开。
+// 用于直连场景（无 formatTransform），保留上游原始 JSON 的全部字段（含供应商特有字段），
+// 不经中性 modelsList 结构中转，避免丢失非共有字段。
+//
+// 规则与 applyAliasesReverseToList 等价（先删被覆盖条目，再追加 alias 克隆条目）。
+// format 决定条目数组字段名与 ID 字段：
+//   - openai_chat / openai_responses / anthropic：数组=data，ID 字段=id
+//   - gemini：数组=models，ID 字段=name（形如 "models/x"，取尾段比较，写入时还原前缀）
+//
+// arg 状态：直接修改 parsed 并将其数组字段重写为结果切片。
+func applyAliasesReverseToListInPlace(parsed map[string]interface{}, format string, aliases map[string]string) {
+	if len(aliases) == 0 {
+		return
+	}
+	// 与 applyAliasesReverseToList 同序构建 aliasKeySet 与 rev，保证语义一致
+	aliasKeySet := make(map[string]struct{}, len(aliases))
+	rev := make(map[string][]string)
+	for k, v := range aliases {
+		if k == "" || v == "" || k == v {
+			continue
+		}
+		aliasKeySet[k] = struct{}{}
+		rev[v] = append(rev[v], k)
+	}
+	if len(aliasKeySet) == 0 && len(rev) == 0 {
+		return
+	}
+
+	var arrField, idField string
+	isGemini := false
+	switch format {
+	case formatGemini:
+		arrField, idField, isGemini = "models", "name", true
+	case formatOpenAIChat, formatOpenAIResponses, formatAnthropic:
+		arrField, idField = "data", "id"
+	default:
+		return
+	}
+
+	arr, ok := parsed[arrField].([]interface{})
+	if !ok {
+		return
+	}
+
+	// ID 提取（gemini name 形如 "models/x" 取尾段）；写入时还原前缀
+	extractID := func(v interface{}) string {
+		s, ok := v.(string)
+		if !ok {
+			return ""
+		}
+		if !isGemini {
+			return s
+		}
+		if idx := strings.LastIndex(s, "/"); idx >= 0 && idx < len(s)-1 {
+			return s[idx+1:]
+		}
+		return s
+	}
+	makeID := func(id string) interface{} {
+		if isGemini {
+			return "models/" + id
+		}
+		return id
+	}
+
+	// 阶段1：删除被覆盖条目（ID == alias key）
+	filtered := arr[:0] // 原地复用底层数组
+	for _, e := range arr {
+		em, ok := e.(map[string]interface{})
+		if !ok {
+			filtered = append(filtered, e)
+			continue
+		}
+		rawID, ok := em[idField]
+		if !ok {
+			filtered = append(filtered, e)
+			continue
+		}
+		id := extractID(rawID)
+		if _, drop := aliasKeySet[id]; drop {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	arr = filtered
+
+	// 阶段2：追加 alias 克隆条目（浅拷贝条目 map；alias 与原条目共享子字段，符合"字段全相同"语义）
+	n := len(arr)
+	for i := 0; i < n; i++ {
+		em, ok := arr[i].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		rawID, ok := em[idField]
+		if !ok {
+			continue
+		}
+		id := extractID(rawID)
+		revKeys, ok := rev[id]
+		if !ok {
+			continue
+		}
+		for _, aliasKey := range revKeys {
+			dup := make(map[string]interface{}, len(em))
+			for k, v := range em {
+				dup[k] = v
+			}
+			dup[idField] = makeID(aliasKey)
+			arr = append(arr, dup)
+		}
+	}
+
+	parsed[arrField] = arr
+}
+
 // TransformModelsListResponse 转换模型列表响应。outFormat=上游响应格式，inFormat=客户端格式。
 // 等价于 TransformResponse 但作用于列表端点，采用 6 向直接两两转换。
-// aliases 为该 upstream 的别名配置（nil=未启用），用于反向展开 alias 条目。
+// aliases 为该 upstream 的别名配置（nil/空=未启用），用于反向展开 alias 条目。
+//
+// fast-path 规则：
+//   - 无 alias 且同格式（needsTransform=false）→ 原样透传
+//   - 无 alias 且 openai_chat↔openai_responses → 原样透传（列表结构一致）
+//   - 有 alias 或需跨格式 → parse → applyAliasesReverseToList（含删除覆盖条目）→ build
+//
+// 用于 formatTransform 场景；直连场景由调用方就地 JSON 处理（applyAliasesReverseToListInPlace）。
 func TransformModelsListResponse(inFormat, outFormat string, body []byte, aliases map[string]string) ([]byte, error) {
-	if !needsTransform(inFormat, outFormat) {
-		return body, nil
-	}
-	// openai_chat 与 openai_responses 列表结构完全一致，fast path 透传
-	if isOpenAIVariant(inFormat) && isOpenAIVariant(outFormat) {
-		return body, nil
+	hasAliases := aliases != nil && len(aliases) > 0
+	if !hasAliases {
+		if !needsTransform(inFormat, outFormat) {
+			return body, nil
+		}
+		// openai_chat 与 openai_responses 列表结构完全一致，fast path 透传
+		if isOpenAIVariant(inFormat) && isOpenAIVariant(outFormat) {
+			return body, nil
+		}
 	}
 	var parsed map[string]interface{}
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -360,6 +514,25 @@ func TransformModelsListResponse(inFormat, outFormat string, body []byte, aliase
 	data, err := json.Marshal(out)
 	if err != nil {
 		return nil, fmt.Errorf("marshal models list: %w", err)
+	}
+	return data, nil
+}
+
+// ApplyAliasesReverseToListInPlaceBytes 解析 body、就地应用 alias 反向展开、重新序列化。
+// 用于直连场景的列表响应处理：保留上游原始 JSON 全部字段，仅改写条目数组。
+// format 决定列表条目结构（openai/anthropic/gemini）。返回改写后的 bytes；alias 为空时原样返回。
+func ApplyAliasesReverseToListInPlaceBytes(body []byte, format string, aliases map[string]string) ([]byte, error) {
+	if len(aliases) == 0 {
+		return body, nil
+	}
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse models list for in-place alias: %w", err)
+	}
+	applyAliasesReverseToListInPlace(parsed, format, aliases)
+	data, err := json.Marshal(parsed)
+	if err != nil {
+		return nil, fmt.Errorf("marshal models list for in-place alias: %w", err)
 	}
 	return data, nil
 }
