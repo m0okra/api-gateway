@@ -589,6 +589,19 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				targetPath = p
 			}
 		}
+
+		// pathPrefix extra：替换 URL path 开头的 /v1 或 /v1beta 为自定义前缀。
+		// 用于上游 base URL 使用非标准 API 版本前缀的场景，如火山引擎的
+		// /api/v3/chat/completions 而非 /v1/chat/completions。
+		// 同时覆盖透传路径（basePath）、格式转换路径（targetEndpointPath）和
+		// 列表转换路径（targetListEndpointPath）。
+		if prefix := upstreamCfg.Extra["pathPrefix"]; prefix != "" {
+			if newPath := applyPathPrefix(targetPath, prefix); newPath != targetPath {
+				log.Printf("[PATH-PREFIX] upstream=%s %s -> %s", upstreamName, targetPath, newPath)
+				targetPath = newPath
+			}
+		}
+
 		targetURL := upstreamCfg.TargetBase + targetPath
 		if encoded := query.Encode(); encoded != "" {
 			targetURL += "?" + encoded

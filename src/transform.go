@@ -555,6 +555,22 @@ func targetEndpointPath(format, model string, isStream bool) string {
 	return ""
 }
 
+// applyPathPrefix 替换 URL path 开头的 /v1 或 /v1beta 为自定义前缀。
+// prefix 非空且 path 以 /v1 或 /v1beta 开头时返回替换结果；否则返回原 path。
+// 先匹配 /v1beta 避免被 /v1 前缀误匹配（/v1beta 也以 /v1 开头）。
+func applyPathPrefix(path, prefix string) string {
+	if prefix == "" {
+		return path
+	}
+	if strings.HasPrefix(path, "/v1beta") {
+		return prefix + path[len("/v1beta"):]
+	}
+	if strings.HasPrefix(path, "/v1") {
+		return prefix + path[len("/v1"):]
+	}
+	return path
+}
+
 // needsTransform 判断是否需要格式转换。
 // openai_chat 与 openai_responses 结构不同（messages/choices vs input/output），
 // 需经 anthropic pivot 链式转换。

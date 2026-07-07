@@ -295,10 +295,11 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 
 #### 高级增强特性
 
-除 `formatTransform` 外，网关还内置以下增强能力（多数通过 `upstreams[].extra` map 的字符串参数按 upstream 单独启用）。`extra` map 同时承载可用性检查参数（如 OpenCode-Go 的 `cookie`/`workspaceId`，见上文）。以下 4 个 `extra` 参数**不依赖 `formatTransform` 开启**——即使透传（`formatTransform` 为空），只要客户端格式匹配各自的目标格式，仍会改写请求体：
+除 `formatTransform` 外，网关还内置以下增强能力（多数通过 `upstreams[].extra` map 的字符串参数按 upstream 单独启用）。`extra` map 同时承载可用性检查参数（如 OpenCode-Go 的 `cookie`/`workspaceId`，见上文）。以下 `extra` 参数**不依赖 `formatTransform` 开启**——即使透传（`formatTransform` 为空），只要满足各自的生效条件，仍会生效：
 
 | key | 取值 | 作用 | 生效条件 |
 |---|---|---|---|
+| `pathPrefix` | 自定义 API 版本前缀，如 `"/api/v3"` | 替换目标 URL path 开头的 `/v1` 或 `/v1beta` 为自定义前缀。用于上游 base URL 使用非标准 API 版本前缀的场景，如火山引擎的 `/api/v3/chat/completions` 而非 `/v1/chat/completions`。同时覆盖透传路径、格式转换路径和列表转换路径。 | 始终生效（无论是否开启 formatTransform，只要构造出的 targetPath 以 `/v1` 或 `/v1beta` 开头即触发替换） |
 | `codexBackend` | `"true"` / `"fast"` | 对发往 ChatGPT Codex 后端的 Responses 请求做字段整形（注入 `store:false`/`include`/`stream:true`/兜底字段，剥离 `max_output_tokens`/`temperature`/`top_p`；`fast` 额外注入 `service_tier:"priority"`） | 上游实际发送格式为 `openai_responses`（转换后或 Responses→Responses 透传） |
 | `preserveReasoningContent` | `"true"` | Anthropic→OpenAI Chat 转换时把 `thinking` 块提取为 `reasoning_content` 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 兼容） | 仅 formatTransform 开启时生效（需跨格式转换） |
 | `reasoningVendor` | `"auto"` 或 `"kimi"`/`"deepseek"`/`"mimo"` 等非空值 | 重写 thinking 历史为占位符，兼容拒绝原始 thinking 块的供应商（`auto` 按 upstream 名/`targetBase` 自动检测） | 客户端格式为 `anthropic`（透传或转换前均可） |
