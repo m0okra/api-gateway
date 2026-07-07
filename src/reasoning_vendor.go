@@ -143,12 +143,17 @@ func stripEffortIfThinkingDisabled(body map[string]interface{}) bool {
 }
 
 // stripEffortIfThinkingDisabledInBytes 是 byte 级别的封装，供 gateway.go 调用。
+//
+// 若 stripEffortIfThinkingDisabled 返回 false（无需修改，如 body 无 thinking 字段），
+// 直接返回原 body 字节，避免不必要的重序列化改变字节表示进而降低上游缓存命中。
 func stripEffortIfThinkingDisabledInBytes(body []byte) ([]byte, error) {
 	var parsed map[string]interface{}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return body, err
 	}
-	stripEffortIfThinkingDisabled(parsed)
+	if !stripEffortIfThinkingDisabled(parsed) {
+		return body, nil
+	}
 	return json.Marshal(parsed)
 }
 
