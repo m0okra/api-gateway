@@ -10,7 +10,7 @@ import "time"
 //   - FakeTokens: fakeToken -> upstream队列（按优先级排序）
 //   - Upstreams:    upstream -> 实际工作所需内容（realToken、targetBase、可用性配置等）
 type TokenMapConfig struct {
-	FakeTokens map[string][]string      `json:"fakeTokens"`
+	FakeTokens map[string][]string       `json:"fakeTokens"`
 	Upstreams  map[string]UpstreamConfig `json:"upstreams"`
 }
 
@@ -37,7 +37,7 @@ type UpstreamConfig struct {
 
 // CacheInjectorConfig 控制 Anthropic Prompt Caching 自动 cache_control 断点注入。
 type CacheInjectorConfig struct {
-	Enabled bool   `json:"enabled"`
+	Enabled bool `json:"enabled"`
 	// TTL 取值 "5m"（默认）或 "1h"。空串视为 "5m"。
 	// "5m" 对应 Anthropic 的 ephemeral 默认 5 分钟；"1h" 对应 1 小时扩展缓存。
 	TTL string `json:"ttl,omitempty"`
@@ -108,6 +108,6 @@ type AvailabilityResult struct {
 // DBDump 是 -e/-i 导入导出所用的 JSON 顶层结构。
 // 单个文件包含配置（TokenMap）与运行时状态（State）两部分，便于备份/迁移/手工编辑。
 type DBDump struct {
-	TokenMap *TokenMapConfig              `json:"tokenMap"`
+	TokenMap *TokenMapConfig               `json:"tokenMap"`
 	State    map[string]*AvailabilityState `json:"state"`
 }

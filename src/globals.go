@@ -21,10 +21,10 @@ var (
 	stateDirty bool
 	// stateGen 代际计数器：每次标记脏时自增。saveState 快照后据此判断提交期间是否有新变更，
 	// 避免误清 stateDirty 导致快照后产生的写入丢失。需在持 mu 写锁时操作。
-	stateGen atomic.Uint64
-	dbPath     = "gateway.db"
-	db         *sql.DB
-	cronCache  = newCronLRU(cronCacheCap) // cron 表达式解析缓存（LRU）
+	stateGen  atomic.Uint64
+	dbPath    = "gateway.db"
+	db        *sql.DB
+	cronCache = newCronLRU(cronCacheCap) // cron 表达式解析缓存（LRU）
 	// reqSem 并发请求信号量（channel semaphore）。在 main 初始化为容量 maxConcurrentReqs。
 	// handler 入口 acquire（写入），defer release（读出），实现全局并发上限保护。
 	reqSem chan struct{}

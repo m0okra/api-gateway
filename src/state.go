@@ -156,17 +156,17 @@ func loadFromDB() error {
 
 	for upstreamRows.Next() {
 		var (
-			name, realToken, targetBase      string
-			availType                        sql.NullString
-			availLimit                       sql.NullInt64
-			availRefreshCron, availProvider   sql.NullString
-			exhausted                        int
-			count                            int
-			balance                          float64
-			recoveryCron                     sql.NullString
+			name, realToken, targetBase           string
+			availType                             sql.NullString
+			availLimit                            sql.NullInt64
+			availRefreshCron, availProvider       sql.NullString
+			exhausted                             int
+			count                                 int
+			balance                               float64
+			recoveryCron                          sql.NullString
 			recoveryAt, lastRecovery, lastChecked sql.NullString
-			formatTransform                  sql.NullString
-			aliasesBlob                      sql.NullString
+			formatTransform                       sql.NullString
+			aliasesBlob                           sql.NullString
 		)
 		if err := upstreamRows.Scan(&name, &realToken, &targetBase,
 			&availType, &availLimit, &availRefreshCron, &availProvider,
@@ -418,15 +418,15 @@ func formatTime(t time.Time) sql.NullString {
 func saveState() error {
 	// 1. 持锁快照
 	type upstreamSnap struct {
-		name          string
-		exhausted     bool
-		count         int
-		balance       float64
-		recoveryCron  string
-		recoveryAt    time.Time
-		lastRecovery  time.Time
-		lastChecked   time.Time
-		tiers         []TierState
+		name         string
+		exhausted    bool
+		count        int
+		balance      float64
+		recoveryCron string
+		recoveryAt   time.Time
+		lastRecovery time.Time
+		lastChecked  time.Time
+		tiers        []TierState
 	}
 	var snap []upstreamSnap
 	mu.Lock()

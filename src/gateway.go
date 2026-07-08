@@ -551,7 +551,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-// Token 注入：转换路径用 swapAuthForTarget 重置 auth 头；透传路径沿用原逻辑
+		// Token 注入：转换路径用 swapAuthForTarget 重置 auth 头；透传路径沿用原逻辑
 		// （仅当对应输入存在时注入对应输出字段，两者都存在时同时注入，否则回退 X-Api-Key / Authorization）。
 		// formatTransform 场景（doTransform/doListTransform 且非直连就地路径）用 swapAuthForTarget；
 		// 直连就地路径（listInPlace）与纯透传走原 auth 头处理逻辑，保持客户端原始 auth 风格。

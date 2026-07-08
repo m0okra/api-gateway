@@ -131,8 +131,10 @@ func cleanupExpiredGeminiShadows() {
 
 // extractGeminiThoughtSignature 从 Gemini part 提取 thoughtSignature。
 // thoughtSignature 与 functionCall/text 在 part 层级平级：
-//   {"functionCall":{...}, "thoughtSignature":"sig-1"}
-//   {"text":"...", "thoughtSignature":"sig-2"}
+//
+//	{"functionCall":{...}, "thoughtSignature":"sig-1"}
+//	{"text":"...", "thoughtSignature":"sig-2"}
+//
 // 兼容 camelCase（thoughtSignature）与 snake_case（thought_signature）。
 func extractGeminiThoughtSignature(part map[string]interface{}) string {
 	if part == nil {

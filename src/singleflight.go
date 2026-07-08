@@ -18,8 +18,8 @@ import "sync"
 // ============================================================================
 
 type availCall struct {
-	wg   sync.WaitGroup
-	res  AvailabilityResult
+	wg  sync.WaitGroup
+	res AvailabilityResult
 }
 
 // availSingleFlight 对同一 key 的并发调用去重：仅首个真正执行，其余复用结果。
