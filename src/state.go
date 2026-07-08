@@ -155,7 +155,7 @@ func loadFromDB() error {
 	metas := make(map[string]upstreamMeta)
 
 	for upstreamRows.Next() {
-var (
+		var (
 			name, realToken, targetBase      string
 			availType                        sql.NullString
 			availLimit                       sql.NullInt64
@@ -392,10 +392,10 @@ func reconcileStateWithConfig() {
 			st.RecoveryCron = ""
 		}
 		// 2) count limit 下调：count >= limit 立即标记 exhaust
-if cfg.Type == availCount && cfg.Limit > 0 && st.Count >= cfg.Limit && !st.Exhausted {
-		st.Exhausted = true
-		markDirty()
-		log.Printf("[state] upstream=%s count=%d >= limit=%d -> exhaust at startup", name, st.Count, cfg.Limit)
+		if cfg.Type == availCount && cfg.Limit > 0 && st.Count >= cfg.Limit && !st.Exhausted {
+			st.Exhausted = true
+			markDirty()
+			log.Printf("[state] upstream=%s count=%d >= limit=%d -> exhaust at startup", name, st.Count, cfg.Limit)
 		}
 	}
 }

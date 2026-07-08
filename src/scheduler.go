@@ -27,7 +27,7 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 		select {
 		case <-stopCh:
 			// 退出前若有未保存状态则保存
-	if dirty := func() bool {
+			if dirty := func() bool {
 				mu.RLock()
 				defer mu.RUnlock()
 				return stateDirty
@@ -42,7 +42,7 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 		case now := <-ticker.C:
 			checkRecovery(now)
 		case <-saveTicker.C:
-	if dirty := func() bool {
+			if dirty := func() bool {
 				mu.RLock()
 				defer mu.RUnlock()
 				return stateDirty
