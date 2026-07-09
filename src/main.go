@@ -76,6 +76,7 @@ func main() {
 	//    ReadTimeout/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/status/check", statusCheckHandler)
 	mux.HandleFunc("/", handler)
 
 	server := &http.Server{

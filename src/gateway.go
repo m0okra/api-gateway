@@ -971,102 +971,142 @@ func maskFakeToken(t string) string {
 }
 
 // ============================================================================
-// /status 端点：暴露运行时状态（脱敏），供运维排查
+// /status 端点：HTML 页面 + 按 fakeToken 查询 upstream 健康状态
 // ============================================================================
 
-// statusUpstream 单个 upstream 的运行时视图（给 /status 用）。
-// realToken 脱敏为首尾各 4 字符，targetBase 完整暴露便于排查路由。
-type statusUpstream struct {
-	Name            string      `json:"name"`
-	TargetBase      string      `json:"targetBase"`
-	RealToken       string      `json:"realToken"`
-	AvailType       string      `json:"availType,omitempty"`
-	Exhausted       bool        `json:"exhausted"`
-	Count           int         `json:"count,omitempty"`
-	Balance         float64     `json:"balance,omitempty"`
-	Tiers           []TierState `json:"tiers,omitempty"`
-	RecoveryCron    string      `json:"recoveryCron,omitempty"`
-	RecoveryAt      time.Time   `json:"recoveryAt,omitempty"`
-	LastRecovery    time.Time   `json:"lastRecovery,omitempty"`
-	LastChecked     time.Time   `json:"lastChecked,omitempty"`
-	QueueFor        []string    `json:"queueFor,omitempty"` // 出现在哪些 fakeToken 队列中（脱敏）
-	FormatTransform string      `json:"formatTransform,omitempty"`
+const statusPageHTML = `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Status</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#f5f5f5;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#fff;border-radius:8px;padding:32px;width:100%;max-width:480px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+h1{font-size:1.2rem;margin-bottom:16px;text-align:center}
+.row{display:flex;gap:8px;margin-bottom:16px}
+input{flex:1;padding:8px 12px;border:1px solid #ccc;border-radius:4px;font-size:.9rem}
+button{padding:8px 20px;border:none;border-radius:4px;background:#333;color:#fff;cursor:pointer;font-size:.9rem}
+button:hover{background:#555}
+.error{color:#c00;margin-bottom:12px}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #eee}
+th{background:#fafafa;font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem}
+.ok{background:#e6f9e6;color:#060}
+.bad{background:#fde8e8;color:#c00}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>Upstream Status</h1>
+<div class="row">
+<input id="token" type="password" placeholder="输入 token">
+<button onclick="check()">查询</button>
+</div>
+<div id="result"></div>
+</div>
+<script>
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function check(){
+  const token=document.getElementById('token').value.trim();
+  const el=document.getElementById('result');
+  if(!token){el.innerHTML='<p class="error">请输入 token</p>';return}
+  try{
+    const r=await fetch('/status/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});
+    const d=await r.json();
+    if(!r.ok){el.innerHTML='<p class="error">'+esc(d.error||'请求失败')+'</p>';return}
+    if(!d.upstreams||!d.upstreams.length){el.innerHTML='<p>该 token 无关联的 upstream</p>';return}
+    let h='<table><tr><th>Name</th><th>Status</th><th>Type</th><th>Detail</th></tr>';
+    for(const u of d.upstreams){
+      const badge=u.exhausted?'<span class="badge bad">Exhausted</span>':'<span class="badge ok">Available</span>';
+      let detail='';
+      if(u.availType==='count')detail='Count: '+u.count;
+      else if(u.availType==='balance')detail='Balance: '+u.balance;
+      else if(u.availType==='usage'&&u.tiers)detail=u.tiers.map(t=>esc(t.name)+': '+t.usedPct.toFixed(1)+'%').join(', ');
+      if(u.recoveryAt){detail+=' | Recovery: '+new Date(u.recoveryAt).toLocaleString()}
+      h+='<tr><td>'+esc(u.name)+'</td><td>'+badge+'</td><td>'+esc(u.availType||'none')+'</td><td>'+detail+'</td></tr>';
+    }
+    h+='</table>';
+    el.innerHTML=h;
+  }catch(e){el.innerHTML='<p class="error">网络错误</p>'}
 }
+document.getElementById('token').addEventListener('keydown',e=>{if(e.key==='Enter')check()});
+</script>
+</body>
+</html>`
 
-// statusResponse /status 的响应体。
-type statusResponse struct {
-	Upstreams  []statusUpstream    `json:"upstreams"`
-	FakeTokens map[string][]string `json:"fakeTokens"` // fakeToken(脱敏) -> upstream 名队列
-}
-
-// handlerStatus 构建内存状态的脱敏快照并通过 /status 返回。
 func statusHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
 		return
 	}
-
-	mu.RLock()
-
-	// 收集每个 upstream 出现在哪些 fakeToken 队列中
-	queueFor := make(map[string][]string)
-	for ft, q := range tokenMap.FakeTokens {
-		ftMasked := maskFakeToken(ft)
-		for _, a := range q {
-			queueFor[a] = append(queueFor[a], ftMasked)
-		}
-	}
-
-	resp := statusResponse{
-		Upstreams:  make([]statusUpstream, 0, len(tokenMap.Upstreams)),
-		FakeTokens: make(map[string][]string, len(tokenMap.FakeTokens)),
-	}
-
-	for name, upstream := range tokenMap.Upstreams {
-		st := stateMap[name]
-		sa := statusUpstream{
-			Name:            name,
-			TargetBase:      upstream.TargetBase,
-			RealToken:       maskToken(upstream.RealToken),
-			FormatTransform: upstream.FormatTransform,
-		}
-		if upstream.Availability != nil {
-			sa.AvailType = upstream.Availability.Type
-		}
-		if st != nil {
-			sa.Exhausted = st.Exhausted
-			sa.Count = st.Count
-			sa.Balance = st.Balance
-			if len(st.Tiers) > 0 {
-				sa.Tiers = make([]TierState, len(st.Tiers))
-				copy(sa.Tiers, st.Tiers)
-			}
-			sa.RecoveryCron = st.RecoveryCron
-			sa.RecoveryAt = st.RecoveryAt
-			sa.LastRecovery = st.LastRecovery
-			sa.LastChecked = st.LastChecked
-		}
-		if qf, ok := queueFor[name]; ok {
-			sa.QueueFor = qf
-		}
-		resp.Upstreams = append(resp.Upstreams, sa)
-	}
-
-	for ft, q := range tokenMap.FakeTokens {
-		cq := make([]string, len(q))
-		copy(cq, q)
-		resp.FakeTokens[maskFakeToken(ft)] = cq
-	}
-
-	mu.RUnlock()
-
-	writeJSON(w, http.StatusOK, resp)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(statusPageHTML))
 }
 
-// maskToken 脱敏 realToken：保留首尾各 4 字符，中间用 mask 替代。
-func maskToken(t string) string {
-	if len(t) <= 8 {
-		return t[:2] + mask
+type statusCheckRequest struct {
+	Token string `json:"token"`
+}
+
+type statusCheckUpstream struct {
+	Name       string      `json:"name"`
+	TargetBase string      `json:"targetBase"`
+	Exhausted  bool        `json:"exhausted"`
+	AvailType  string      `json:"availType,omitempty"`
+	Count      int         `json:"count,omitempty"`
+	Balance    float64     `json:"balance,omitempty"`
+	Tiers      []TierState `json:"tiers,omitempty"`
+	RecoveryAt time.Time   `json:"recoveryAt,omitempty"`
+}
+
+func statusCheckHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "Method not allowed"})
+		return
 	}
-	return t[:4] + mask + t[len(t)-4:]
+
+	var req statusCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "请提供 token"})
+		return
+	}
+
+	mu.RLock()
+	queue, ok := tokenMap.FakeTokens[req.Token]
+	if !ok || len(queue) == 0 {
+		mu.RUnlock()
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "无效的 token"})
+		return
+	}
+
+	upstreams := make([]statusCheckUpstream, 0, len(queue))
+	for _, name := range queue {
+		uc, exists := tokenMap.Upstreams[name]
+		if !exists {
+			continue
+		}
+		su := statusCheckUpstream{
+			Name:       name,
+			TargetBase: uc.TargetBase,
+		}
+		if uc.Availability != nil {
+			su.AvailType = uc.Availability.Type
+		}
+		if st := stateMap[name]; st != nil {
+			su.Exhausted = st.Exhausted
+			su.Count = st.Count
+			su.Balance = st.Balance
+			if len(st.Tiers) > 0 {
+				su.Tiers = make([]TierState, len(st.Tiers))
+				copy(su.Tiers, st.Tiers)
+			}
+			su.RecoveryAt = st.RecoveryAt
+		}
+		upstreams = append(upstreams, su)
+	}
+	mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{"upstreams": upstreams})
 }
