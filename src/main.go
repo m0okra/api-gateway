@@ -66,7 +66,11 @@ func main() {
 	// 2. 启动调度goroutine（exhaust恢复 + 状态保存）
 	schedStop := make(chan struct{})
 	schedDone := make(chan struct{})
-	go runScheduler(schedStop, schedDone)
+	// shutdownCtx 在收到停机信号后由 time.AfterFunc 延迟 cancel，
+	// 供 scheduler final save 与 server.Shutdown 共享超时预算。
+	shutdownCtx, cancelShutdown := context.WithCancel(context.Background())
+	defer cancelShutdown()
+	go runScheduler(shutdownCtx, schedStop, schedDone)
 
 	// 3. 初始化并发信号量（channel semaphore，容量 = maxConcurrentReqs）
 	reqSem = make(chan struct{}, maxConcurrentReqs)
@@ -101,11 +105,13 @@ func main() {
 	<-stop
 
 	log.Println("Shutting down...")
-	close(schedStop) // 停止调度器（退出前会保存脏状态）
-	<-schedDone      // 等待调度器完成 final save，避免 db.Close() 先于事务提交
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
+	// 收到信号后启动超时定时器：saveStateTimeout 后强制 cancel shutdownCtx，
+	// 保证 scheduler final save 与 server.Shutdown 都不会无限阻塞。
+	timer := time.AfterFunc(saveStateTimeout, cancelShutdown)
+	defer timer.Stop()
+	close(schedStop)           // 停止调度器（退出前会用 shutdownCtx 做 final save）
+	<-schedDone                // 等待调度器完成 final save，避免 db.Close() 先于事务提交
+	server.Shutdown(shutdownCtx) // 复用同一超时预算关闭 HTTP 服务器
 	if db != nil {
 		db.Close()
 	}

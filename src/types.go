@@ -1,6 +1,11 @@
 package main
 
-import "time"
+import (
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+)
 
 // ============================================================================
 // 数据结构
@@ -110,4 +115,135 @@ type AvailabilityResult struct {
 type DBDump struct {
 	TokenMap *TokenMapConfig               `json:"tokenMap"`
 	State    map[string]*AvailabilityState `json:"state"`
+}
+
+// ============================================================================
+// 配置校验（ISSUES #7）
+//
+// 每个配置结构提供 Validate()，在 loadFromDB / importFromJSON 时集中调用。
+// 校验失败 → fail-fast：loadFromDB 让进程退出，importFromJSON 在触碰 DB 前拒绝。
+// 错误收集策略：收集全部错误一次性返回，让用户一次看到所有问题。
+// ============================================================================
+
+// validFormatTransformValues 是 FormatTransform 字段的合法取值集合（不含空串，空串=透传合法）。
+var validFormatTransformValues = map[string]bool{
+	formatOpenAIChat:      true,
+	formatOpenAIResponses: true,
+	formatAnthropic:       true,
+	formatGemini:          true,
+}
+
+// validAvailabilityTypes 是 AvailabilityConfig.Type 字段的合法取值集合。
+var validAvailabilityTypes = map[string]bool{
+	availCount:       true,
+	availUsage:       true,
+	availBalance:     true,
+	availExhaust:     true,
+	availPassthrough: true,
+}
+
+// validCacheTTLs 是 CacheInjectorConfig.TTL 字段的合法取值集合（空串=默认5m）。
+var validCacheTTLs = map[string]bool{
+	"":   true,
+	"5m": true,
+	"1h": true,
+}
+
+// Validate 校验整个 TokenMapConfig：遍历所有 upstream，收集全部错误。
+// 空配置（无 upstream）合法——空库启动是正常场景。
+func (t *TokenMapConfig) Validate() error {
+	var errs []string
+	for name, upstream := range t.Upstreams {
+		if err := upstream.Validate(); err != nil {
+			errs = append(errs, fmt.Sprintf("upstream %q: %s", name, err))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("config validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// Validate 校验单个 upstream 配置。
+// RealToken 可为空（本地 Ollama 等无需鉴权的 upstream 合法）。
+func (u *UpstreamConfig) Validate() error {
+	var errs []string
+
+	// TargetBase：非空 + 合法 URL + scheme 为 http/https + host 非空
+	if u.TargetBase == "" {
+		errs = append(errs, "targetBase is empty")
+	} else {
+		parsed, err := url.Parse(u.TargetBase)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("targetBase parse error: %v", err))
+		} else if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			errs = append(errs, fmt.Sprintf("targetBase scheme must be http or https, got %q", parsed.Scheme))
+		} else if parsed.Host == "" {
+			errs = append(errs, "targetBase host is empty")
+		}
+	}
+
+	// FormatTransform：空串合法（透传），非空必须在合法集合内
+	if u.FormatTransform != "" && !validFormatTransformValues[u.FormatTransform] {
+		errs = append(errs, fmt.Sprintf("formatTransform %q is invalid (valid: openai, openai_responses, anthropic, gemini)", u.FormatTransform))
+	}
+
+	// Availability：非 nil 时递归校验
+	if u.Availability != nil {
+		if err := u.Availability.Validate(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	// CacheInjection：非 nil 时递归校验
+	if u.CacheInjection != nil {
+		if err := u.CacheInjection.Validate(); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// Validate 校验可用性配置。
+func (a *AvailabilityConfig) Validate() error {
+	var errs []string
+
+	// Type：必须在合法集合内
+	if !validAvailabilityTypes[a.Type] {
+		errs = append(errs, fmt.Sprintf("availability.type %q is invalid (valid: count, usage, balance, exhaust, none)", a.Type))
+	}
+
+	switch a.Type {
+	case availCount:
+		// count 型：Limit 必须 > 0，否则 Count>=0 立即耗尽
+		if a.Limit <= 0 {
+			errs = append(errs, "availability.limit must be > 0 for count type")
+		}
+	case availBalance, availUsage:
+		// balance/usage 型：Provider 必须非空，否则静默走 fallbackResult
+		if a.Provider == "" {
+			errs = append(errs, fmt.Sprintf("availability.provider is required for %s type", a.Type))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// Validate 校验缓存注入配置。
+// Enabled=false 时跳过 TTL 校验（未启用时不阻拦）。
+func (c *CacheInjectorConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if !validCacheTTLs[c.TTL] {
+		return fmt.Errorf("cacheInjection.ttl %q is invalid (valid: \"5m\", \"1h\", or empty for default)", c.TTL)
+	}
+	return nil
 }

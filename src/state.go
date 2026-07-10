@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -320,6 +321,13 @@ func loadFromDB() error {
 	}
 	stateDirty = false
 	reconcileStateWithConfig()
+
+	// 配置校验（ISSUES #7）：启动期集中校验所有 upstream 配置，非法则 fail-fast。
+	// 在 mu 锁下调用是安全的——Validate 只读已加载完毕的 tokenMap，不做 I/O。
+	if err := tokenMap.Validate(); err != nil {
+		return fmt.Errorf("config validation failed: %w", err)
+	}
+
 	log.Printf("State loaded from DB (%d upstreams)", len(stateMap))
 	return nil
 }
@@ -414,11 +422,14 @@ func formatTime(t time.Time) sql.NullString {
 // saveState 将内存中所有 upstream 状态全量写回 SQLite（单事务）。
 // 配置字段不写回（配置由用户直接编辑 DB；运行时轮转顺序不持久化）。
 //
+// ctx 用于在优雅停机期间取消可能卡在 SQLite 争用的事务 I/O。
+// 周期 save 用独立 timeout ctx，final save 用 main 的 shutdownCtx。
+//
 // 并发优化：在写锁内构建 state 深拷贝快照后即释放锁，事务的 SQLite I/O 在锁外执行，
 // 避免写库（可能数百 ms）阻塞所有请求。快照后记录 stateGen 代际计数，提交后再取锁：
 // 若代际未变 → 无新写入，安全清除 stateDirty；若代际已增 → 快照后又有变更，保留 stateDirty
 // 由下一个保存周期补写，保证不丢数据。
-func saveState() error {
+func saveState(ctx context.Context) error {
 	// 1. 持锁快照
 	type upstreamSnap struct {
 		name         string
@@ -457,13 +468,13 @@ func saveState() error {
 	mu.Unlock()
 
 	// 2. 锁外执行事务 I/O
-	tx, err := db.Begin()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	upstreamUpd, err := tx.Prepare(`UPDATE upstreams SET
+	upstreamUpd, err := tx.PrepareContext(ctx, `UPDATE upstreams SET
 		exhausted=?, count=?, balance=?, recovery_cron=?, recovery_at=?, last_recovery=?, last_checked=?
 		WHERE name=?`)
 	if err != nil {
@@ -471,13 +482,13 @@ func saveState() error {
 	}
 	defer upstreamUpd.Close()
 
-	tierDel, err := tx.Prepare(`DELETE FROM upstream_tiers WHERE upstream_name=?`)
+	tierDel, err := tx.PrepareContext(ctx, `DELETE FROM upstream_tiers WHERE upstream_name=?`)
 	if err != nil {
 		return fmt.Errorf("prepare tier delete: %w", err)
 	}
 	defer tierDel.Close()
 
-	tierIns, err := tx.Prepare(`INSERT INTO upstream_tiers (upstream_name, name, used_pct, reset_in_sec) VALUES (?,?,?,?)`)
+	tierIns, err := tx.PrepareContext(ctx, `INSERT INTO upstream_tiers (upstream_name, name, used_pct, reset_in_sec) VALUES (?,?,?,?)`)
 	if err != nil {
 		return fmt.Errorf("prepare tier insert: %w", err)
 	}
@@ -492,17 +503,17 @@ func saveState() error {
 		if s.recoveryCron != "" {
 			recoveryCron = sql.NullString{String: s.recoveryCron, Valid: true}
 		}
-		if _, err := upstreamUpd.Exec(exhausted, s.count, s.balance, recoveryCron,
+		if _, err := upstreamUpd.ExecContext(ctx, exhausted, s.count, s.balance, recoveryCron,
 			formatTime(s.recoveryAt), formatTime(s.lastRecovery), formatTime(s.lastChecked),
 			s.name); err != nil {
 			return fmt.Errorf("update upstream %s: %w", s.name, err)
 		}
 		// tiers 全量重写（usage 型；非 usage 型 tiers 为 nil → 仅删除）
-		if _, err := tierDel.Exec(s.name); err != nil {
+		if _, err := tierDel.ExecContext(ctx, s.name); err != nil {
 			return fmt.Errorf("delete tiers for %s: %w", s.name, err)
 		}
 		for _, ts := range s.tiers {
-			if _, err := tierIns.Exec(s.name, ts.Name, ts.UsedPct, ts.ResetInSec); err != nil {
+			if _, err := tierIns.ExecContext(ctx, s.name, ts.Name, ts.UsedPct, ts.ResetInSec); err != nil {
 				return fmt.Errorf("insert tier %s.%s: %w", s.name, ts.Name, err)
 			}
 		}
@@ -595,6 +606,25 @@ func importFromJSON(inPath string) error {
 	}
 	if dump.State == nil {
 		dump.State = map[string]*AvailabilityState{}
+	}
+
+	// 配置校验（ISSUES #7）：在触碰 DB 之前全量校验，非法则直接拒绝，不备份不清空。
+	if err := dump.TokenMap.Validate(); err != nil {
+		return fmt.Errorf("import validation failed (DB untouched): %w", err)
+	}
+
+	// 自动备份（ISSUES #6）：导入前将现有 gateway.db 复制到 gateway.db.bak，
+	// 任何导入失败或误操作都可通过 .bak 文件回滚。仅当 DB 已存在时备份。
+	// 此时无进程持有 DB（导入分支不启动 HTTP 服务器），文件状态一致。
+	if _, err := os.Stat(dbPath); err == nil {
+		bakData, err := os.ReadFile(dbPath)
+		if err != nil {
+			return fmt.Errorf("backup read failed: %w", err)
+		}
+		if err := os.WriteFile(dbPath+".bak", bakData, 0600); err != nil {
+			return fmt.Errorf("backup write failed: %w", err)
+		}
+		log.Printf("[import] backed up %s -> %s.bak", dbPath, dbPath)
 	}
 
 	conn, err := openDB(dbPath)

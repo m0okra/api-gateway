@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"time"
 )
@@ -12,9 +13,12 @@ import (
 //       usage/balance/exhaust型 → now >= RecoveryAt 时间点触发
 //     且距上次实际触发 > recoveryMinGap，触发恢复
 //   - 每5min：检查 dirty flag，为true则保存
+//
+// shutdownCtx 来自 main 的优雅停机 context，final save 用它以支持超时取消；
+// 周期 save 用独立的 saveStateTimeout context，不受停机信号影响。
 // ============================================================================
 
-func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
+func runScheduler(shutdownCtx context.Context, stopCh <-chan struct{}, done chan<- struct{}) {
 	ticker := time.NewTicker(schedulerTickInterval)
 	defer ticker.Stop()
 	saveTicker := time.NewTicker(stateSaveInterval)
@@ -32,7 +36,7 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 				defer mu.RUnlock()
 				return stateDirty
 			}(); dirty {
-				if err := saveState(); err != nil {
+				if err := saveState(shutdownCtx); err != nil {
 					log.Printf("[scheduler] final save failed: %v", err)
 				} else {
 					log.Printf("[scheduler] final state saved")
@@ -47,11 +51,13 @@ func runScheduler(stopCh <-chan struct{}, done chan<- struct{}) {
 				defer mu.RUnlock()
 				return stateDirty
 			}(); dirty {
-				if err := saveState(); err != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), saveStateTimeout)
+				if err := saveState(ctx); err != nil {
 					log.Printf("[scheduler] save state failed: %v", err)
 				} else {
 					log.Printf("[scheduler] state saved")
 				}
+				cancel()
 			}
 		case <-shadowCleanupTicker.C:
 			cleanupExpiredGeminiShadows()

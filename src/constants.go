@@ -15,6 +15,11 @@ const (
 	recoveryMinGap        = 60 * time.Second // 同一upstream两次恢复触发之间的最小间隔，防止死循环
 	streamIdleTimeout     = 5 * time.Minute  // 流式响应空闲读超时，超过则取消上游连接
 
+	// saveStateTimeout saveState 事务的超时上限。
+	// SIGTERM 后优雅停机期间 final save 用 shutdownCtx（10s），周期 save 用此值独立超时。
+	// 防止卡在 SQLite busy_timeout（5s）后仍拖慢停机。
+	saveStateTimeout = 10 * time.Second
+
 	// 以下为非 count 型（usage/balance/exhaust）恢复调度的时间兜底值
 	defaultFallbackRecoverGap = 30 * time.Minute // exhaust 兜底下次复查间隔
 	defaultBalanceRecoverGap  = 30 * time.Minute // balance provider 未提供 reset 时默认间隔
