@@ -66,3 +66,34 @@
 - 新增 `CHANGELOG.md`（`d40e45b`），记录 v1.1 完整变更。
 - README 首段补充"API 格式转换"能力描述（`1a0ff91`），随后精简冗余措辞（`a0da4a6`）。
 - `.gitignore` 新增 `tools/` 与 `.trae/`（随 `1a0ff91`）。
+
+## v1.3 [8a812b0]-[bae9e2c] — 2026-07-08 ~ 2026-07-10
+
+### Security
+
+- **/status 端点 token 鉴权**（`e54dea5`）：将原 JSON /status handler（泄露所有 upstream 配置，包括 token、targetBase 等）替换为 HTML 页面 + `POST /status/check` 端点，仅返回该 fakeToken 关联的 upstream 健康状态。移除了 `maskToken`、`statusUpstream`、`statusResponse` 等不再使用的类型。在 `main.go` 注册 `/status/check` 路由。
+
+### Added
+
+- **配置校验体系**（`ee87d78`）：为 `TokenMapConfig`、`UpstreamConfig`、`AvailabilityConfig`、`CacheInjectorConfig` 新增 `Validate()` 方法，在 `loadFromDB`（启动 fail-fast）与 `importFromJSON`（导入前校验，不触 DB）时集中调用，收集全部错误一次性返回。
+
+- **导入自动备份**（`ee87d78`）：`importFromJSON` 在解析 JSON 并校验通过后，若 `gateway.db` 已存在则自动备份为 `gateway.db.bak`（0600），再执行事务写入。
+
+- **Context-aware saveState**（`ee87d78`）：`saveState` 改为接收 `context.Context`，内部 `BeginTx`/`Prepare`/`Exec` 切换为 context-aware 变体；main 通过 `shutdownCtx` 传递给 scheduler，支持 10s 超时兜底取消（`saveStateTimeout` 常量），防止 final save 卡住停机。
+
+- **Count 周期刷新**（`e155c74`）：`checkRecovery` 不再跳过未耗尽 count upstream，cron 匹配时即使不 exhausted 也归零计数（真正按 `RefreshCron` 周期刷新的语义）；`Count==0 && !Exhausted` 时为 no-op 不写 DB。
+
+- **/status 增强**（`e155c74`）：`statusCheckUpstream` 新增 `Limit` 与 `RecoveryCron` 字段；`Count`/`Balance` 解除 `omitempty` 以确保零值序列化；HTML 渲染 "count/limit"（limit 缺省显示 ∞）和 "Refresh: cron"。
+
+### Fixed
+
+- **Nil guard 与数据竞态**（`9849425`）：`checkAvailability` 的 `availCount` 分支增加 `st == nil` 防护，防止 panic；handler 中 `AvailabilityState` 在 `RLock` 下拷贝，避免与写者数据竞争。
+- **SQLite 并发限制**（`9849425`）：`openDB` 调用 `SetMaxOpenConns(1)`，防止 WAL 下单写模型下的 `SQLITE_BUSY` 冲突。
+
+### Style
+
+- `state.go` 与 `scheduler.go` 缩进修正（`8a812b0`）；其余文件缩进修正（`e0e101a`）。
+
+### Docs
+
+- README 与当前代码库同步（`bae9e2c`）：重写 `/status` 章节、新增配置校验小节、修正配置导入导出、模型列表 alias 反向展开、流式 error 事件格式、Gemini 工具调用 ID、各文件详解（globals/state/providers/scheduler）等 14 项差异。
