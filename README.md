@@ -7,7 +7,7 @@ Go + SQLite 轻量级 API 反向代理网关，兼容三大主流AI API（OpenAI
 ```
 src/
 ├── main.go            入口：flag 解析、加载配置、启动 HTTP 服务器、优雅关闭
-├── globals.go         全局变量：配置状态、共享 HTTP 客户端、writeJSON 工具
+├── globals.go         全局变量：配置状态、共享 transport/HTTP 客户端、writeJSON 工具
 ├── constants.go       常量定义：超时阈值、可用性类型共用名、并发与超时保护常量
 ├── types.go           数据结构：TokenMapConfig/UpstreamConfig/AvailabilityConfig/...
 ├── singleflight.go    可用性检查 singleflight（自实现，仅用标准库）
@@ -112,6 +112,23 @@ api-gateway -p 9090
 | `usage` | 用量型 | provider 返回任一层级 ≥ 100% | `RecoveryAt`（精确时间点），由 provider 按已耗尽层级最长的 resetInSec 设定 |
 | `exhaust` | 触发即耗尽 | 响应可用性错误时立即 exhaust | `RecoveryAt`（精确时间点），默认 30min 后自动恢复 |
 
+### 配置校验
+
+所有配置结构（`TokenMapConfig` / `UpstreamConfig` / `AvailabilityConfig` / `CacheInjectorConfig`）在 `loadFromDB()` 启动加载与 `importFromJSON()` 导入时集中调用 `Validate()`，**校验失败即 fail-fast**：启动加载直接 `log.Fatal` 退出，导入在触碰 DB 前返回错误（DB 保持原状）。校验收集全部错误一次性返回，便于一次定位所有问题。
+
+校验规则：
+
+- **`UpstreamConfig`**：
+  - `targetBase` 非空、URL 合法、scheme 为 `http`/`https`、host 非空。
+  - `formatTransform` 空串合法（透传）；非空必须命中 `{openai, openai_responses, anthropic, gemini}`。
+  - `realToken` 可空（本地 Ollama 等无需鉴权的 upstream 合法）。
+- **`AvailabilityConfig`**：
+  - `type` 必须命中 `{count, usage, balance, exhaust, none}`。
+  - `count` 型要求 `limit > 0`（否则 `Count>=0` 立即耗尽）。
+  - `balance` / `usage` 型要求 `provider` 非空（否则静默走 fallback）。
+- **`CacheInjectorConfig`**：`Enabled=false` 时跳过 TTL 校验；启用时 `ttl` 仅可为 `"5m"`、`"1h"` 或空串（=默认 `5m`）。
+- **空库合法**：`Upstreams` 为空不算错误（首次启动空库是正常场景）。
+
 ### 请求流程
 
 ```
@@ -170,7 +187,7 @@ client → 网关 (带 fakeToken)
 - 内存中维护 `stateDirty` 标志与 `stateGen` 代际计数器（`atomic.Uint64`），每 5min 检查并写入。
 - `saveState()` 优化为锁内快照 → 锁外 I/O：在写锁内深拷贝 state 快照并记录代际后立即释放锁，SQLite 事务在锁外执行；提交后再次取锁，仅当代际未变（无新写入）才清 dirty，避免写库期间（可能数百 ms）阻塞所有请求。
 - 调度器退出前 final save 确保持久化一致性；main 通过 `schedDone` channel 等待 final save 完成后再 `db.Close()`，避免事务被截断。
-- 启动时清理 FakeTokens 队列中 Upstreames 不存在的 upstream（配置一致性保护）。
+- 启动时执行 `cleanFakeTokenQueues`（清理 FakeTokens 队列中引用不存在的 upstream）与对称的 `reconcileStateWithConfig`（为 tokenMap 中存在的 upstream 补齐初始 AvailabilityState、删除孤立 state 条目），并重置 `stateDirty=false`。
 - 运行时 upstream 队列轮转顺序不持久化（重启恢复 `fake_tokens.priority` 定义的配置顺序）。
 - 旧文件迁移：usage/balance/exhaust 型旧 `RecoveryCron` 字段在重启后被忽略，`RecoveryAt` 为零值触发立即复查，首次写入后清空旧字段。
 
@@ -183,7 +200,12 @@ client → 网关 (带 fakeToken)
 
 两者互斥。JSON 文件格式为 `DBDump`：`{ "tokenMap": {fakeTokens, upstreams}, "state": {upstream: AvailabilityState} }`，结构与运行时内存模型一致，`time.Time` 走 RFC3339Nano 字符串，人类可读可编辑。
 
-导入防御：fakeToken 队列中重复 upstream 跳过保留首次、引用不存在的 upstream 跳过避免 FK 违约、state 中有但 upstreams 中无的孤儿条目警告忽略；全程单事务，任一步失败回滚保持 DB 原状。
+导入流程（按顺序）：
+1. **预校验**：解析 JSON 后立即对其调用 `Validate()`（见上文「配置校验」），失败则拒绝，**不触碰 DB**，打印全部错误。
+2. **自动备份**：若 `gateway.db` 已存在，先整体读出并写入同目录 `gateway.db.bak`（0600 权限），再开始写入——失败回滚也仍有原库备份可恢复。
+3. **全量覆盖**：单事务内 `DELETE` 4 张表（子表 `upstream_tiers`/`upstream_extra`/`fake_tokens` 先于父 `upstreams`）后依次 `INSERT`。
+4. **导入防御**：fakeToken 队列中重复 upstream 在 Go 层用 `seen` map 跳过保留首次（`INSERT OR IGNORE` 仅作数据库层兜底）；队列引用不存在的 upstream 跳过避免 FK 违约；state 中有但 upstreams 中无的孤儿条目警告忽略。
+5. 任一步失败整体 `Rollback`，DB 保持原状（前面已备份的 `.bak` 不受影响）。
 
 典型用途：备份/恢复 `gateway.db`、手工编辑配置后导入、跨环境迁移。导出文件含明文 `realToken`，需自行保护文件权限。
 
@@ -253,7 +275,10 @@ client → 网关 (带 fakeToken)
   - Anthropic → OpenAI：`id`→`id`，`owned_by` 留空。
   - Gemini → OpenAI/Anthropic：从 `name="models/x"` 提取尾段作为 `id`，`displayName` 直接保留为 `display_name`/`displayName`。
   - 反向 OpenAI/Anthropic → Gemini：`id` 拼回 `name="models/"+id`，`displayName` 兜底用 `id`，固定填 `supportedGenerationMethods: ["generateContent","streamGenerateContent"]`，`inputTokenLimit`/`outputTokenLimit` 在 openai/anthropic 源无对应字段时填 0。
-- **别名反向展开**：upstream 配置 `aliases` 时，模型列表响应里若上游真实模型名命中 `aliases` 的 value，则为每个指向它的 alias key 追加一条 entry，所有字段与原真实名条目完全相同（仅 `id`/`name`/`display_name`/`displayName` 改为 alias key）。原真实名条目保留，客户端既能从列表命中真实名也能命中 alias。一对多（多个 alias key → 同一真实名）会展开为多条 alias entry。
+- **别名反向展开（两阶段）**：upstream 配置 `aliases` 时，模型列表响应按下列两阶段处理，使列表显示与请求路由的 alias 行为完全一致：
+  1. **删除被覆盖条目**：若某 entry 的 ID 等于某个 alias key（且该 key 的 `value` 不同——即该客户端名已被重定向到另一真实上游模型），则删除其原条目，避免显示与路由行为不符的字段。
+  2. **追加 alias 克隆**：为每个指向真实名的 alias key 追加一条克隆 entry，与原真实名条目字段**完全相同**——**仅 `id`/`name`（ID 字段）改为 alias key**，`display_name`/`displayName` 等其余字段保留原真实名条目的值，不随 alias key 变。
+  一对多（多个 alias key → 同一真实名）会展开为多条 alias entry；`k==v` 自指跳过，空串无效果。
 - **错误响应**：列表请求的 4xx/5xx 错误响应同样走 `TransformErrorResponse` 转为客户端列表格式后返回（inFormat 此时被覆写为客户端列表格式）。
 - **未配置 `formatTransform` 时**完全透传（`outFormat==""` → `doListTransform=false`），行为同现状。上游格式 == 客户端列表判定格式时也透传。
 
@@ -265,7 +290,7 @@ client → 网关 (带 fakeToken)
 - **reasoning 透传**：OpenAI Chat 的 `delta.reasoning`/`reasoning_content`、Responses 的 `response.reasoning.delta`/`.done` 与 `response.reasoning_summary_text.*` 事件均转成 Anthropic `thinking` block（`content_block_start` + `thinking_delta` + `content_block_stop`）。
 - **懒发 message_start**：`message_start` 推迟到首个实际内容/usage 事件时才发送，避免空响应留下"悬挂消息"。
 - **UTF-8 安全累积**：跨 TCP chunk 边界拆分的多字节 UTF-8 字符会正确累积，不损坏工具调用 JSON 参数。
-- **流式 error 事件**：上游流式传输中途出错时发送 Anthropic 格式 `event: error`，并抑制合成的 `message_stop`，避免把失败伪装成正常完成。
+- **流式 error 事件**：上游流式传输中途出错时按**客户端格式**分流渲染：Anthropic 客户端发 `event: error` + `data: {...}`；OpenAI Chat/Responses 客户端发 `data: {"error":{...}}` + 终止 `data: [DONE]`；Gemini 客户端发 `data: {"error":{"code":500,"status":"INTERNAL",...}}`。并抑制合成的 `message_stop`，避免把失败伪装成正常完成。
 - **无限空白中止**：工具调用 `arguments` 中超过 500 连续空白字符视为上游异常，中止该 tool block 以防客户端挂起。
 - **重复 finish_reason 去重**：异常上游多次发送终止事件时，`stop_reason` 仅设置一次。
 
@@ -282,14 +307,14 @@ client → 网关 (带 fakeToken)
 }
 ```
 
-DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（`openai`/`openai_responses`/`anthropic`/`gemini`/空）。`/status` 端点的响应中 `upstreams[].formatTransform` 字段会回显当前配置。
+DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（`openai`/`openai_responses`/`anthropic`/`gemini`/空）。注意新版 `/status/check` 响应不回显 `formatTransform`（仅返回健康/计数/恢复信息），需查看完整配置请直接读 DB 或用 `-e` 导出。
 
 #### 限制说明
 
 - **错误响应转换**：4xx/5xx 错误响应体在转换路径下会经 `TransformErrorResponse` 转为客户端格式后返回（包括可用性错误 401/402/403/429）。各厂商错误 JSON 结构差异较大，转换尽量保留 `error.message`/`type` 等通用字段，无法映射的字段按目标格式兜底。仅对 `resp.StatusCode < 300` 的成功响应走 `TransformResponse`。
 - **请求转换失败 → 继续尝试下一个 upstream**：客户端请求体无法解析为目标格式时，不直接 400 中断，而是记录 `[TRANSFORM] request convert failed (will try next upstream)` 日志后继续尝试队列中的下一个 upstream（透传 upstream 不进入转换路径，可正常处理）。全部 upstream 均失败后由循环外兜底返回 `503`。
 - **响应转换失败 → 回退原 body**：响应转换出错时记日志并原样返回上游响应（非流式）；流式转换 Feed 出错则中断流并记日志。
-- **Gemini 工具调用 ID**：Gemini `functionCall` 无独立 ID 字段，转换到 anthropic/openai 时用无状态启发式合成 ID（基于调用顺序），可能与上游真实 ID 不一致；反向（anthropic/openai→gemini）时 ID 丢失。
+- **Gemini 工具调用 ID**：Gemini `functionCall` 无独立 ID 字段，转换到 anthropic/openai 时用 `crypto/rand` 合成随机十六进制 ID（前缀 `gemini_synth_`，无状态），可能与上游真实 ID 不一致；反向（anthropic/openai→gemini）时**真实 ID 保留**写入 `functionCall.id`，仅丢弃 `gemini_synth_` 合成前缀的 ID。
 - **链式转换语义损耗**：`openai_chat` ↔ `openai_responses` 等跨子格式转换经 anthropic pivot 两步完成，工具调用、reasoning 等字段经历两次映射，可能出现语义损耗（如 Responses 的 namespace tool 经 anthropic 中转后降级为普通 function tool）。
 - **非法值兜底**：`formatTransform` 配置为非上述 4 个合法值时，记 `[TRANSFORM] invalid formatTransform ... -> passthrough` 警告日志后按透传处理，不报错。
 
@@ -301,7 +326,7 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 |---|---|---|---|
 | `pathPrefix` | 自定义 API 版本前缀，如 `"/api/v3"` | 替换目标 URL path 开头的 `/v1` 或 `/v1beta` 为自定义前缀。用于上游 base URL 使用非标准 API 版本前缀的场景，如火山引擎的 `/api/v3/chat/completions` 而非 `/v1/chat/completions`。同时覆盖透传路径、格式转换路径和列表转换路径。 | 始终生效（无论是否开启 formatTransform，只要构造出的 targetPath 以 `/v1` 或 `/v1beta` 开头即触发替换） |
 | `codexBackend` | `"true"` / `"fast"` | 对发往 ChatGPT Codex 后端的 Responses 请求做字段整形（注入 `store:false`/`include`/`stream:true`/兜底字段，剥离 `max_output_tokens`/`temperature`/`top_p`；`fast` 额外注入 `service_tier:"priority"`） | 上游实际发送格式为 `openai_responses`（转换后或 Responses→Responses 透传） |
-| `preserveReasoningContent` | `"true"` | Anthropic→OpenAI Chat 转换时把 `thinking` 块提取为 `reasoning_content` 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 兼容） | 仅 formatTransform 开启时生效（需跨格式转换） |
+| `preserveReasoningContent` | `"true"` | Anthropic→OpenAI Chat 转换时把 `thinking` 块提取为 `reasoning_content` 字段（Kimi/DeepSeek/MiMo 等 reasoning vendor 兼容）。**仅当该 assistant 消息含 `tool_use` 块时才写入**；纯 reasoning + text 的消息 thinking 会被静默丢弃 | 仅 formatTransform 开启时生效（需跨格式转换） |
 | `reasoningVendor` | `"auto"` 或 `"kimi"`/`"deepseek"`/`"mimo"` 等非空值 | 重写 thinking 历史为占位符，兼容拒绝原始 thinking 块的供应商（`auto` 按 upstream 名/`targetBase` 自动检测） | 客户端格式为 `anthropic`（透传或转换前均可） |
 | `stripEffortWhenThinkingDisabled` | `"true"` | `thinking.type != enabled` 时剥离 `reasoning_effort`/`output_config.effort` 参数（DeepSeek Anthropic 兼容端点要求） | 客户端格式为 `anthropic`（透传或转换前均可） |
 
@@ -312,73 +337,67 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 - **cache_control 自动注入**：upstream 配置 `cacheInjection: { enabled: true, ttl: "5m" }` 时，自动在 tools/system/最后 assistant/最后 user 消息末尾注入最多 4 个 `cache_control: {"type":"ephemeral"}` 断点，享受 Anthropic Prompt Caching 折扣。**不依赖 `formatTransform`**，透传 Anthropic→Anthropic 时同样生效。
 - **Gemini thoughtSignature 影子存储**：按 `tool_call_id` 维度存储 Gemini 的 `thoughtSignature` 与完整 assistant turn `parts` 数组（含 `thought:true` 块），多轮工具调用时原样回放，避免 Gemini 签名校验失败 400。
 - **thinking signature 自动修复**：上游返回 thinking signature 相关 400 错误时，自动剥离 thinking/redacted_thinking 块与残留 `signature` 字段后重试同一 upstream（最多 1 次）。
-- **reasoning effort 4 档映射**：`thinking.budget_tokens` 与 `output_config.effort` 映射到 `low`/`medium`/`high`/`xhigh` 四档（`adaptive` → `xhigh`），`xhigh` 在转 OpenAI 时降级为 `high`。
+- **reasoning effort 4 档映射**：`thinking.budget_tokens` 与 `output_config.effort` 映射到 `low`/`medium`/`high`/`xhigh` 四档（`output_config.effort == "max"` 或 `thinking` `adaptive` → `xhigh`；`thinking.type == "enabled"` 但无 `budget_tokens` 时默认 `high`），`xhigh` 在转 OpenAI 时降级为 `high`。
 - **redacted_thinking 占位符**：Anthropic 的 `redacted_thinking` 块转 OpenAI/Gemini 时替换为 `[redacted thinking]` 占位文本，保留语义。
 - **标准参数透传**：Anthropic↔OpenAI 转换时透传 `frequency_penalty`/`logit_bias`/`logprobs`/`metadata`/`n`/`parallel_tool_calls`/`presence_penalty`/`response_format`/`seed`/`service_tier`/`top_logprobs`/`user` 等 12 个标准参数，不再静默丢弃。
-- **document/input_file 支持**：Anthropic `document` 块（PDF）转 Gemini 时变 `inlineData`，转 Responses 时变 `input_file`+`file_data`。
+- **document/input_file 支持**：Anthropic `document` 块（PDF）转 Gemini 时变 `inlineData`，转 Responses 时变 `input_file`+`file_data`；**转 OpenAI Chat 时被静默丢弃**（OpenAI Chat 无文档能力）。
 - **incomplete_reason 细分**：Responses `incomplete` 状态按 `incomplete_reason` 细分，仅 `max_output_tokens`/`max_tokens` 映射为 `max_tokens`，其他映射为 `end_turn`。
 
-### 状态查询（/status）
+### 状态查询
 
-`GET /status` 返回当前网关内存运行时状态的脱敏快照，供运维排查使用：
+为避免泄露所有 upstream 配置与真实 token，状态查询拆为两个端点，且均**返回 fakeToken 关联的 upstream**：
+
+- **`GET /status`**：返回一个极简 HTML 查询页（含 token 输入框），前端固定 `POST` 到 `/status/check` 渲染结果。无需鉴权即可访问页面本身，但只有提交有效 token 才能看到对应队列状态。
+- **`POST /status/check`**：接收 `{"token":"<fakeToken>"}`，校验该 fakeToken 存在且队列非空，仅返回队列内 upstream 的运行时状态（**不含 `realToken`、不含其他 fakeToken 的队列**），token 无效返回 401。
 
 ```bash
-curl http://localhost:9090/status
+curl -X POST http://localhost:9090/status/check \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"sk-xxxxxx"}'
 ```
 
-响应体：
+响应体（`upstreams` 数组，仅包含该 fakeToken 队列中的 upstream）：
 
 ```json
 {
   "upstreams": [
     {
-      "name": "deepseek-aaa",
-      "targetBase": "https://api.deepseek.com",
-      "realToken": "sk-a********aaaa",
-      "availType": "balance",
-      "exhausted": false,
-      "balance": 12.34,
-      "recoveryAt": "0001-01-01T00:00:00Z",
-      "queueFor": ["sk...aa"]
-    },
-    {
       "name": "gemini",
       "targetBase": "https://generativelanguage.googleapis.com",
-      "realToken": "AIb********bbbb",
-      "availType": "count",
       "exhausted": false,
+      "availType": "count",
       "count": 10,
-      "recoveryCron": "0 0 16 * * *",
-      "lastChecked": "2026-06-30T11:53:01.91Z",
-      "queueFor": ["sk...bb"]
+      "limit": 250,
+      "recoveryCron": "0 0 16 * * *"
     },
     {
       "name": "opencode-go",
       "targetBase": "https://opencode.ai/zen/go",
-      "realToken": "sk-c********cccc",
-      "availType": "usage",
       "exhausted": true,
+      "availType": "usage",
+      "count": 0,
+      "balance": 0,
       "tiers": [
         {"name": "rolling", "usedPct": 100, "resetInSec": 2592000}
       ],
-      "recoveryAt": "2026-07-11T09:09:29Z",
-      "queueFor": ["sk...cc"]
+      "recoveryAt": "2026-07-11T09:09:29Z"
     }
-  ],
-  "fakeTokens": {
-    "sk...aa": ["deepseek-aaa", "gemini"],
-    "sk...cc": ["opencode-go"]
-  }
+  ]
 }
 ```
 
 | 字段 | 说明 |
 |---|---|
-| `upstreams` | 每个 upstream 的运行时快照（配置+状态） |
-| `upstreams[].realToken` | 真实 API Key 脱敏视图（首尾各 4 字符 + `********`） |
-| `upstreams[].queueFor` | 该 upstream 出现在哪些 fakeToken 队列中（脱敏），便于排障 |
+| `upstreams` | 该 fakeToken 队列内 upstream 的运行时快照（按队列顺序） |
+| `upstreams[].availType` | 可用性类型（`count`/`usage`/`balance`/`exhaust`/`none`，缺省为 `none`） |
+| `upstreams[].limit` | count 型的 `limit`（其余类型缺省） |
+| `upstreams[].count` | count 型的当前计数（其余类型始终为 0） |
+| `upstreams[].balance` | balance 型的余额（其余类型始终为 0） |
 | `upstreams[].tiers` | usage 型的各配额层级用量（count/balance 型无此字段） |
-| `fakeTokens` | 当前 fakeToken → upstream 队列映射，fakeToken 名脱敏 |
+| `upstreams[].recoveryCron` | count 型的恢复 cron 表达式（其余类型缺省） |
+| `upstreams[].recoveryAt` | usage/balance/exhaust 型的精确恢复时间点（其余类型缺省） |
+
+响应**不包含** `realToken`、`queueFor`、`lastChecked`、顶层 `fakeTokens` 映射等敏感或全局字段——只对持 token 的调用方暴露其自身队列。HTML 页面在浏览器本地用 `fetch` 调用 `/status/check` 完成查询，无外部 JS 依赖。
 
 ### 恢复调度机制
 
@@ -399,7 +418,9 @@ curl http://localhost:9090/status
 - **兜底 exhaust**：设为 `now + 30min`。
 - 当 provider 返回的 `resetInSec` 异常（≤ 0）时，使用 `minRecoverGap = 60s` 地板保护，防止死循环。
 
-调度器每 1s 遍历所有 exhausted upstream，检查 `now >= RecoveryAt`（零值视为旧文件迁移，立即触发）。触发后调用 provider 复查，返回新的 exhausted 状态和 `RecoveryAt`；若已恢复则清除 exhausted，upstream 重新参与请求轮转。
+调度器每 1s 遍历所有 exhausted upstream，检查 `now >= RecoveryAt`（零值视为旧文件迁移，立即触发）。触发后按类型分流恢复：
+- **`exhaust` 型 / 无 availability 配置**：到达 `RecoveryAt` **直接自动恢复**（清零 `Exhausted` 与 `RecoveryAt`），**不调用 provider**——因为 `fallbackResult` 恒返回 `Exhausted=true`，若复查会形成 60s 死循环。
+- **`usage` / `balance` 型**：通过 `availSF.Do()` singleflight 调用 provider 复查，返回新的 exhausted 状态与 `RecoveryAt`；若已恢复则清除 exhausted，upstream 重新参与请求轮转。
 
 ### 请求体大小限制
 
@@ -411,30 +432,31 @@ curl http://localhost:9090/status
 
 1. 解析 `-p` / `-port` / `-db` / `-e`(`-export`) / `-i`(`-import`) flag
 2. 若指定 `-e` 或 `-i`：执行导出/导入后 `os.Exit(0)`，不启动服务器（管理操作，互斥）
-3. 调用 `loadFromDB()` 从 SQLite 加载配置与状态（统一数据源）
+3. 调用 `loadFromDB()` 从 SQLite 加载配置与状态（统一数据源），并运行 `Validate()` 校验——失败即 `log.Fatal` 退出
 4. 启动 `runScheduler` goroutine
 5. 初始化 `reqSem` 并发信号量（channel semaphore，容量 256），handler 入口 acquire、defer release
-6. 启动 HTTP server，监听 `:port`，配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
+6. 启动 HTTP server，监听 `:port`，注册 `GET /status`（HTML 查询页）、`POST /status/check`（按 fakeToken 查询关联 upstream 状态）、`/`（核心代理 handler）；配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
 7. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）
 
 ### globals.go
 
 - 包级全局变量（`tokenMap`、`stateMap`、`mu sync.RWMutex`、`stateGen atomic.Uint64`、`db`、`dbPath` 等）
-- 共享 HTTP 客户端（复用 Transport，避免每次创建新连接）：
-  - `defaultClient`（15s 超时）— provider 可用性检查
-  - `proxyClient`（120s 超时）— 普通代理请求
-  - `streamClient`（无整体超时）— 流式代理请求
+- 共享 HTTP transport/客户端：
+  - `sharedTransport`（`MaxIdleConns=100`、`MaxIdleConnsPerHost=20`、`IdleConnTimeout=90s`）— 所有代理/provided client 共享连接池，避免每请求新建 Transport
+  - `proxyClient`（120s 超时，复用 sharedTransport）— 普通代理请求
+  - `streamClient`（无整体超时，复用 sharedTransport）— 流式代理请求
+  - provider 可用性检查**不**使用上述任一 client，而在 `providers.go` 内走 `httpGetRaw` 的三阶段重试 client（2s+4s+8s 独立超时，每阶段新建 client 但共用 sharedTransport）
 - `reqSem`（channel semaphore，容量 256）：全局并发上限，handler 入口 acquire，超限请求阻塞排队
 - `availSF`（`availSingleFlight`）：可用性检查 singleflight，同 upstream 并发触发仅首次执行 provider 调用
 - `writeJSON` 统一 JSON 响应写入，捕获并记录编码错误
 
 ### state.go
 
-- `openDB`：打开 SQLite（`PRAGMA foreign_keys=ON` + `WAL` + `busy_timeout`）并建表 IF NOT EXISTS，供 `loadFromDB` 与 `importFromJSON` 复用
-- `loadFromDB`：查 4 张表填充 `tokenMap` + `stateMap`、`cleanFakeTokenQueues` + `reconcileStateWithConfig`
+- `openDB`：打开 SQLite `db` 并设 `PRAGMA foreign_keys=ON` + `WAL` + `busy_timeout`、`conn.SetMaxOpenConns(1)`（避免 WAL 下并发写竞争），`CREATE TABLE IF NOT EXISTS` 4 张表 + `idx_fake_tokens_order` 索引；随后用 `PRAGMA table_info` 检查 `upstreams` 列，对旧库执行 `ALTER TABLE ADD COLUMN (format_transform / aliases)` **运行时迁移**。供 `loadFromDB` 与 `importFromJSON` 复用。
+- `loadFromDB`：查 4 张表填充 `tokenMap` + `stateMap`；`cleanFakeTokenQueues`（清队列中引用不存在的 upstream）+ `reconcileStateWithConfig`（为 tokenMap 中存在的 upstream 补齐默认 `AvailabilityState`、删除孤立 state 条目）；末尾重置 `stateDirty=false`；调用 `tokenMap.Validate()`，失败 `log.Fatal`。
 - `saveState`：单事务写回——先持写锁深拷贝 state 快照（含 Tiers 副本）并记录 `stateGen`，释放锁后遍历快照执行 SQLite I/O（`UPDATE upstreams` 状态列 + 每个 upstream 的 `upstream_tiers` DELETE/INSERT）；提交后再取锁，仅当代际未变才清 dirty。锁外 I/O 避免写库阻塞所有请求。
 - `exportToJSON`：复用 `loadFromDB` 载入内存 → marshal `DBDump{tokenMap, stateMap}` → 原子写（tmp+rename，0600）；导出 reconcile 后的规范视图
-- `importFromJSON`：读 JSON → 单事务 DELETE 4 表（先子后父）+ INSERT 全量覆盖；防御：队列重复 upstream 用 `INSERT OR IGNORE` 跳过、引用不存在 upstream 跳过、orphan state 警告；任一步失败 Rollback
+- `importFromJSON`：① 解析 JSON 后立即 `Validate()`（不触碰 DB）→ ② 若 `gateway.db` 存在则先备份为 `gateway.db.bak`（0600）→ ③ 单事务 DELETE 4 表（先子后父）+ INSERT 全量覆盖；④ 防御：队列重复 upstream 用 Go `seen` map 跳过（`INSERT OR IGNORE` 仅作 DB 兜底从不触发）、引用不存在 upstream 跳过避免 FK 违约、orphan state 警告忽略；任一步失败 `Rollback`（前面已有 `.bak` 备份）。
 
 ### cron.go
 
@@ -449,17 +471,24 @@ curl http://localhost:9090/status
 - `checkOpenCodeGoUsage`：GET `/_server`，解析 rolling/weekly/monthly 三级用量；在所有已耗尽层级（usagePercent ≥ 100）中取最长 `resetInSec`，返回 `RecoveryAt = now + maxReset`
   - rolling 若不匹配直接 fallback（opencode API 必返回 rolling）
   - weekly/monthly 可能缺失，不影响逻辑
-- 其他 provider（Kimi / OpenRouter / Claude / Codex / Gemini / ZAI / MiniMax）仅框架返回 exhaust（始终耗尽+30min 复查）
-- `httpGetJSON` / `httpGetText` 使用共享 `defaultClient`
+- 其他 provider 仅框架，按类型返回兜底：
+  - **balance 型**（无具体实现）：`Kimi`、`OpenRouter`
+  - **usage 型**（无具体实现）：`Claude`、`Codex`、`Gemini`、`ZAI`、`MiniMax`
+  - 均返回 `fallbackResult`（`Exhausted=true`，`RecoveryAt = now + 30min`）
+- `httpGetJSON` / `httpGetText` 不用共享 `defaultClient`，经 `httpGetRaw` 的**三阶段重试**：每阶段独立超时 client（2s + 4s + 8s），仅对网络错误/超时、5xx、429 触发重试；2xx 立即返回，其他 4xx（如 401/403）视为确定失败不重试。每阶段 client 复用 `sharedTransport` 保持连接池
 
 ### scheduler.go
 
-- `runScheduler`：主循环 select ticker（1s 恢复检查）与 saveTicker（5min 状态保存）；通过 `done` channel 通知 main 已完成 final save
+- `runScheduler`：主循环 `select` 三个 ticker：`ticker`（1s 恢复检查）、`saveTicker`（5min 状态保存）、`shadowCleanupTicker`（10min Gemini shadow 过期条目惰性清理，见 `gemini_shadow.go`）；通过 `done` channel 通知 main 已完成 final save
 - `checkRecovery`：遍历 all upstream，按类型分流：
   - **count 型**：`RecoveryCron` cron 周期匹配
   - **usage/balance/exhaust 型**：`now >= RecoveryAt` 时间点触发（零值为旧文件迁移，立即触发）
   - 统一受 `recoveryMinGap`（60s）约束，避免短时间重复触发
-- `recoverUpstream`：count 型直接重置计数并清除 exhausted；其余类型通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `RecoveryAt`
+- `recoverUpstream`：按类型分流恢复——
+  - **count 型**：直接重置 `Count=0`、清除 `exhausted`，**不调用 provider**（count 由网关自行计数 + cron 周期刷新驱动；`Count==0 && !Exhausted` 时为 no-op，不触发 DB 写）。
+  - **`exhaust` 型 / 无 `availability` 配置**：到达 `RecoveryAt` **直接自动恢复**（清零 `Exhausted` 与 `RecoveryAt`），**不调用 provider**——`fallbackResult` 恒返回 `Exhausted=true`，复查会形成死循环。
+  - **`usage` / `balance` 型**：通过 `availSF.Do()` singleflight 去重调用 provider 复查（避免与 handler 路径并发重复检查），`applyAvailabilityResult` 写入新 `Exhausted` 与 `RecoveryAt`；若已恢复则清除 `exhausted`，upstream 重新参与轮转。
+  - 统一在恢复后更新 `LastRecovery` 并 `markDirty`（count 型 `LastRecovery` 仍更新以维持防抖但不持久化）。
 
 ### gateway.go
 
