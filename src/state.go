@@ -68,6 +68,9 @@ func openDB(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
+	// SQLite 仅允许单写：限制连接池为 1，避免并发 handler 写入与长写事务（saveState）
+	// 频繁触发 SQLITE_BUSY；热请求路径走内存 stateMap/tokenMap，不触碰 DB，无性能影响。
+	conn.SetMaxOpenConns(1)
 	// 启用 FK + WAL，提升并发与崩溃安全
 	if _, err := conn.Exec(`PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`); err != nil {
 		conn.Close()

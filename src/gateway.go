@@ -656,11 +656,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 			// 调用可用性检查（count型走自身判断；其它调用provider），用 singleflight 合并同 upstream 并发调用
 			res := availSF.Do(upstreamName, func() AvailabilityResult {
-				var stCopy *AvailabilityState
+				// 锁内只取快照值拷贝后释放锁，再传指针给 checkAvailability：
+				// 避免 RUnlock 后仍持有共享 *AvailabilityState 指针，
+				// 与 incrementCount/applyAvailabilityResult 在写锁下修改同结构体形成数据竞争。
+				// 与 scheduler.go:162 (stCopy := *cur) 范式统一。
 				mu.RLock()
-				stCopy = stateMap[upstreamName]
+				cur := stateMap[upstreamName]
+				var stCopy AvailabilityState
+				if cur != nil {
+					stCopy = *cur
+				}
 				mu.RUnlock()
-				return checkAvailability(upstreamName, upstreamCfg.Availability, stCopy)
+				if cur == nil {
+					return checkAvailability(upstreamName, upstreamCfg.Availability, nil)
+				}
+				return checkAvailability(upstreamName, upstreamCfg.Availability, &stCopy)
 			})
 			exhausted := applyAvailabilityResult(upstreamName, res)
 

@@ -29,6 +29,11 @@ func checkAvailability(upstreamName string, cfg *AvailabilityConfig, st *Availab
 	switch cfg.Type {
 	case availCount:
 		// count型：网关自行统计，检查时即判断 count>=limit
+		// st 可能为 nil（stateMap 条目缺失或并发读写）：视为初始未计数（Count=0），非耗尽。
+		// 与 fallbackResult 的 st != nil 风格一致，避免 goroutine panic。
+		if st == nil {
+			return AvailabilityResult{Count: 0, RecoveryCron: cfg.RefreshCron}
+		}
 		exhausted := st.Count >= cfg.Limit
 		return AvailabilityResult{Exhausted: exhausted, Count: st.Count, RecoveryCron: cfg.RefreshCron}
 
