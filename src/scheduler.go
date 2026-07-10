@@ -66,7 +66,8 @@ func runScheduler(shutdownCtx context.Context, stopCh <-chan struct{}, done chan
 }
 
 // checkRecovery 遍历所有upstream，判断是否触发恢复：
-//   - count型：RecoveryCron 周期匹配
+//   - count型：RecoveryCron 周期匹配命中即重置计数（不论是否已耗尽，
+//     周期刷新语义：每到一个 cron 周期就把 count 清零，而非仅用于从 exhaust 恢复）
 //   - usage/balance/exhaust型：now >= RecoveryAt 时间点触发
 //     （RecoveryAt 为零值视为旧文件迁移，立即触发一次 provider 检查）
 //     统一受 recoveryMinGap 约束，防止短时间内重复触发
@@ -75,11 +76,16 @@ func checkRecovery(now time.Time) {
 	// 复制一份需要触发的upstream名，避免长时间持锁且不持有 state 指针
 	var toRecover []string
 	for name, st := range stateMap {
-		if st == nil || !st.Exhausted {
+		if st == nil {
 			continue
 		}
 		cfg := tokenMap.Upstreams[name].Availability
 		isCount := cfg != nil && cfg.Type == availCount
+		// count 型按 cron 周期刷新计数，不要求已耗尽；
+		// 其余类型仅在 exhausted 时才参与恢复调度。
+		if !isCount && !st.Exhausted {
+			continue
+		}
 
 		if isCount {
 			// count型：按 cron 周期匹配
@@ -115,23 +121,35 @@ func checkRecovery(now time.Time) {
 func recoverUpstream(name string, now time.Time) {
 	mu.Lock()
 	cur := stateMap[name]
-	if cur == nil || !cur.Exhausted {
+	if cur == nil {
 		mu.Unlock()
 		return
 	}
 	cfg := tokenMap.Upstreams[name].Availability
+	isCount := cfg != nil && cfg.Type == availCount
+	// count 型按 cron 周期刷新计数（不论是否已耗尽）；
+	// 其余类型仅在 exhausted 时才恢复，避免对健康 upstream 误触 provider 复查。
+	if !isCount && !cur.Exhausted {
+		mu.Unlock()
+		return
+	}
 
 	// count型：直接重置count并恢复。
 	// 注意：count 型语义由网关自行计数 + cron 周期重置驱动，不依赖 provider 检查，
 	// 所以这里不调用 applyAvailabilityResult，LastChecked 也不会更新（保持零值）。
 	// 若未来引入依赖 LastChecked 的逻辑需在此显式更新。
-	if cfg != nil && cfg.Type == availCount {
-		cur.Count = 0
-		cur.Exhausted = false
+	if isCount {
+		wasExhausted := cur.Exhausted
+		// count 已是 0 且未耗尽时为 no-op，避免每个 cron 周期都触发无意义的 DB 写。
+		// LastRecovery 始终更新以维持 recoveryMinGap 防抖，但不 markDirty（不持久化）。
+		if cur.Count != 0 || wasExhausted {
+			cur.Count = 0
+			cur.Exhausted = false
+			markDirty()
+		}
 		cur.LastRecovery = now
-		markDirty()
 		mu.Unlock()
-		log.Printf("[recover] upstream=%s count reset (exhausted=false)", name)
+		log.Printf("[refresh] upstream=%s count reset by cron (exhausted=%v->false)", name, wasExhausted)
 		return
 	}
 

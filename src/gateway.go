@@ -1032,10 +1032,11 @@ async function check(){
     for(const u of d.upstreams){
       const badge=u.exhausted?'<span class="badge bad">Exhausted</span>':'<span class="badge ok">Available</span>';
       let detail='';
-      if(u.availType==='count')detail='Count: '+u.count;
-      else if(u.availType==='balance')detail='Balance: '+u.balance;
+      if(u.availType==='count')detail='Count: '+(u.count||0)+'/'+(u.limit||'∞');
+      else if(u.availType==='balance')detail='Balance: '+(u.balance||0).toFixed(2);
       else if(u.availType==='usage'&&u.tiers)detail=u.tiers.map(t=>esc(t.name)+': '+t.usedPct.toFixed(1)+'%').join(', ');
-      if(u.recoveryAt){detail+=' | Recovery: '+new Date(u.recoveryAt).toLocaleString()}
+      if(u.recoveryCron){detail+=' | Refresh: '+esc(u.recoveryCron)}
+      else if(u.recoveryAt){detail+=' | Recovery: '+new Date(u.recoveryAt).toLocaleString()}
       h+='<tr><td>'+esc(u.name)+'</td><td>'+badge+'</td><td>'+esc(u.availType||'none')+'</td><td>'+detail+'</td></tr>';
     }
     h+='</table>';
@@ -1061,14 +1062,16 @@ type statusCheckRequest struct {
 }
 
 type statusCheckUpstream struct {
-	Name       string      `json:"name"`
-	TargetBase string      `json:"targetBase"`
-	Exhausted  bool        `json:"exhausted"`
-	AvailType  string      `json:"availType,omitempty"`
-	Count      int         `json:"count,omitempty"`
-	Balance    float64     `json:"balance,omitempty"`
-	Tiers      []TierState `json:"tiers,omitempty"`
-	RecoveryAt time.Time   `json:"recoveryAt,omitempty"`
+	Name         string      `json:"name"`
+	TargetBase   string      `json:"targetBase"`
+	Exhausted    bool        `json:"exhausted"`
+	AvailType    string      `json:"availType,omitempty"`
+	Count        int         `json:"count"`
+	Limit        int         `json:"limit,omitempty"`
+	Balance      float64     `json:"balance"`
+	Tiers        []TierState `json:"tiers,omitempty"`
+	RecoveryAt   time.Time   `json:"recoveryAt,omitempty"`
+	RecoveryCron string      `json:"recoveryCron,omitempty"`
 }
 
 func statusCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -1103,11 +1106,15 @@ func statusCheckHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if uc.Availability != nil {
 			su.AvailType = uc.Availability.Type
+			if uc.Availability.Type == availCount {
+				su.Limit = uc.Availability.Limit
+			}
 		}
 		if st := stateMap[name]; st != nil {
 			su.Exhausted = st.Exhausted
 			su.Count = st.Count
 			su.Balance = st.Balance
+			su.RecoveryCron = st.RecoveryCron
 			if len(st.Tiers) > 0 {
 				su.Tiers = make([]TierState, len(st.Tiers))
 				copy(su.Tiers, st.Tiers)
