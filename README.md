@@ -42,12 +42,19 @@ go build -o api-gateway.exe .
 
 | flag | 说明 |
 |---|---|
-| `-p` / `-port` | 运行端口，默认 `9090` |
+| `-p` / `-port` | 运行端口，可重复指定以同时监听多个端口，支持纯端口（`9090`）或 `host:port`（`127.0.0.1:9091`、`:9092`），未传默认 `:9090`。所有端口共享同一份配置/DB/状态 |
 | `-db` | SQLite 数据库文件路径，默认 `gateway.db` |
 | `-e <file>` / `-export <file>` | 将 `-db` 库全量导出为 JSON 文件后退出（不启动服务器） |
 | `-i <file>` / `-import <file>` | 将 JSON 文件全量导入 `-db` 库后退出（不启动服务器，全量覆盖） |
 
 `-e` 与 `-i` 互斥。
+
+多端口示例：
+
+```bash
+# 同时监听 0.0.0.0:9090、127.0.0.1:9091、:9092，共享同一份配置
+api-gateway -p 9090 -p 127.0.0.1:9091 -p :9092
+```
 
 ### 快速开始
 
@@ -70,6 +77,8 @@ api-gateway -i my-config.json
 
 ```bash
 api-gateway -p 9090
+# 或同时监听多个端口
+api-gateway -p 9090 -p 127.0.0.1:9091
 ```
 
 4. 客户端用 fakeToken 请求，token 注入方式按优先级递减：`Authorization: Bearer xxx` / `X-Goog-Api-Key` / `?key=` / `X-Api-Key`。网关将 fakeToken 替换为 upstream 的 realToken 转发到 targetBase。
