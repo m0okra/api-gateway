@@ -113,8 +113,21 @@ type AvailabilityResult struct {
 // DBDump 是 -e/-i 导入导出所用的 JSON 顶层结构。
 // 单个文件包含配置（TokenMap）与运行时状态（State）两部分，便于备份/迁移/手工编辑。
 type DBDump struct {
-	TokenMap *TokenMapConfig               `json:"tokenMap"`
-	State    map[string]*AvailabilityState `json:"state"`
+	TokenMap   *TokenMapConfig               `json:"tokenMap"`
+	State      map[string]*AvailabilityState `json:"state"`
+	Accounts   []AccountDump                 `json:"accounts,omitempty"`
+	IPSessions []IPSessionDump               `json:"ipSessions,omitempty"`
+}
+
+type AccountDump struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"passwordHash"`
+}
+
+type IPSessionDump struct {
+	IP       string `json:"ip"`
+	Username string `json:"username"`
+	LoginAt  string `json:"loginAt"`
 }
 
 // ============================================================================

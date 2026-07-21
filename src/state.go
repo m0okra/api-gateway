@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS fake_tokens (
   FOREIGN KEY(upstream_name) REFERENCES upstreams(name) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_fake_tokens_order ON fake_tokens(fake_token, priority);
+CREATE TABLE IF NOT EXISTS accounts (
+  username      TEXT PRIMARY KEY,
+  password_hash TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ip_sessions (
+  ip       TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  login_at DATETIME NOT NULL,
+  FOREIGN KEY(username) REFERENCES accounts(username) ON DELETE CASCADE
+);
 `
 
 // openDB 打开 SQLite 连接，设置 PRAGMA（FK/WAL/busy_timeout）并确保 schema 存在。
@@ -552,6 +562,21 @@ func exportToJSON(outPath string) error {
 	if err := loadFromDB(); err != nil {
 		return err
 	}
+
+	// 导出 accounts 和 ip_sessions（在关闭 DB 前查询）
+	accounts, err := dumpAccounts(db)
+	if err != nil {
+		db.Close()
+		db = nil
+		return fmt.Errorf("dump accounts: %w", err)
+	}
+	sessions, err := dumpIPSessions(db)
+	if err != nil {
+		db.Close()
+		db = nil
+		return fmt.Errorf("dump ip_sessions: %w", err)
+	}
+
 	// loadFromDB 把连接赋给了全局 db；导出场景下立即关闭，避免泄漏
 	if db != nil {
 		db.Close()
@@ -559,7 +584,7 @@ func exportToJSON(outPath string) error {
 	}
 
 	mu.Lock()
-	dump := DBDump{TokenMap: tokenMap, State: stateMap}
+	dump := DBDump{TokenMap: tokenMap, State: stateMap, Accounts: accounts, IPSessions: sessions}
 	mu.Unlock()
 
 	data, err := json.MarshalIndent(dump, "", "  ")
@@ -640,6 +665,12 @@ func importFromJSON(inPath string) error {
 	defer tx.Rollback()
 
 	// 1. 全量清空（先子表后父表，虽然开了 FK 但 DELETE 顺序仍稳妥）
+	if _, err := tx.Exec(`DELETE FROM ip_sessions`); err != nil {
+		return fmt.Errorf("clear ip_sessions: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM accounts`); err != nil {
+		return fmt.Errorf("clear accounts: %w", err)
+	}
 	if _, err := tx.Exec(`DELETE FROM upstream_tiers`); err != nil {
 		return fmt.Errorf("clear upstream_tiers: %w", err)
 	}
@@ -786,6 +817,26 @@ func importFromJSON(inPath string) error {
 			log.Printf("[import] WARN state has orphan upstream=%s (not in tokenMap.upstreams) -> ignored", name)
 			orphanWarned++
 		}
+	}
+
+	// 7. accounts + ip_sessions
+	accountSet := make(map[string]bool, len(dump.Accounts))
+	for _, acc := range dump.Accounts {
+		if _, err := tx.Exec(`INSERT INTO accounts (username, password_hash) VALUES (?,?)`, acc.Username, acc.PasswordHash); err != nil {
+			return fmt.Errorf("insert account %q: %w", acc.Username, err)
+		}
+		accountSet[acc.Username] = true
+	}
+	sessCount := 0
+	for _, sess := range dump.IPSessions {
+		if !accountSet[sess.Username] {
+			log.Printf("[import] WARN ip_session ip=%s references missing account=%s -> skipped", sess.IP, sess.Username)
+			continue
+		}
+		if _, err := tx.Exec(`INSERT INTO ip_sessions (ip, username, login_at) VALUES (?,?,?)`, sess.IP, sess.Username, sess.LoginAt); err != nil {
+			return fmt.Errorf("insert ip_session %q: %w", sess.IP, err)
+		}
+		sessCount++
 	}
 
 	if err := tx.Commit(); err != nil {

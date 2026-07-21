@@ -4,4 +4,6 @@ gateway.db-shm
 gateway.db-wal
 
 aliases.json
+tools/
+.trae/
 *_test.go

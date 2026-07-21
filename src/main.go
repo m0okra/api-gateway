@@ -105,6 +105,7 @@ func (e *listenAddrError) Error() string {
 func main() {
 	var addrs addrList
 	var exportPath, importPath string
+	var addAccount bool
 	// -p / -port 共享同一 addrList，可重复指定，向后兼容单端口用法（未传则默认 :9090）
 	flag.Var(&addrs, "p", "运行端口，可重复指定（纯端口或 host:port），未传默认 :9090")
 	flag.Var(&addrs, "port", "运行端口，可重复指定（纯端口或 host:port），未传默认 :9090")
@@ -113,6 +114,8 @@ func main() {
 	flag.StringVar(&exportPath, "export", "", "导出：将 -db 库全量导出为该 JSON 文件后退出")
 	flag.StringVar(&importPath, "i", "", "导入：将该 JSON 文件全量导入 -db 库后退出")
 	flag.StringVar(&importPath, "import", "", "导入：将该 JSON 文件全量导入 -db 库后退出")
+	flag.BoolVar(&authEnabled, "auth", false, "启用 IP 账号认证")
+	flag.BoolVar(&addAccount, "account", false, "交互式添加账户后退出")
 	flag.Parse()
 
 	// 管理操作分支：导出/导入互斥，执行后立即退出，不启动 HTTP 服务器
@@ -129,6 +132,10 @@ func main() {
 		if err := importFromJSON(importPath); err != nil {
 			log.Fatalf("Import failed: %v", err)
 		}
+		return
+	}
+	if addAccount {
+		createAccountFlow()
 		return
 	}
 
@@ -159,6 +166,18 @@ func main() {
 		log.Printf("请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。")
 	}
 
+	// 1.5 IP 账号认证初始化
+	if authEnabled {
+		accountCount, err := loadAuthFromDB(db)
+		if err != nil {
+			log.Fatalf("Failed to load auth sessions: %v", err)
+		}
+		if accountCount == 0 {
+			log.Fatalf("警告：-auth 已启用但数据库中没有任何账号，请先在 accounts 表中添加账号后重启")
+		}
+		log.Printf("Auth enabled (accounts=%d, active sessions=%d)", accountCount, len(ipSessions))
+	}
+
 	// 2. 启动调度goroutine（exhaust恢复 + 状态保存）
 	schedStop := make(chan struct{})
 	schedDone := make(chan struct{})
@@ -178,7 +197,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", statusHandler)
 	mux.HandleFunc("/status/check", statusCheckHandler)
-	mux.HandleFunc("/", handler)
+	mux.HandleFunc("/login", loginHandler)
+	mux.HandleFunc("/login/logout", logoutHandler)
+	mux.HandleFunc("/", authMiddleware(handler))
 
 	// 同步绑定所有 listener：任一端口冲突立即 log.Fatalf，避免半启动状态。
 	// 全部绑定成功后再发就绪日志，保证对外可见时所有端口均已就绪。
