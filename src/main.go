@@ -195,7 +195,7 @@ func main() {
 	//    WriteTimeout 保持 0：流式 SSE 响应可能持续超过 5min，设写超时会中断合法流。
 	//    ReadTimeout/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
 	mux := http.NewServeMux()
-	mux.HandleFunc("/status", statusHandler)
+	mux.HandleFunc("/status", authMiddleware(statusHandler))
 	mux.HandleFunc("/status/check", statusCheckHandler)
 	mux.HandleFunc("/login", loginHandler)
 	mux.HandleFunc("/login/logout", logoutHandler)
