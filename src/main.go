@@ -36,7 +36,8 @@ func (a *addrList) String() string {
 // Set 解析单次 -p 值并 append。
 // 支持两种格式：
 //   - 纯端口 "9090" → 规整为 ":9090"
-//   - "host:port"（如 "127.0.0.1:9090"、":9090"、"0.0.0.0:9091"）
+//   - "host:port"（如 "127.0.0.1:9090"、":9090"、"0.0.0.0:9091"、"[::1]:9090"）
+//     IPv4 字面量走 tcp4（只监听 IPv4），IPv6 字面量走 tcp6，空 host 走 tcp（双栈）
 //
 // 非法值直接 log.Fatalf，与项目 fail-fast 风格一致。
 func (a *addrList) Set(v string) error {
@@ -79,6 +80,27 @@ func normalizeListenAddr(raw string) (string, error) {
 	}
 	// host 类型不做预校验，交由 net.Listen 在绑定阶段裁决。
 	return raw, nil
+}
+
+// listenNetworkFor 根据 host 字面量选择 network："tcp4" / "tcp6" / "tcp"。
+// Go 的 net.Listen("tcp", ...) 对通配地址（0.0.0.0、::、空 host）一律走
+// AF_INET6 + IPV6_V6ONLY=0 的 dual-stack 监听，导致写 "0.0.0.0:9090" 也变成
+// 同时监听 IPv6（ss 显示 *:9090）。这里对 IPv4 字面量强制走 "tcp4"，让
+// "0.0.0.0" / "127.0.0.1" 真正只监听 IPv4；IPv6 字面量走 "tcp6"；
+// 空 host（":port"）保持 "tcp" 双栈以维持默认行为。
+func listenNetworkFor(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "tcp"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "tcp"
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return "tcp4"
+	}
+	return "tcp6"
 }
 
 // containsColon 判断字符串是否包含冒号；抽取为独立小函数以便内联优化。
@@ -210,7 +232,7 @@ func main() {
 	}
 	entries := make([]srvEntry, 0, len(addrs))
 	for _, addr := range addrs {
-		ln, err := net.Listen("tcp", addr)
+		ln, err := net.Listen(listenNetworkFor(addr), addr)
 		if err != nil {
 			// 已绑定的 listener 在进程退出时由 OS 回收，无需显式关闭
 			log.Fatalf("Failed to listen on %s: %v", addr, err)
