@@ -96,3 +96,46 @@
 ### Docs
 
 - README 与当前代码库同步（`bae9e2c`）：重写 `/status` 章节、新增配置校验小节、修正配置导入导出、模型列表 alias 反向展开、流式 error 事件格式、Gemini 工具调用 ID、各文件详解（globals/state/providers/scheduler）等 14 项差异。
+
+## v1.4 [3c5c55d]-[fd3050f] — 2026-07-10 ~ 2026-08-17
+
+### Added
+
+- **多端口监听**（`0ab66a1`）：将单一 `-p`/`-port` int flag 替换为可重复指定的 `addrList` flag.Value，接受纯端口（`9090`）或 `host:port`（`127.0.0.1:9091`、`localhost:9092`、`:9093`）两种形式。
+  - 新增 `normalizeListenAddr` 校验/规整每个值（端口范围 1-65535，经 `net.SplitHostPort`）；host 合法性留到 `net.Listen` 绑定期裁决，`localhost` 等主机名可用。
+  - 所有 listener 共享同一 mux 与全局状态（tokenMap/stateMap/DB/scheduler）；绑定全部成功后才开始 serve，任一端口冲突即 fail-fast，杜绝半启动。
+  - 每个 listener 独立 goroutine serve；SIGINT/SIGTERM 时在共享 `shutdownCtx` 预算内并发关闭，全部退出后再关闭 DB。
+  - 未传 `-p` 时默认 `:9090` 不变，兼容旧版单端口用法。
+
+- **IP 账号认证**（`fa6978c`、`3f291a5`）：新增可选的基于 IP 的账号认证机制，由 `-auth` flag 启用。
+  - 启用后所有 API 请求（`/` 路由）要求客户端 IP 已通过 `/login` 登录，否则统一返回 `401 Unauthorized`；未启用时行为不变，接收所有 IP 来源请求。
+  - `/login` 提供登录表单与会话管理面板（列表展示该账户已登录的 IP），`/login/logout` 登出；`-account` 交互式添加账户（密码输入隐藏明文，bcrypt 哈希存储）。
+  - 新增 `accounts` 与 `ip_sessions` 表（含 `login_at`，外键级联删除）；启动时 `loadAuthFromDB` 将会话加载到内存（`ipSessions` + `authMu` 读写锁）；`-auth` 启用但库中无账号时打印警告并退出。
+  - `-e`/`-i` 导入导出扩展支持 accounts 与 ip_sessions。
+  - `/status` 端点（`3f291a5`）在 `-auth` 启用时同样纳入 `authMiddleware` 保护；`/status/check` 与 `/login` 保持不受限。
+
+- **Per-upstream 代理 + per-model 覆盖**（`121ffb2`）：新增 `UpstreamConfig.Proxy`（该 upstream 所有出站请求统一代理，含 provider 可用性检查）与 `ModelProxies`（per-model 覆盖，key 为 alias 替换/格式转换后实际发往上游的模型名 `sendModel`，而非客户端请求名）。
+  - 生效规则（优先级递减）：`modelProxies[sendModel]` 命中 → 覆盖 `Proxy`（value 空串 = 显式直连豁免）；未命中 → 回退 `Proxy`；未配置 → 直连，与旧版行为完全一致。
+  - 新增 `src/proxy.go`：按代理 URL 懒加载缓存 `*http.Transport` + plain/stream client 对（超时对齐 `proxyClient`/`streamClient`），同一 URL 只建一个连接池，经 `getProxyTransport` 与 provider 检查路径共享。
+  - 支持 `http://` / `https://` / `socks5://`（URL 内嵌 user:pass 认证；socks5 由标准库在代理侧解析主机名）。
+  - `gateway.go` 在 alias/transform 后按最终 `sendModel` 逐次解析代理；命中时记 `[PROXY]` 日志且脱敏凭据。
+  - `providers.go`：`httpGetRaw/JSON/Text` 新增 Via 变体接收 transport；DeepSeek/OpenCode-Go 可用性检查经 upstream `Proxy` 发出，避免 targetBase 需代理可达时检查误判。
+  - `state.go`：`upstreams` 表新增 `proxy` / `model_proxies` 列，旧库启动 `ALTER TABLE ADD COLUMN` 自动迁移；`-e`/`-i` 往返。
+  - 校验 fail-fast：`proxy` / `modelProxies` 任何 value 非法（无法解析、scheme 非三种、host 为空）→ 启动 `log.Fatal` / 导入拒绝且不触碰 DB；`/status/check` 不回显代理配置（可能含凭据）。
+
+- **跨平台构建脚本**（`d6465c9`）：新增 `build.bat`（Windows）与 `build.sh`（Linux/macOS），自 `src/` 构建剥离符号的 `api-gateway` 二进制（`-ldflags="-s -w"`）。
+
+### Fixed
+
+- **IPv4/IPv6 字面量监听网络选择**（`06ab9f2`）：Go `net.Listen("tcp", addr)` 对通配地址（`0.0.0.0`、`::`、空 host）会提升为 dual-stack（AF_INET6 + V6ONLY=0），导致 `0.0.0.0:9090` 实际同时绑定 IPv4 与 IPv6。新增 `listenNetworkFor(addr)` 按字面量 host 选择网络：IPv4 字面量 → `tcp4`（仅 IPv4）；IPv6 字面量 → `tcp6`；空 host（`:port`）→ `tcp` 保持原 dual-stack 默认。`0.0.0.0:9090` 由此真正只监听 IPv4，默认 `:9090` 行为不变（参见 golang/go #7411、#17615、#48723）。
+
+### Chore
+
+- `.gitignore` 移除测试配置 `tools/` 与 `.trae/`（`3c5c55d`，并清除 CHANGELOG 中对应旧条目）。
+- `.gitignore` 补充 `api-gateway`（无 `.exe` 后缀的 Linux/macOS 构建产物）与 `gateway.db.bak`（`fd3050f`）。
+
+### Docs
+
+- README flag 表与 quick-start 补充多端口示例（`0ab66a1`）。
+- README 新增 IP 账号认证章节、`-auth`/`-account` flag 说明与启动流程、全局状态说明（`fa6978c`）。
+- README 新增代理配置章节：`proxy`/`modelProxies` 示例 JSON、四层生效规则、可用性检查/列表请求走代理、校验 fail-fast、日志脱敏与 DB 持久化说明（`121ffb2`）。
