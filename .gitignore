@@ -1,7 +1,9 @@
+api-gateway
 api-gateway.exe
 gateway.db
 gateway.db-shm
 gateway.db-wal
+gateway.db.bak
 
 aliases.json
 tools/
