@@ -38,6 +38,15 @@ type UpstreamConfig struct {
 	// 在模型列表响应中按 value→key 反向展开：同时保留真实模型名条目与 alias 条目，
 	// 二者字段完全相同，客户端能从列表命中 alias 并请求。
 	Aliases map[string]string `json:"aliases,omitempty"`
+	// Proxy 该 upstream 所有出站请求（转发 + 可用性检查）统一走的代理 URL。
+	// 支持 http:// / https:// / socks5://（URL 内嵌 user:pass 认证）。
+	// 空串 = 不走代理（直连，行为与旧版一致）。
+	Proxy string `json:"proxy,omitempty"`
+	// ModelProxies per-model 代理覆盖（per-upstream）：key 为实际发往上游的模型名
+	// （alias 替换后的 sendModel，而非客户端请求名），value 为代理 URL。
+	// 命中时覆盖 Proxy；value 为空串表示该模型显式直连（豁免 upstream 级 Proxy）；
+	// 未命中回退 Proxy。nil 表示不启用 per-model 覆盖。
+	ModelProxies map[string]string `json:"modelProxies,omitempty"`
 }
 
 // CacheInjectorConfig 控制 Anthropic Prompt Caching 自动 cache_control 断点注入。
@@ -162,6 +171,25 @@ var validCacheTTLs = map[string]bool{
 	"1h": true,
 }
 
+// validateProxyURL 校验代理 URL：空串合法（不设代理/显式直连豁免）；
+// 非空时必须可解析、scheme 为 http/https/socks5、host 非空。
+func validateProxyURL(s string) error {
+	if s == "" {
+		return nil
+	}
+	parsed, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("parse error: %v", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "socks5" {
+		return fmt.Errorf("scheme must be http, https or socks5, got %q", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("host is empty")
+	}
+	return nil
+}
+
 // Validate 校验整个 TokenMapConfig：遍历所有 upstream，收集全部错误。
 // 空配置（无 upstream）合法——空库启动是正常场景。
 func (t *TokenMapConfig) Validate() error {
@@ -199,6 +227,17 @@ func (u *UpstreamConfig) Validate() error {
 	// FormatTransform：空串合法（透传），非空必须在合法集合内
 	if u.FormatTransform != "" && !validFormatTransformValues[u.FormatTransform] {
 		errs = append(errs, fmt.Sprintf("formatTransform %q is invalid (valid: openai, openai_responses, anthropic, gemini)", u.FormatTransform))
+	}
+
+	// Proxy：空串合法（直连），非空必须是合法代理 URL
+	if err := validateProxyURL(u.Proxy); err != nil {
+		errs = append(errs, fmt.Sprintf("proxy %q is invalid: %s", u.Proxy, err))
+	}
+	// ModelProxies：key 为上游模型名（非空），value 为代理 URL 或空串（显式直连豁免）
+	for model, p := range u.ModelProxies {
+		if err := validateProxyURL(p); err != nil {
+			errs = append(errs, fmt.Sprintf("modelProxies[%s] %q is invalid: %s", model, p, err))
+		}
 	}
 
 	// Availability：非 nil 时递归校验

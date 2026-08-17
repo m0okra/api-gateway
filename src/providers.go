@@ -113,7 +113,9 @@ func checkDeepSeekBalance(upstreamName string, st *AvailabilityState) Availabili
 	}
 	token := upstream.RealToken
 
-	body, status, err := httpGetJSON("https://api.deepseek.com/user/balance",
+	// 可用性检查与转发路径一致：upstream 配了统一代理时同样经代理发出，
+	// 避免 targetBase 需代理可达时检查误判（modelProxies 与模型无关，不适用）
+	body, status, err := httpGetJSONVia(getProxyTransport(upstream.Proxy), "https://api.deepseek.com/user/balance",
 		map[string]string{"Authorization": "Bearer " + token, "Accept": "application/json"})
 	if err != nil || status != 200 {
 		log.Printf("[AVAIL] deepseek check failed upstream=%s status=%d err=%v -> fallback", upstreamName, status, err)
@@ -165,7 +167,8 @@ func checkOpenCodeGoUsage(upstreamName string, cfg *AvailabilityConfig, st *Avai
 	args := fmt.Sprintf(`{"t":{"t":9,"i":0,"l":1,"a":[{"t":1,"s":%q}],"o":0},"f":31,"m":[]}`, workspaceID)
 	reqURL := fmt.Sprintf("https://opencode.ai/_server?id=%s&args=%s", opencodeGoServiceID, url.QueryEscape(args))
 
-	text, status, err := httpGetText(reqURL, map[string]string{
+	// 同 DeepSeek：可用性检查走 upstream 级统一代理
+	text, status, err := httpGetTextVia(getProxyTransport(upstream.Proxy), reqURL, map[string]string{
 		"accept":            "*/*",
 		"cookie":            cookie,
 		"x-server-id":       opencodeGoServiceID,
@@ -291,15 +294,24 @@ func checkMiniMaxUsage(upstreamName string, st *AvailabilityState) AvailabilityR
 // providerRetryTimeouts 三阶段重试的每阶段超时。
 var providerRetryTimeouts = []time.Duration{providerRetryStage1, providerRetryStage2, providerRetryStage3}
 
-// httpGetRaw 带三阶段重试的 HTTP GET 底层实现。
+// httpGetRaw 带三阶段重试的 HTTP GET 底层实现（直连，共用 sharedTransport）。
 // 仅对网络错误（含超时）/ 5xx 服务器错误 / 429 限流重试；
 // 2xx 成功立即返回；其他 4xx（如 401/403）视为确定失败不重试。
 // 每阶段使用独立超时创建 client，共享 Transport 保持连接池复用。
 func httpGetRaw(reqURL string, headers map[string]string) (statusCode int, body []byte, err error) {
+	return httpGetRawVia(sharedTransport, reqURL, headers)
+}
+
+// httpGetRawVia httpGetRaw 的 transport 参数版本：tr 为 nil 时回退 sharedTransport。
+// provider 可用性检查在 upstream 配了统一代理时传入 getProxyTransport(upstream.Proxy)。
+func httpGetRawVia(tr *http.Transport, reqURL string, headers map[string]string) (statusCode int, body []byte, err error) {
+	if tr == nil {
+		tr = sharedTransport
+	}
 	for stage, t := range providerRetryTimeouts {
 		var code int
 		var data []byte
-		code, data, err = httpGetOnce(reqURL, headers, t)
+		code, data, err = httpGetOnce(tr, reqURL, headers, t)
 		if err != nil {
 			// 网络错误（含超时）：非最后一阶段则重试
 			if stage < len(providerRetryTimeouts)-1 {
@@ -328,9 +340,9 @@ func httpGetRaw(reqURL string, headers map[string]string) (statusCode int, body 
 	return 0, nil, err // unreachable
 }
 
-// httpGetOnce 单次 HTTP GET，使用指定超时。
-func httpGetOnce(reqURL string, headers map[string]string, timeout time.Duration) (int, []byte, error) {
-	client := &http.Client{Timeout: timeout, Transport: sharedTransport}
+// httpGetOnce 单次 HTTP GET，使用指定超时与 transport。
+func httpGetOnce(tr *http.Transport, reqURL string, headers map[string]string, timeout time.Duration) (int, []byte, error) {
+	client := &http.Client{Timeout: timeout, Transport: tr}
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return 0, nil, err
@@ -351,7 +363,11 @@ func httpGetOnce(reqURL string, headers map[string]string, timeout time.Duration
 }
 
 func httpGetJSON(reqURL string, headers map[string]string) (map[string]interface{}, int, error) {
-	code, data, err := httpGetRaw(reqURL, headers)
+	return httpGetJSONVia(sharedTransport, reqURL, headers)
+}
+
+func httpGetJSONVia(tr *http.Transport, reqURL string, headers map[string]string) (map[string]interface{}, int, error) {
+	code, data, err := httpGetRawVia(tr, reqURL, headers)
 	if err != nil {
 		return nil, code, err
 	}
@@ -363,7 +379,11 @@ func httpGetJSON(reqURL string, headers map[string]string) (map[string]interface
 }
 
 func httpGetText(reqURL string, headers map[string]string) (string, int, error) {
-	code, data, err := httpGetRaw(reqURL, headers)
+	return httpGetTextVia(sharedTransport, reqURL, headers)
+}
+
+func httpGetTextVia(tr *http.Transport, reqURL string, headers map[string]string) (string, int, error) {
+	code, data, err := httpGetRawVia(tr, reqURL, headers)
 	if err != nil {
 		return "", code, err
 	}

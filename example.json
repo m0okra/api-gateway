@@ -52,6 +52,11 @@
         "realToken": "***",
         "targetBase": "https://generativelanguage.googleapis.com",
         "formatTransform": "gemini",
+        "proxy": "socks5://127.0.0.1:1080",
+        "modelProxies": {
+          "gemini-2.5-pro": "http://user:pass@127.0.0.1:8080",
+          "gemini-2.5-flash": ""
+        },
         "availability": {
           "type": "count",
           "limit": 250,

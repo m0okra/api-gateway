@@ -22,6 +22,7 @@ src/
 ├── cache_injector.go  Anthropic cache_control 自动注入（最多 4 个断点）
 ├── thinking_rectifier.go thinking signature 自动修复（400 重试时剥离 thinking 块）
 ├── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、格式转换、流式响应
+├── proxy.go           上游代理：per-upstream 统一代理 + per-model 覆盖，transport 缓存与 client 变体
 └── auth.go            IP 账号认证：-auth 启用后的登录/登出/中间件/会话管理
 ```
 
@@ -134,6 +135,8 @@ api-gateway -p 9090 -p 127.0.0.1:9091
   - `targetBase` 非空、URL 合法、scheme 为 `http`/`https`、host 非空。
   - `formatTransform` 空串合法（透传）；非空必须命中 `{openai, openai_responses, anthropic, gemini}`。
   - `realToken` 可空（本地 Ollama 等无需鉴权的 upstream 合法）。
+  - `proxy` 非空时必须是合法代理 URL：scheme ∈ `{http, https, socks5}` 且 host 非空（空串=直连合法）。
+  - `modelProxies` 的 value 为空串（显式直连豁免）或合法代理 URL，逐个校验。
 - **`AvailabilityConfig`**：
   - `type` 必须命中 `{count, usage, balance, exhaust, none}`。
   - `count` 型要求 `limit > 0`（否则 `Count>=0` 立即耗尽）。
@@ -262,6 +265,40 @@ client → 网关 (带 fakeToken)
 - **作用于 attempt 循环内**：alias 重写仅作用于本次 attempt 的局部 `sendBody`/`sendModel`/`basePath`，不污染跨 attempt 复用的原始 `bodyBytes`/`r.URL.Path`/`modelStr`。重试到另一个 different-format upstream 时按其各自的 `aliases` 重新计算，避免跨 upstream 串污染。
 - **DB 持久化**：`upstreams` 表 `aliases` 列存 JSON 编码的 map 字符串；导入导出（`-e`/`-i`）跟着 upstream 配置一起序列化。旧库无此列时启动自动 `ALTER TABLE ADD COLUMN` 兼容。
 - **模型列表响应反向展开**：上游返回模型列表时，按 value→key 反向展开——见下文「模型列表请求转换」。
+
+### 上游代理（per-upstream 统一代理 + per-model 覆盖）
+
+每个 upstream 可选配置两个代理字段，控制网关向该 upstream 发送请求时是否经代理：
+
+```json
+"gemini": {
+  "realToken": "***",
+  "targetBase": "https://generativelanguage.googleapis.com",
+  "proxy": "socks5://127.0.0.1:1080",
+  "modelProxies": {
+    "gemini-2.5-pro": "http://user:pass@127.0.0.1:8080",
+    "gemini-2.5-flash": ""
+  }
+}
+```
+
+生效规则（优先级递减）：
+
+1. **`modelProxies[sendModel]` 命中 → 覆盖 `proxy`**。判断 key 是 **alias 替换、格式转换后实际发往上游的模型名**（`sendModel`），而不是客户端请求名——与 alias 机制类似，但以“实际发送的模型名”为准。例如客户端请求 `gpt-4` 经 alias 映射到 `gemini-2.5-pro`，则以 `gemini-2.5-pro` 查 `modelProxies`。
+2. **`modelProxies` value 为空串 `""` → 该模型显式直连**（豁免 upstream 级 `proxy`）。
+3. **`modelProxies` 未命中 → 回退 upstream 级 `proxy`**。
+4. **`proxy` 也未配置 → 直连**，行为与旧版完全一致。
+
+要点：
+
+- **支持协议**：`http://`、`https://`、`socks5://` 三种代理 URL（URL 内嵌 `user:pass` 认证原生支持）。标准库对 `socks5://` 的 hostname 解析在**代理端**完成（与 `socks5h` 等价），若需本地解析需自定义 dialer，当前不支持。
+- **可用性检查也走代理**：`proxy` 配置后，provider 可用性检查（DeepSeek 余额、OpenCode-Go 用量）同样经代理发出，避免 targetBase 需代理可达时检查误判 exhaust。`modelProxies` 与模型无关，不适用于检查路径。
+- **列表请求**（`GET /v1/models` 等，无模型名）自然走 upstream 级 `proxy`。
+- **校验 fail-fast**：`proxy` 或 `modelProxies` 任何 value 非法（无法解析 / scheme 不在上述三种 / host 为空）→ 启动 `log.Fatal` 退出 / `-i` 导入拒绝且不触碰 DB，与 `targetBase` 同策略。
+- **连接池复用**：同一代理 URL 全局只建一个 Transport（连接池参数与 `sharedTransport` 一致），流式/非流式 client 超时语义与直连一致。
+- **日志脱敏**：命中代理时记 `[PROXY] upstream=xxx model=yyy route=modelProxies|upstream -> socks5://***@127.0.0.1:1080`，代理凭据不落日志。
+- **`/status/check` 不回显**代理配置（可能含凭据）；查看完整配置用 `-e` 导出。
+- **DB 持久化**：`upstreams` 表 `proxy` 列存 URL 字符串、`model_proxies` 列存 JSON 编码的 map；旧库启动时 `ALTER TABLE ADD COLUMN` 自动迁移；`-e`/`-i` 跟随 upstream 序列化。
 
 ### API 格式转换（formatTransform）
 

@@ -602,6 +602,31 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// 代理选择（per-upstream 统一代理 + per-model 覆盖）：
+		// 以 alias 替换/格式转换后实际发往上游的模型名（sendModel）为 modelProxies 的判断 key；
+		// 命中则覆盖 upstream 级 proxy（value 空串 = 显式直连豁免），未命中回退 proxy。
+		// 列表请求 sendModel=="" 自然走 upstream 级 proxy。未命中任何代理时沿用循环外
+		// 选定的共享 client（proxyClient/streamClient），行为不变。
+		attemptClient := client
+		proxyURL, hitModelOverride := resolveProxyURL(upstreamCfg, sendModel)
+		if proxyURL != "" {
+			pc, sc := getProxyClients(proxyURL)
+			if isStream {
+				attemptClient = sc
+			} else {
+				attemptClient = pc
+			}
+			if sendModel != "" {
+				route := "upstream"
+				if hitModelOverride {
+					route = "modelProxies"
+				}
+				log.Printf("[PROXY] upstream=%s model=%s route=%s -> %s", upstreamName, sendModel, route, maskProxyURL(proxyURL))
+			} else {
+				log.Printf("[PROXY] upstream=%s -> %s", upstreamName, maskProxyURL(proxyURL))
+			}
+		}
+
 		targetURL := upstreamCfg.TargetBase + targetPath
 		if encoded := query.Encode(); encoded != "" {
 			targetURL += "?" + encoded
@@ -636,7 +661,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header = outHeaders
 
-		resp, err := client.Do(req)
+		resp, err := attemptClient.Do(req)
 		if err != nil {
 			cancelReq()
 			log.Printf("[ERR] %s %s -> %v", r.Method, maskURL(targetURL), err)
@@ -739,7 +764,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 							return
 						}
 						retryReq.Header = outHeaders
-						resp, err = client.Do(retryReq)
+						resp, err = attemptClient.Do(retryReq)
 						if err != nil {
 							cancelReq()
 							log.Printf("[ERR] %s %s -> %v (rectify retry)", r.Method, maskURL(targetURL), err)
