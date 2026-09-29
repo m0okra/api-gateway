@@ -5,6 +5,11 @@ gateway.db-shm
 gateway.db-wal
 gateway.db.bak
 
+# TLS 证书与私钥：含明文私钥，绝不入库
+*.crt
+*.key
+*.pem
+
 aliases.json
 tools/
 .trae/

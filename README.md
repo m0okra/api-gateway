@@ -6,7 +6,8 @@ Go + SQLite 轻量级 API 反向代理网关，兼容三大主流AI API（OpenAI
 
 ```
 src/
-├── main.go            入口：flag 解析、加载配置、启动 HTTP 服务器、优雅关闭
+├── main.go            入口：flag 解析、加载配置、启动 HTTP/HTTPS 服务器、优雅关闭
+├── tls.go             HTTPS 监听：证书加载/热重载（mtime 指纹）与 per-port tls.Config 构造
 ├── globals.go         全局变量：配置状态、共享 transport/HTTP 客户端、writeJSON 工具
 ├── constants.go       常量定义：超时阈值、可用性类型共用名、并发与超时保护常量
 ├── types.go           数据结构：TokenMapConfig/UpstreamConfig/AvailabilityConfig/...
@@ -30,6 +31,7 @@ src/
 
 - Go ≥ 1.26
 - 依赖 `modernc.org/sqlite`（纯 Go 实现，**无需 CGo**）与 `golang.org/x/crypto`（bcrypt 密码哈希），保持单 exe 静态构建，跨平台编译方便
+- HTTPS 监听仅用标准库 `crypto/tls` / `crypto/x509`，**未引入任何新依赖**（证书由用户通过 `-cert`/`-key` 自备）
 - 在 `src/` 目录下执行：
 
 ```bash
@@ -44,7 +46,8 @@ go build -o api-gateway.exe .
 
 | flag | 说明 |
 |---|---|
-| `-p` / `-port` | 运行端口，可重复指定以同时监听多个端口，支持纯端口（`9090`）或 `host:port`（`127.0.0.1:9091`、`:9092`），未传默认 `:9090`。所有端口共享同一份配置/DB/状态 |
+| `-p` / `-port` | 运行端口，可重复指定以同时监听多个端口，支持纯端口（`9090`）或 `host:port`（`127.0.0.1:9091`、`:9092`），未传默认 `:9090`。所有端口共享同一份配置/DB/状态。**加 `https://` 前缀即该端口走 HTTPS**（如 `https://:9443`），`http://` 前缀为明文的显式写法 |
+| `-cert` / `-key` | HTTPS 证书链与私钥文件（PEM 格式）。存在 `https://` 监听端口时**必填**，缺失则启动即退出；无 https 端口时提供仅告警不生效 |
 | `-db` | SQLite 数据库文件路径，默认 `gateway.db` |
 | `-auth` | 启用 IP 账号认证。启用后所有 API 请求需先通过 `/login` 登录，否则返回 401。未启用时行为不变（接收所有 IP 来源的请求） |
 | `-account` | 交互式添加账户后退出（不启动服务器）。依次输入用户名、密码、确认密码，密码输入隐藏明文 |
@@ -58,7 +61,37 @@ go build -o api-gateway.exe .
 ```bash
 # 同时监听 0.0.0.0:9090、127.0.0.1:9091、:9092，共享同一份配置
 api-gateway -p 9090 -p 127.0.0.1:9091 -p :9092
+
+# HTTP 与 HTTPS 混合监听（同一地址的明文与 TLS 是两个不冲突的端点）
+api-gateway -p 9090 -p https://:9443 -cert ./tls.crt -key ./tls.key
 ```
+
+### HTTPS 监听
+
+任意 `-p` 值加 `https://` 前缀即声明为 HTTPS 端口，可与其他明文端口混用；全部端口共享同一 mux、全局状态与 DB，行为与明文端口完全一致（含 SSE 流式、格式转换、IP 认证）。
+
+```bash
+# 仅 HTTPS
+api-gateway -p https://:9443 -cert ./tls.crt -key ./tls.key
+
+# 混合：9090 明文 + 9443 HTTPS（所有网卡）+ 8443 HTTPS（仅 127.0.0.1）
+api-gateway -p 9090 -p https://:9443 -p https://127.0.0.1:8443 \
+  -cert ./tls.crt -key ./tls.key
+```
+
+要点：
+
+- **证书格式**：PEM。`-cert` 传证书链（服务器证书 + 中间证书按序拼接，叶子证书在前），`-key` 传对应私钥。两者不匹配或任一文件不存在/损坏均在**启动阶段** `log.Fatal` 退出，不会半启动。
+- **自动启用 HTTP/2**：HTTPS 端口经 `http.Server.ServeTLS` 启动，ALPN 自动协商 `h2` / `http/1.1`。客户端支持 HTTP/2 时走 HTTP/2，否则回退 HTTP/1.1。SSE 流式在 HTTP/2 下仍逐块即时下发（不受应答缓冲影响）。
+- **每个端口独立 TLS 配置**：多个 https 端口共用一个证书加载器，但各自持有独立的 `*tls.Config` 实例——`net/http` 在初始化时会无锁写入 `TLSConfig.NextProtos`，共享同一实例在多端口并发启动时构成数据竞争。
+- **最低 TLS 版本 1.2**：显式拒绝 TLS 1.0/1.1。
+- **证书热重载（无需重启）**：每次 TLS 握手按证书文件的 `mtime + size` 检查变更，检测到替换即重新加载。因此 `certbot` / `acme.sh` 等续期工具采用「写临时文件 + rename」替换证书后，**无需重启网关**即生效。重载失败（如文件短暂处于中间态）不致命——继续沿用上一份成功加载的证书并记日志，避免文件抖动导致 HTTPS 整体不可用。
+- **启动日志**：加载成功打印证书主体、SAN 与剩余有效期；剩余不足 14 天或已过期会额外告警。
+- **`-auth` 与 HTTPS 无关**：IP 认证按 `RemoteAddr` 判定，明文端口登录的会话对 HTTPS 端口同样有效（反之亦然）——两者共享同一份 `ipSessions`。
+- **不需要重定向/SNI/mTLS**：当前实现不提供 HTTP→HTTPS 自动重定向、SNI 多证书与客户端证书认证。多域名由**单个证书的 SAN 列表**覆盖（一个 https 端口即可服务多个域名）；若各域名需各自独立证书，则前置反代终止 TLS，或每个域名跑独立进程。
+- **证书文件请勿入库**：`.gitignore` 已忽略 `*.crt` / `*.key` / `*.pem`。
+
+> ⚠️ 若用 nginx/caddy 前置终止 TLS 而非本项目的 HTTPS 端口，请注意 `-auth` 的客户端识别仅取 `RemoteAddr`、**不解析 `X-Forwarded-For`**：所有请求会被视作来自代理 IP，从而共享同一个登录会话。这种部署方式下需自行改造 `clientIP`，或直接使用本项目内置的 HTTPS 监听。
 
 ### 快速开始
 
@@ -68,7 +101,7 @@ api-gateway -p 9090 -p 127.0.0.1:9091 -p :9092
 TokenMap loaded from DB (fakeTokens=0, upstreams=0)
 State loaded from DB (0 upstreams)
 请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。
-Gateway running on port 9090
+Gateway running on http://:9090
 ```
 
 2. 参考 `example.json` 编写配置（脱敏示例，含 fakeTokens 队列与 upstreams 配置），导入：
@@ -83,6 +116,8 @@ api-gateway -i my-config.json
 api-gateway -p 9090
 # 或同时监听多个端口
 api-gateway -p 9090 -p 127.0.0.1:9091
+# 或启用 HTTPS（证书自备，需 PEM 格式）
+api-gateway -p https://:9443 -cert ./tls.crt -key ./tls.key
 ```
 
 4. 客户端用 fakeToken 请求，token 注入方式按优先级递减：`Authorization: Bearer xxx` / `X-Goog-Api-Key` / `?key=` / `X-Api-Key`。网关将 fakeToken 替换为 upstream 的 realToken 转发到 targetBase。
@@ -529,14 +564,25 @@ api-gateway -account
 
 ### main.go
 
-1. 解析 `-p` / `-port` / `-db` / `-auth` / `-e`(`-export`) / `-i`(`-import`) flag
+1. 解析 `-p` / `-port` / `-cert` / `-key` / `-db` / `-auth` / `-e`(`-export`) / `-i`(`-import`) flag。`-p` 值可带 `https://` / `http://` 前缀声明协议，解析为 `listenSpec{addr, tls}`（`parseListenSpec` → `splitListenScheme` → `normalizeListenAddr`）
 2. 若指定 `-e` 或 `-i`：执行导出/导入后 `os.Exit(0)`，不启动服务器（管理操作，互斥）
 3. 调用 `loadFromDB()` 从 SQLite 加载配置与状态（统一数据源），并运行 `Validate()` 校验——失败即 `log.Fatal` 退出
 4. 若 `-auth` 启用：调用 `loadAuthFromDB()` 加载 IP 会话到内存，检查账号数量——为 0 则 `log.Fatal` 退出
 5. 启动 `runScheduler` goroutine
 6. 初始化 `reqSem` 并发信号量（channel semaphore，容量 256），handler 入口 acquire、defer release
-7. 启动 HTTP server，监听 `:port`，注册 `GET /status`（HTML 查询页）、`POST /status/check`（按 fakeToken 查询关联 upstream 状态）、`/login`（IP 认证登录/会话管理）、`/login/logout`（登出）、`/`（核心代理 handler，经 `authMiddleware` 包裹）；配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
-8. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）
+7. 启动 HTTP/HTTPS server：所有监听地址共享同一 mux，注册 `GET /status`（HTML 查询页）、`POST /status/check`（按 fakeToken 查询关联 upstream 状态）、`/login`/`/login/logout`（IP 认证登录/登出）、`/`（核心代理 handler，经 `authMiddleware` 包裹）；配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
+   - **同步 bind 全部 listener**后才发就绪日志，任一端口冲突或证书加载失败即 `log.Fatal`，避免半启动
+   - https 端口的证书经 `newCertReloader` 在 bind 阶段加载；每个 https 端口各自持有 `newTLSConfig()` 产出的独立 `*tls.Config`，启动时调 `ServeTLS(ln, "", "")`（证书由 `GetCertificate` 回调动态提供，故不传文件路径），明文端口调 `Serve(ln)`；就绪日志按协议输出 `http://host:port` / `https://host:port`
+8. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）；`Shutdown` 对所有 listener（含 TLS）并发执行，复用同一 `shutdownCtx` 超时预算
+
+### tls.go
+
+- `certReloader`：持有证书/私钥路径与最近一次成功加载的证书，`newCertReloader` **启动时立即加载一次**（失败即返回错误，由 main `log.Fatal` fail-fast）
+- `certFileFingerprint`：以「路径 + mtime + size」作为证书内容版本标识。续期工具普遍用「写临时文件 + rename」替换证书，mtime 必然变化，故无需哈希文件内容
+- `reload`：指纹未变直接复用缓存；变化时 `tls.LoadX509KeyPair` 重载并更新缓存
+- `getCertificate`：`tls.Config.GetCertificate` 回调，每次握手触发一次指纹检查。**重载失败不致命**——沿用上一份成功证书并记日志，避免文件抖导致 HTTPS 整体不可用；仅在从未成功加载时才把错误丢给客户端
+- `logCertInfo`：解析叶子证书，打印 subject/SAN/notAfter 与剩余天数；剩余 < 14 天或已过期额外告警。解析失败仅降级跳过日志
+- `newTLSConfig`：为**单个**端口构造独立 `*tls.Config`——`MinVersion=TLS1.2`、显式 `NextProtos=["h2","http/1.1"]`、`GetCertificate` 指向 reloader；`Certificates` 留空以使回调必然被调用
 
 ### globals.go
 
