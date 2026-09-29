@@ -139,3 +139,24 @@
 - README flag 表与 quick-start 补充多端口示例（`0ab66a1`）。
 - README 新增 IP 账号认证章节、`-auth`/`-account` flag 说明与启动流程、全局状态说明（`fa6978c`）。
 - README 新增代理配置章节：`proxy`/`modelProxies` 示例 JSON、四层生效规则、可用性检查/列表请求走代理、校验 fail-fast、日志脱敏与 DB 持久化说明（`121ffb2`）。
+
+## v1.5 [fd3050f]-[db426bb] — 2026-08-17 ~ 2026-09-29
+
+### Added
+
+- **HTTPS 监听**（`db426bb`）：`-p` / `-port` 的任意值可加 `https://` 前缀声明为 HTTPS 端口（如 `-p https://:9443`），支持与明文端口混用；`http://` 前缀为明文的显式写法（与不加前缀等价），scheme 大小写不敏感。新增 `-cert` / `-key` flag 提供 PEM 证书链与私钥，证书由用户自备（不生成、不申请）。
+  - 端口解析链重构为 `parseListenSpec` → `splitListenScheme` → `normalizeListenAddr`，产出 `listenSpec{addr, tls}`；`addrList` 元素类型由 `string` 升为 `listenSpec`，去重 key 改为「协议+地址」，故同一地址的明文与 TLS 视为两个不冲突的端点。
+  - 经 `http.Server.ServeTLS(ln, "", "")` 启动（证书由 `GetCertificate` 回调动态提供），ALPN 自动协商 `h2`/`http/1.1`；**未**自包 `tls.NewListener` + `Serve`，因为后者不会注册 HTTP/2 的 `TLSNextProto`，客户端会停在 HTTP/1.1。
+  - 新增 `src/tls.go`：`certReloader` 按「路径 + mtime + size」指纹在每次握手惰性重载证书，使 certbot/acme.sh 类工具「写临时文件 + rename」替换证书后**无需重启进程**即生效；重载失败沿用上一份成功证书（仅记日志）而非中断服务。`logCertInfo` 打印 subject/SAN/有效期，剩余 < 14 天或已过期额外告警。锁范围刻意收窄（指纹计算与读盘解析均在锁外），因该回调每次握手都会触发。
+  - 证书在 bind 阶段加载，缺失/不匹配/损坏均在启动时 `log.Fatal`，与现有多端口「全部绑定成功才 serve」的 fail-fast 策略一致；存在 https 端口但缺 `-cert`/`-key` 亦启动即退出，反之（给了证书但无 https 端口）仅告警。
+  - **每个 https 端口持有独立的 `*tls.Config`**（证书加载器共用）：`net/http` 初始化时会无锁 `append` 到 `TLSConfig.NextProtos`（`http2ConfigureServer` 在 `cloneTLSConfig` 之前执行），共享同一实例在多端口并发启动时构成数据竞争；已加载的 `*tls.Certificate` 不可变故可共享。
+  - 显式 `MinVersion = TLS1.2`，拒绝 TLS 1.0/1.1；`NextProtos` 显式预设。
+  - 就绪日志由 `Gateway running on %s` 改为带协议的形式（`http://:9090` / `https://:9443`）。
+  - 仅使用标准库 `crypto/tls` / `crypto/x509`，**未引入任何新依赖**。
+
+### Docs
+
+- `README.md` 新增「HTTPS 监听」章节：用法、证书格式、HTTP/2、per-port 配置、热重载、最低版本、启动日志、与 `-auth` 的关系，以及不支持重定向/SNI/mTLS 的说明（`db426bb`）。
+- `README.md` flag 表补充 `-cert`/`-key` 与 `-p` 的 `https://` 前缀；多端口示例增补混合监听；`main.go` 文件说明重写并新增 `tls.go` 说明（`db426bb`）。
+- `README.md` 补充警告——若用 nginx/caddy 前置终止 TLS，`-auth` 仅取 `RemoteAddr` 且**不解析 `X-Forwarded-For`**，所有请求会被视为来自代理 IP 从而共享同一登录会话（`db426bb`）。
+- `.gitignore` 新增 `*.crt` / `*.key` / `*.pem`（证书含明文私钥，不得入库）（`db426bb`）。
