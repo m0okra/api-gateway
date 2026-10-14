@@ -53,6 +53,8 @@ go build -o api-gateway.exe .
 | `-account` | 交互式添加账户后退出（不启动服务器）。依次输入用户名、密码、确认密码，密码输入隐藏明文 |
 | `-e <file>` / `-export <file>` | 将 `-db` 库全量导出为 JSON 文件后退出（不启动服务器） |
 | `-i <file>` / `-import <file>` | 将 JSON 文件全量导入 `-db` 库后退出（不启动服务器，全量覆盖） |
+| `-stream-idle-timeout` | 流式（SSE）响应空闲读超时，Go duration 格式（如 `5m`、`90s`、`1h30m`），默认 `5m`。连续无数据超过该时长则取消上游连接。须 >0 且 ≤ `-stream-max-life`，否则启动即退出 |
+| `-stream-max-life` | 流式（SSE）请求最大生命周期硬上限，Go duration 格式，默认 `30m`。到期强制取消上游连接，防止流式 goroutine 无限堆积。须 ≥ `-stream-idle-timeout`，否则启动即退出。注意 thinking-signature 修复重试会重建一份完整预算，故单次客户端请求寿命上界为 2× |
 
 `-e` 与 `-i` 互斥。
 
@@ -223,9 +225,17 @@ client → 网关 (带 fakeToken)
 
 ### 流式响应保护
 
-流式分支有两个保护层：
-- **空闲读超时**（`streamIdleTimeout = 5min`）：启动 goroutine 监控，超时内未读到上游数据则调用 `cancelReq()` 中断上游连接。
-- **最大生命周期**（`maxStreamLife = 30min`）：流式上下文叠加 `context.WithTimeout` 硬上限。即使空闲监控 goroutine 在边界情况未触发，到期也会强制取消上游连接，防止流式 goroutine 无限堆积。
+流式分支有两个保护层，两者均可在启动时通过 flag 调节（默认值即下述数值）：
+- **空闲读超时**（`-stream-idle-timeout`，默认 `5m`）：启动 goroutine 监控，超时内未读到上游数据则调用 `cancelReq()` 中断上游连接。
+- **最大生命周期**（`-stream-max-life`，默认 `30m`）：流式上下文叠加 `context.WithTimeout` 硬上限。即使空闲监控 goroutine 在边界情况未触发，到期也会强制取消上游连接，防止流式 goroutine 无限堆积。
+
+两个参数相互约束，启动时强制校验（违反即 `log.Fatal` 退出）：
+- 两者都必须是正数（`>0`）——不接受用 `0` 表示“禁用保护”：交给 `context.WithTimeout` / `time.NewTimer` 的零值会立即过期，等于流式功能全废，需要长流请直接调大数值。
+- **`-stream-max-life` 不得小于 `-stream-idle-timeout`**（等于可以）——否则总寿命先到，空闲保护永远无法生效。
+
+因此若想单独缩短总寿命，需同时下调空闲超时；例如 `-stream-max-life 1m` 配默认空闲 `5m` 会被拒绝，须写成 `-stream-max-life 1m -stream-idle-timeout 30s`。
+
+启动日志会输出生效值：`[CONFIG] stream idle timeout=5m0s, max life=30m0s`。
 
 ### 状态持久化
 
@@ -564,7 +574,7 @@ api-gateway -account
 
 ### main.go
 
-1. 解析 `-p` / `-port` / `-cert` / `-key` / `-db` / `-auth` / `-e`(`-export`) / `-i`(`-import`) flag。`-p` 值可带 `https://` / `http://` 前缀声明协议，解析为 `listenSpec{addr, tls}`（`parseListenSpec` → `splitListenScheme` → `normalizeListenAddr`）
+1. 解析 `-p` / `-port` / `-cert` / `-key` / `-db` / `-auth` / `-account` / `-e`(`-export`) / `-i`(`-import`) / `-stream-idle-timeout` / `-stream-max-life` flag，随后立即调用 `validateStreamTimeouts` 校验两个流式超时（在管理操作分支之前，故传参错误无论是否启动服务器都会 fail-fast）。`-p` 值可带 `https://` / `http://` 前缀声明协议，解析为 `listenSpec{addr, tls}`（`parseListenSpec` → `splitListenScheme` → `normalizeListenAddr`）
 2. 若指定 `-e` 或 `-i`：执行导出/导入后 `os.Exit(0)`，不启动服务器（管理操作，互斥）
 3. 调用 `loadFromDB()` 从 SQLite 加载配置与状态（统一数据源），并运行 `Validate()` 校验——失败即 `log.Fatal` 退出
 4. 若 `-auth` 启用：调用 `loadAuthFromDB()` 加载 IP 会话到内存，检查账号数量——为 0 则 `log.Fatal` 退出

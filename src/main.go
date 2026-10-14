@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -176,6 +177,26 @@ func (e *listenAddrError) Error() string {
 	return "invalid listen address " + strconv.Quote(e.raw) + ": " + e.reason
 }
 
+// validateStreamTimeouts 校验两个流式超时启动参数（-stream-idle-timeout / -stream-max-life）。
+// 规则：
+//   - 两者都必须为正数：0 或负值交给 context.WithTimeout / time.NewTimer 会立即过期，
+//     等于流式功能全废，故不允许用 0 表示“禁用保护”，需要长流就调大数值。
+//   - maxStreamLife 不得小于 streamIdleTimeout：否则总寿命先到，空闲保护永远无法生效。
+//
+// 返回 error 而非直接 log.Fatalf，便于单测；由 main 在 flag.Parse 后立即调用并退出。
+func validateStreamTimeouts(idle, life time.Duration) error {
+	if idle <= 0 {
+		return fmt.Errorf("-stream-idle-timeout must be positive (got %s)", idle)
+	}
+	if life <= 0 {
+		return fmt.Errorf("-stream-max-life must be positive (got %s)", life)
+	}
+	if life < idle {
+		return fmt.Errorf("-stream-max-life (%s) must not be less than -stream-idle-timeout (%s)", life, idle)
+	}
+	return nil
+}
+
 // ============================================================================
 
 func main() {
@@ -196,11 +217,21 @@ func main() {
 	flag.StringVar(&importPath, "import", "", "导入：将该 JSON 文件全量导入 -db 库后退出")
 	flag.BoolVar(&authEnabled, "auth", false, "启用 IP 账号认证")
 	flag.BoolVar(&addAccount, "account", false, "交互式添加账户后退出")
+	flag.DurationVar(&streamIdleTimeout, "stream-idle-timeout", defaultStreamIdleTimeout,
+		"流式(SSE)响应空闲读超时：连续无数据超过该时长则取消上游连接（须 >0 且 ≤ -stream-max-life）")
+	flag.DurationVar(&maxStreamLife, "stream-max-life", defaultMaxStreamLife,
+		"流式(SSE)请求最大生命周期硬上限：到期强制取消上游连接（须 ≥ -stream-idle-timeout）")
 	flag.Parse()
+
+	// 启动参数校验：无条件执行（在 -e/-i/-account 等提前退出的管理分支之前），
+	// 传参错误无论本次是否启动服务器都应 fail-fast。
+	if err := validateStreamTimeouts(streamIdleTimeout, maxStreamLife); err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	// 管理操作分支：导出/导入互斥，执行后立即退出，不启动 HTTP 服务器
 	if exportPath != "" && importPath != "" {
-		log.Fatalf("-e/-export 与 -i/-import 互斥，请单独使用")
+		log.Fatalf("-e/-export and -i/-import are mutually exclusive; use only one")
 	}
 	if exportPath != "" {
 		if err := exportToJSON(exportPath); err != nil {
@@ -244,11 +275,14 @@ func main() {
 	}
 	if httpsPorts > 0 {
 		if certFile == "" || keyFile == "" {
-			log.Fatalf("检测到 %d 个 https:// 监听端口，必须同时提供 -cert 与 -key", httpsPorts)
+			log.Fatalf("found %d https:// listener(s); both -cert and -key are required", httpsPorts)
 		}
 	} else if certFile != "" || keyFile != "" {
-		log.Printf("warning: -cert/-key 已提供，但没有任何 https:// 监听端口，证书不会被使用")
+		log.Printf("warning: -cert/-key provided but no https:// listener is configured; certificate will not be used")
 	}
+
+	// 打印生效的流式超时参数（仅在实际启动服务器的路径上输出，管理操作不受噪）。
+	log.Printf("[CONFIG] stream idle timeout=%s, max life=%s", streamIdleTimeout, maxStreamLife)
 
 	// 1. 从 SQLite 加载配置与状态（统一数据源）
 	dbExisted := true
@@ -261,7 +295,7 @@ func main() {
 	log.Printf("TokenMap loaded from DB (fakeTokens=%d, upstreams=%d)",
 		len(tokenMap.FakeTokens), len(tokenMap.Upstreams))
 	if !dbExisted || len(tokenMap.Upstreams) == 0 {
-		log.Printf("请使用 -i example.json 导入配置，或直接用 sqlite3 CLI 编辑 gateway.db 后重启。")
+		log.Printf("Use -i example.json to import a config, or edit gateway.db with the sqlite3 CLI and restart.")
 	}
 
 	// 1.5 IP 账号认证初始化
@@ -271,7 +305,7 @@ func main() {
 			log.Fatalf("Failed to load auth sessions: %v", err)
 		}
 		if accountCount == 0 {
-			log.Fatalf("警告：-auth 已启用但数据库中没有任何账号，请先在 accounts 表中添加账号后重启")
+			log.Fatalf("-auth requires at least one account in the accounts table; none found")
 		}
 		log.Printf("Auth enabled (accounts=%d, active sessions=%d)", accountCount, len(ipSessions))
 	}
@@ -290,7 +324,7 @@ func main() {
 	reqSem = make(chan struct{}, maxConcurrentReqs)
 
 	// 4. 启动 HTTP 服务器（多端口共享同一 mux 与全局状态）
-	//    WriteTimeout 保持 0：流式 SSE 响应可能持续超过 5min，设写超时会中断合法流。
+	//    WriteTimeout 保持 0：流式 SSE 响应可能长时间持续，设写超时会中断合法流。
 	//    ReadTimeout/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", authMiddleware(statusHandler))

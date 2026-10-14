@@ -646,6 +646,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// 到期也会取消上游连接，避免 goroutine 无限堆积。
 		// lifeCtx 派生自 reqCtx，过期会触发 reqCtx(=lifeCtx).Done() → 中断 resp.Body.Read
 		// 同时通知 idle 监控 goroutine 退出。
+		// 注意：下方 thinking-signature 修复重试会重建一份完整的 maxStreamLife 预算，
+		// 故单次客户端请求的实际寿命上界为 2×maxStreamLife（重试至多 1 次）。
 		if isStream {
 			lifeCtx, lifeCancel := context.WithTimeout(reqCtx, maxStreamLife)
 			origCancel := cancelReq
@@ -750,6 +752,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 						cancelReq()
 						reqCtx, cancelReq = context.WithCancel(r.Context())
 						if isStream {
+							// 重试重新计一份完整预算（不共享首次请求的剩余时间），
+							// 故总寿命上界为 2×maxStreamLife。
 							lifeCtx, lifeCancel := context.WithTimeout(reqCtx, maxStreamLife)
 							origCancel := cancelReq
 							reqCtx = lifeCtx

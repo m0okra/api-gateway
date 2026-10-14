@@ -386,47 +386,47 @@ button:hover{background:#555}
 func createAccountFlow() {
 	reader := bufio.NewReader(os.Stdin)
 
-	fmt.Print("用户名: ")
+	fmt.Print("Username: ")
 	username, _ := reader.ReadString('\n')
 	username = strings.TrimSpace(username)
 	if username == "" {
-		log.Fatalf("用户名不能为空")
+		log.Fatalf("username must not be empty")
 	}
 
-	fmt.Print("密码: ")
+	fmt.Print("Password: ")
 	pwBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
 	if err != nil {
-		log.Fatalf("读取密码失败: %v", err)
+		log.Fatalf("failed to read password: %v", err)
 	}
 	password := string(pwBytes)
 	if password == "" {
-		log.Fatalf("密码不能为空")
+		log.Fatalf("password must not be empty")
 	}
 
-	fmt.Print("确认密码: ")
+	fmt.Print("Confirm password: ")
 	confirmBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
 	if err != nil {
-		log.Fatalf("读取密码失败: %v", err)
+		log.Fatalf("failed to read password: %v", err)
 	}
 	if string(confirmBytes) != password {
-		log.Fatalf("两次输入的密码不一致")
+		log.Fatalf("passwords do not match")
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
-		log.Fatalf("生成密码哈希失败: %v", err)
+		log.Fatalf("failed to hash password: %v", err)
 	}
 
 	conn, err := openDB(dbPath)
 	if err != nil {
-		log.Fatalf("打开数据库失败: %v", err)
+		log.Fatalf("failed to open database: %v", err)
 	}
 	defer conn.Close()
 
 	if _, err := conn.Exec(`INSERT INTO accounts (username, password_hash) VALUES (?,?)`, username, string(hash)); err != nil {
-		log.Fatalf("添加账户失败: %v", err)
+		log.Fatalf("failed to add account: %v", err)
 	}
-	log.Printf("账户 %q 添加成功", username)
+	log.Printf("account %q added", username)
 }

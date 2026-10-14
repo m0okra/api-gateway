@@ -34,6 +34,16 @@ var (
 	availSF = newAvailSingleFlight()
 )
 
+// 流式（SSE）超时参数：编译期默认值见 constants.go，可在启动时通过
+// -stream-idle-timeout / -stream-max-life 覆盖（flag.Parse 前绑定到此二变量）。
+// 仅在 main 启动阶段写入，启动完成后只读，故无需加锁。
+var (
+	// streamIdleTimeout 流式响应空闲读超时：连续无数据超过该时长则取消上游连接。
+	streamIdleTimeout = defaultStreamIdleTimeout
+	// maxStreamLife 流式请求最大生命周期硬上限：到期强制取消上游连接。
+	maxStreamLife = defaultMaxStreamLife
+)
+
 // ============================================================================
 // 共享 HTTP 客户端（复用连接，避免每次请求创建Transport）
 // ============================================================================
