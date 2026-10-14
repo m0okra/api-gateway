@@ -12,5 +12,4 @@ gateway.db.bak
 
 aliases.json
 tools/
-.trae/
 *_test.go

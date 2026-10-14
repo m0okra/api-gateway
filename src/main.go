@@ -397,8 +397,8 @@ func main() {
 	// 保证 scheduler final save 与 server.Shutdown 都不会无限阻塞。
 	timer := time.AfterFunc(saveStateTimeout, cancelShutdown)
 	defer timer.Stop()
-	close(schedStop)           // 停止调度器（退出前会用 shutdownCtx 做 final save）
-	<-schedDone                // 等待调度器完成 final save，避免 db.Close() 先于事务提交
+	close(schedStop) // 停止调度器（退出前会用 shutdownCtx 做 final save）
+	<-schedDone      // 等待调度器完成 final save，避免 db.Close() 先于事务提交
 
 	// 并发关闭所有 listener，复用同一 shutdownCtx 超时预算
 	var wg sync.WaitGroup
