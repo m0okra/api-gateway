@@ -24,7 +24,8 @@ src/
 ├── thinking_rectifier.go thinking signature 自动修复（400 重试时剥离 thinking 块）
 ├── gateway.go         核心转发：fakeToken → upstream 队列轮转（原子挑选）、请求注入、格式转换、流式响应
 ├── proxy.go           上游代理：per-upstream 统一代理 + per-model 覆盖，transport 缓存与 client 变体
-└── auth.go            IP 账号认证：-auth 启用后的登录/登出/中间件/会话管理
+└── auth.go            IP 账号认证：-auth 启用后的中间件/登录登出/会话管理/账户管理 CLI
+├── login_limiter.go   登录爆破防护：per-IP + per-账号双维度内存限流（LRU + 翻倍锁定）
 ```
 
 ## 编译说明
@@ -49,14 +50,17 @@ go build -o api-gateway.exe .
 | `-p` / `-port` | 运行端口，可重复指定以同时监听多个端口，支持纯端口（`9090`）或 `host:port`（`127.0.0.1:9091`、`:9092`），未传默认 `:9090`。所有端口共享同一份配置/DB/状态。**加 `https://` 前缀即该端口走 HTTPS**（如 `https://:9443`），`http://` 前缀为明文的显式写法 |
 | `-cert` / `-key` | HTTPS 证书链与私钥文件（PEM 格式）。存在 `https://` 监听端口时**必填**，缺失则启动即退出；无 https 端口时提供仅告警不生效 |
 | `-db` | SQLite 数据库文件路径，默认 `gateway.db` |
-| `-auth` | 启用 IP 账号认证。启用后所有 API 请求需先通过 `/login` 登录，否则返回 401。未启用时行为不变（接收所有 IP 来源的请求） |
-| `-account` | 交互式添加账户后退出（不启动服务器）。依次输入用户名、密码、确认密码，密码输入隐藏明文 |
+| `-auth` | 启用 IP 账号认证。启用后除 `/login` 与 `/login/logout` 外，所有端点（含 `/status`、`/status/check` 与 `/`）都需先通过 `/login` 登录，否则 `/status` 返回 302 跳转登录页、其余返回 401 JSON。未启用时行为不变（接收所有 IP 来源的请求，`/login` 返回 404） |
+| `-account` | 交互式添加账户后退出（不启动服务器）。依次输入用户名、密码、确认密码，密码输入隐藏明文。允许自动创建缺失的 DB 文件 |
+| `-del-account <name>` | 删除指定账户及其全部登录会话后退出。需确认（输入 `y`），账户不存在则报错退出。要求 DB 文件已存在 |
+| `-list-accounts` | 以纯文本表格列出所有账户及各自的已登录 IP 数后退出。要求 DB 文件已存在 |
+| `-passwd <name>` | 重置指定账户的密码后退出（两次输入确认，密码隐藏明文）。不影响已登录的 IP 会话。要求 DB 文件已存在 |
 | `-e <file>` / `-export <file>` | 将 `-db` 库全量导出为 JSON 文件后退出（不启动服务器） |
 | `-i <file>` / `-import <file>` | 将 JSON 文件全量导入 `-db` 库后退出（不启动服务器，全量覆盖） |
 | `-stream-idle-timeout` | 流式（SSE）响应空闲读超时，Go duration 格式（如 `5m`、`90s`、`1h30m`），默认 `5m`。连续无数据超过该时长则取消上游连接。须 >0 且 ≤ `-stream-max-life`，否则启动即退出 |
 | `-stream-max-life` | 流式（SSE）请求最大生命周期硬上限，Go duration 格式，默认 `30m`。到期强制取消上游连接，防止流式 goroutine 无限堆积。须 ≥ `-stream-idle-timeout`，否则启动即退出。注意 thinking-signature 修复重试会重建一份完整预算，故单次客户端请求寿命上界为 2× |
 
-`-e` 与 `-i` 互斥。
+**管理类 flag 互斥**：`-e`、`-i`、`-account`、`-del-account`、`-list-accounts`、`-passwd` 六者**最多只能指定一个**，同时给出多个会直接报错退出（而非按顺序隐式优先）。
 
 多端口示例：
 
@@ -240,7 +244,7 @@ client → 网关 (带 fakeToken)
 ### 状态持久化
 
 - 所有配置与运行时状态统一存储在 `gateway.db`（SQLite，WAL 模式，明文不加密，依赖文件权限保护）。
-- 表结构：`upstreams`（配置列 + 运行时状态列同行，含 per-upstream `aliases` JSON 列）、`upstream_tiers`（usage 型层级配置+状态）、`upstream_extra`（Extra map）、`fake_tokens`（fakeToken→有序 upstream 队列，priority=队列下标）、`accounts`（IP 认证账号，bcrypt 哈希）、`ip_sessions`（IP 登录会话，FK 关联 accounts）。
+- 表结构：`upstreams`（配置列 + 运行时状态列同行，含 per-upstream `aliases` JSON 列）、`upstream_tiers`（usage 型层级配置+状态）、`upstream_extra`（Extra map）、`fake_tokens`（fakeToken→有序 upstream 队列，priority=队列下标）、`accounts`（IP 认证账号，bcrypt 哈希）、`ip_sessions`（IP 登录会话，FK 关联 accounts）、`login_policy`（登录限流策略单行表，`CHECK(id=1)`）。
 - 恢复调度依据按类型二选一：
   - **count 型**：`RecoveryCron`（cron 表达式，对应配置的 `RefreshCron`）
   - **usage/balance/exhaust 型**：`RecoveryAt`（精确时间点 `time.Time`，由 provider 在 exhaust 时设定）
@@ -276,9 +280,10 @@ client → 网关 (带 fakeToken)
 导入流程（按顺序）：
 1. **预校验**：解析 JSON 后立即对其调用 `Validate()`（见上文「配置校验」），失败则拒绝，**不触碰 DB**，打印全部错误。
 2. **自动备份**：若 `gateway.db` 已存在，先整体读出并写入同目录 `gateway.db.bak`（0600 权限），再开始写入——失败回滚也仍有原库备份可恢复。
-3. **全量覆盖**：单事务内 `DELETE` 6 张表（`ip_sessions`→`accounts`→子表 `upstream_tiers`/`upstream_extra`/`fake_tokens`→父 `upstreams`）后依次 `INSERT`。
+3. **全量覆盖**：单事务内 `DELETE` 7 张表（`login_policy`/`ip_sessions`→`accounts`→子表 `upstream_tiers`/`upstream_extra`/`fake_tokens`→父 `upstreams`）后依次 `INSERT`。
 4. **导入防御**：fakeToken 队列中重复 upstream 在 Go 层用 `seen` map 跳过保留首次（`INSERT OR IGNORE` 仅作数据库层兜底）；队列引用不存在的 upstream 跳过避免 FK 违约；state 中有但 upstreams 中无的孤儿条目警告忽略。
 5. **账号与会话导入**：`accounts` 先于 `ip_sessions` 插入（FK 约束）；`ip_sessions` 中引用不存在账号的条目跳过并警告。
+6. **限流策略导入**：顶层 `loginPolicy`（指针 + `omitempty`）；旧文件缺席时用编译期默认值并写入 DB，保持全量覆盖语义。
 6. 任一步失败整体 `Rollback`，DB 保持原状（前面已备份的 `.bak` 不受影响）。
 
 典型用途：备份/恢复 `gateway.db`、手工编辑配置后导入、跨环境迁移。导出文件含明文 `realToken`，需自行保护文件权限。
@@ -455,8 +460,8 @@ DB 直接编辑：`upstreams` 表 `format_transform` 列存配置值字符串（
 
 为避免泄露所有 upstream 配置与真实 token，状态查询拆为两个端点，且均**返回 fakeToken 关联的 upstream**：
 
-- **`GET /status`**：返回一个极简 HTML 查询页（含 token 输入框），前端固定 `POST` 到 `/status/check` 渲染结果。无需鉴权即可访问页面本身，但只有提交有效 token 才能看到对应队列状态。
-- **`POST /status/check`**：接收 `{"token":"<fakeToken>"}`，校验该 fakeToken 存在且队列非空，仅返回队列内 upstream 的运行时状态（**不含 `realToken`、不含其他 fakeToken 的队列**），token 无效返回 401。
+- **`GET /status`**：返回一个极简 HTML 查询页（含 token 输入框），前端固定 `POST` 到 `/status/check` 渲染结果。`-auth` 启用时未登录会 302 跳转 `/login`；未启用时公开访问。
+- **`POST /status/check`**：接收 `{"token":"<fakeToken>"}`，校验该 fakeToken 存在且队列非空，仅返回队列内 upstream 的运行时状态（**不含 `realToken`、不含其他 fakeToken 的队列**），token 无效返回 401。`-auth` 启用时需先登录（未登录返回 401 JSON）。
 
 ```bash
 curl -X POST http://localhost:9090/status/check \
@@ -513,24 +518,82 @@ curl -X POST http://localhost:9090/status/check \
 
 #### 工作机制
 
-- 启用后，所有 API 请求（`/` 路由）需客户端 IP 已通过 `/login` 登录，否则统一返回 `401 Unauthorized`。
-- `/login` 和 `/status` 端点不受认证限制，始终可访问。
+- 启用后，**除 `/login` 与 `/login/logout` 外的所有端点**都需要客户端 IP 已通过 `/login` 登录：
+  - `/status` 是给人浏览的 HTML 页面 → 未登录 **302 跳转 `/login`**
+  - `/status/check` 与 catch-all `/` 返回机器可解析的 **401 JSON**
+- `-auth` 未启用时，`/login` 与 `/login/logout` 显式注册为 **404 JSON**（而不是落到 `/` 转玑 handler 报「缺 token」之类令人迷惑的错误），`/status` 与 `/status/check` 保持公开。
 - 一个账户可同时给多个 IP 地址登录。
 - 账号信息与 IP 登录状态持久化在 SQLite 数据库中（`accounts` 表 + `ip_sessions` 表），重启后会话不丢失。
 - 启动时若 `-auth` 已启用但数据库中没有任何账号，打印警告并退出。
 
-#### 账号管理
+#### 登录爆破防护
 
-使用 `-account` 交互式添加账户（密码隐藏明文，bcrypt 哈希存储）：
+`/login` 的 POST 提交带双维度限流，防止密码暴力猜测与由此引发的 bcrypt CPU 消耗：
 
-```bash
-api-gateway -account
-# 用户名: admin
-# 密码: ********
-# 确认密码: ********
+| 维度 | 默认阈值 | 默认锁定 | 叠加行为 | 清空条件 |
+|---|---|---|---|---|
+| per-IP | 窗口内连续失败 5 次 | 5 分钟 | 再犯翻倍（10m → 20m → 40m …），封顶 1 小时 | 该 IP 登录成功即清空（含翻倍等级） |
+| per-账号 | 窗口内连续失败 20 次 | 5 分钟 | **不翻倍**，固定 5 分钟 | 仅该账号自己登录成功才清空 |
+
+要点：
+
+- **锁定期内不执行 bcrypt**，直接短路返回，防护才真正治得了 CPU 燃烧。
+- **IP 命中锁** → `429 Too Many Requests` + `Retry-After: <剩余秒>`；**仅账号命中锁** → 仍返回 `401「用户名或密码错误」`，不泄露哪些账号被锁。
+- **「连续」的定义**：窗口 = 该维度的基础锁定时长，窗口外的失败不累积。
+- 锁定期间即使输入**正确密码**也会被拒，直到锁定到期。
+- 两个维度**可独立关闭**（`maxFails*` 设为 `0`）。
+- 纯内存，重启清零。每维度内存表上限 1024 条，LRU 淘汰，防止伪造源 IP / 随机用户名的扫描把内存撑爆。
+- 已知取舍：per-账号锁定意味着**知道用户名的人可故意输错把你锁在门外**（这是所有锁定型防护的共同代价）。
+
+#### 限流策略配置
+
+策略持久化在 `login_policy` 单行表，空表时 `loadFromDB` 自动写入一行默认值；可通过 `-e` 导出编辑后 `-i` 导入。JSON 顶层字段 `loginPolicy`：
+
+```json
+"loginPolicy": {
+  "maxFailsIp": 5,
+  "lockIpSec": 300,
+  "maxFailsUser": 20,
+  "lockUserSec": 300,
+  "lockCapSec": 3600
+}
 ```
 
-也可通过 `-e` 导出 JSON 后编辑 `accounts` 数组，再用 `-i` 导入（见下文「配置导入导出」）。
+校验规则（fail-fast：启动 `log.Fatal`，导入在触碰 DB 前拒绝）：
+
+- `maxFailsIp` / `maxFailsUser` 允许为 `0`（= 关闭该维度限流），**负数非法**
+- `lockIpSec` ≥ 1、`lockUserSec` ≥ 1（秒）
+- `lockCapSec` ≥ `max(lockIpSec, lockUserSec)`（否则翻倍逻辑退化成常量）
+
+旧版导出文件不含 `loginPolicy` 时，导入会使用编译期默认值并写入 DB（保持 `-i` 的全量覆盖语义，不残留导入前的旧策略）。
+
+#### 账号管理
+
+```bash
+# 添加（交互式，密码隐藏明文）
+api-gateway -account
+
+# 列出所有账户及其已登录 IP 数
+api-gateway -list-accounts
+# USERNAME   SESSIONS
+# admin      2
+
+# 重置密码（两次输入确认，不影响已登录会话）
+api-gateway -passwd admin
+
+# 删除账户及其全部登录会话（需输入 y 确认）
+api-gateway -del-account admin
+# Delete account "admin" and its 2 active session(s)? This cannot be undone. [y/N]:
+```
+
+要点：
+
+- `-list-accounts` / `-del-account` / `-passwd` **要求 DB 文件已存在**；路径打错会直接报错，而不是静默造出一个空白库。`-account` 保留自动建库（首次使用需先有库才能加账户）。
+- 删除依赖 `ip_sessions.username` 的 `ON DELETE CASCADE` 连带清除会话。
+- 允许删到 0 个账户；下次开 `-auth` 启动会因无账号而明确报错退出。
+- 也可通过 `-e` 导出 JSON 后编辑 `accounts` 数组，再用 `-i` 导入。
+
+> ⚠️ **所有账户管理命令均为独立进程改库，不影响已运行的网关进程。** `authMiddleware` 只查内存中的 `ipSessions`，从不回查 `accounts` 表——**删除账户或改密码后，需重启运行中的网关才生效**，否则被删账户已登录的 IP 在重启前仍然畅通。命令执行成功后会打印此提示。
 
 #### 登录流程
 
@@ -580,7 +643,7 @@ api-gateway -account
 4. 若 `-auth` 启用：调用 `loadAuthFromDB()` 加载 IP 会话到内存，检查账号数量——为 0 则 `log.Fatal` 退出
 5. 启动 `runScheduler` goroutine
 6. 初始化 `reqSem` 并发信号量（channel semaphore，容量 256），handler 入口 acquire、defer release
-7. 启动 HTTP/HTTPS server：所有监听地址共享同一 mux，注册 `GET /status`（HTML 查询页）、`POST /status/check`（按 fakeToken 查询关联 upstream 状态）、`/login`/`/login/logout`（IP 认证登录/登出）、`/`（核心代理 handler，经 `authMiddleware` 包裹）；配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
+7. 启动 HTTP/HTTPS server：所有监听地址共享同一 mux。路由按 `-auth` 分流：启用时注册 `/login`、`/login/logout`（免登录）、`/status`（`authMiddlewareRedirect`）、`/status/check` 与 `/`（`authMiddleware`）；未启用时 `/login`、`/login/logout` 显式注册为 404 JSON，`/status`、`/status/check` 公开。另配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
    - **同步 bind 全部 listener**后才发就绪日志，任一端口冲突或证书加载失败即 `log.Fatal`，避免半启动
    - https 端口的证书经 `newCertReloader` 在 bind 阶段加载；每个 https 端口各自持有 `newTLSConfig()` 产出的独立 `*tls.Config`，启动时调 `ServeTLS(ln, "", "")`（证书由 `GetCertificate` 回调动态提供，故不传文件路径），明文端口调 `Serve(ln)`；就绪日志按协议输出 `http://host:port` / `https://host:port`
 8. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）；`Shutdown` 对所有 listener（含 TLS）并发执行，复用同一 `shutdownCtx` 超时预算
@@ -608,11 +671,12 @@ api-gateway -account
 
 ### state.go
 
-- `openDB`：打开 SQLite `db` 并设 `PRAGMA foreign_keys=ON` + `WAL` + `busy_timeout`、`conn.SetMaxOpenConns(1)`（避免 WAL 下并发写竞争），`CREATE TABLE IF NOT EXISTS` 6 张表（`upstreams`/`upstream_tiers`/`upstream_extra`/`fake_tokens`/`accounts`/`ip_sessions`）+ `idx_fake_tokens_order` 索引；随后用 `PRAGMA table_info` 检查 `upstreams` 列，对旧库执行 `ALTER TABLE ADD COLUMN (format_transform / aliases)` **运行时迁移**。供 `loadFromDB` 与 `importFromJSON` 复用。
+- `openDB`：打开 SQLite `db` 并设 `PRAGMA foreign_keys=ON` + `WAL` + `busy_timeout`、`conn.SetMaxOpenConns(1)`（避免 WAL 下并发写竞争），`CREATE TABLE IF NOT EXISTS` 7 张表（`upstreams`/`upstream_tiers`/`upstream_extra`/`fake_tokens`/`accounts`/`ip_sessions`/`login_policy`）+ `idx_fake_tokens_order` 索引；随后用 `PRAGMA table_info` 检查 `upstreams` 列，对旧库执行 `ALTER TABLE ADD COLUMN (format_transform / aliases)` **运行时迁移**。供 `loadFromDB` 与 `importFromJSON` 复用。
+- `loadLoginPolicy` / `writeLoginPolicy`：读/写 `login_policy` 单行表；表空时 `loadFromDB` 落地一行编译期默认值，保证 `-e` 导出必然带上可读的策略字段。`writeLoginPolicy` 接受 `*sql.DB` 与 `*sql.Tx` 两种 execer。
 - `loadFromDB`：查 4 张表填充 `tokenMap` + `stateMap`；`cleanFakeTokenQueues`（清队列中引用不存在的 upstream）+ `reconcileStateWithConfig`（为 tokenMap 中存在的 upstream 补齐默认 `AvailabilityState`、删除孤立 state 条目）；末尾重置 `stateDirty=false`；调用 `tokenMap.Validate()`，失败 `log.Fatal`。
 - `saveState`：单事务写回——先持写锁深拷贝 state 快照（含 Tiers 副本）并记录 `stateGen`，释放锁后遍历快照执行 SQLite I/O（`UPDATE upstreams` 状态列 + 每个 upstream 的 `upstream_tiers` DELETE/INSERT）；提交后再取锁，仅当代际未变才清 dirty。锁外 I/O 避免写库阻塞所有请求。
-- `exportToJSON`：复用 `loadFromDB` 载入内存 → 查询 `accounts`/`ip_sessions` 表 → marshal `DBDump{tokenMap, stateMap, accounts, ipSessions}` → 原子写（tmp+rename，0600）；导出 reconcile 后的规范视图
-- `importFromJSON`：① 解析 JSON 后立即 `Validate()`（不触碰 DB）→ ② 若 `gateway.db` 存在则先备份为 `gateway.db.bak`（0600）→ ③ 单事务 DELETE 6 表（先子后父）+ INSERT 全量覆盖（含 accounts/ip_sessions）；④ 防御：队列重复 upstream 用 Go `seen` map 跳过（`INSERT OR IGNORE` 仅作 DB 兜底从不触发）、引用不存在 upstream 跳过避免 FK 违约、orphan state 警告忽略、ip_sessions 引用不存在账号跳过并警告；任一步失败 `Rollback`（前面已有 `.bak` 备份）。
+- `exportToJSON`：复用 `loadFromDB` 载入内存 → 查询 `accounts`/`ip_sessions`/`login_policy` 表 → marshal `DBDump{tokenMap, stateMap, accounts, ipSessions, loginPolicy}` → 原子写（tmp+rename，0600）；导出 reconcile 后的规范视图
+- `importFromJSON`：① 解析 JSON 后立即 `Validate()`（含 `loginPolicy`，不触碰 DB）→ ② 若 `gateway.db` 存在则先备份为 `gateway.db.bak`（0600）→ ③ 单事务 DELETE 7 表（先子后父）+ INSERT 全量覆盖（含 accounts/ip_sessions/login_policy）；④ 防御：队列重复 upstream 用 Go `seen` map 跳过（`INSERT OR IGNORE` 仅作 DB 兜底从不触发）、引用不存在 upstream 跳过避免 FK 违约、orphan state 警告忽略、ip_sessions 引用不存在账号跳过并警告；任一步失败 `Rollback`（前面已有 `.bak` 备份）。
 
 ### cron.go
 
@@ -705,11 +769,22 @@ api-gateway -account
 - 全局状态：`authEnabled`（`-auth` flag）、`ipSessions map[string]string`（ip→username 内存缓存）、`authMu sync.RWMutex`
 - `clientIP`：从 `r.RemoteAddr` 提取客户端 IP（`net.SplitHostPort` 去端口）
 - `loadAuthFromDB`：启动时从 DB 加载 `ip_sessions` 到内存，返回账号数量供 main 判断
-- `authMiddleware`：包裹 catch-all handler，`authEnabled` 时检查 `ipSessions[ip]` 是否存在，不存在返回 401
-- `loginHandler`：GET 按当前 IP 是否已登录分流——未登录返回登录表单 HTML，已登录返回会话管理面板（当前 IP、账户、所有已登录 IP 列表、退出按钮）；POST 处理表单提交（bcrypt 验证 → 写入 DB + 内存 → 302 重定向）
+- `authMiddleware`：包裹 catch-all 与 `/status/check`，`authEnabled` 时检查 `ipSessions[ip]` 是否存在，不存在返回 401 JSON
+- `authMiddlewareRedirect`：同上但未登录返回 302 到 `/login`，仅用于 `/status` 这个给人浏览的 HTML 页面（API 路由必须返回可解析的 JSON）
+- `authDisabledHandler`：`-auth` 未启用时显式注册 `/login`、`/login/logout` 返回 404 JSON，避免请求落到 catch-all 后报出与认证无关的错误
+- `loginHandler`：GET 按当前 IP 是否已登录分流——未登录返回登录表单 HTML，已登录返回会话管理面板（当前 IP、账户、所有已登录 IP 列表、退出按钮）；POST 处理表单提交（**限流预检 → bcrypt 验证 → 写入 DB + 内存 → 302 重定向**），失败时记录到限流器
 - `logoutHandler`：POST 接收 `{"ip":"..."}` 或 `{"all":true}`，校验当前 IP 已登录且只能操作同账户的 IP，从 DB + 内存删除会话
 - `dumpAccounts` / `dumpIPSessions`：导出辅助，供 `exportToJSON` 查询 auth 相关表
+- `createAccountFlow`（`-account`）/ `deleteAccountFlow`（`-del-account`）/ `listAccountsFlow`（`-list-accounts`）/ `changePasswordFlow`（`-passwd`）：账户管理 CLI，均在独立进程改库并不启动服务器；`requireExistingDB` 保证 list/del/passwd 不静默造库，`confirmPrompt` 给删除加撤销机会，`warnRestartRequired` 提示运行中网关需重启才生效
 - HTML 模板：`loginFormHTML`（登录表单）、`renderDashboard`（会话管理面板），硬编码内联，风格与 `/status` 页面一致
+
+### login_limiter.go
+
+- `LoginPolicy`：限流策略结构（`maxFailsIp` / `lockIpSec` / `maxFailsUser` / `lockUserSec` / `lockCapSec`），持久化在 `login_policy` 单行表，可经 `-e`/`-i` 导入导出；`Validate()` 收集全部错误一次性返回
+- `attemptEntry` / `attemptLRU`：`container/list` + `map` 实现的带容量上限 LRU（`loginLimiterCap`=1024），`sweep` 清理空闲条目
+- `loginRateLimiter`：双维度限流器。`ipLockRemaining` / `userLockRemaining` 查询锁定剩余（兼懒清理），`recordFailure` 双维度同时累积失败并在达阈值时锁定（IP 维度按 `lockLevel` 翻倍、封顶 `lockCapSec`；账号维度固定时长），`recordSuccess` 清空两个维度，`gc` 由 `runScheduler` 的 10 分钟 ticker 驱动
+- `now func() time.Time` 注入时钟，使翻倍/过期/GC 行为能用假时钟做确定性测试
+- `ipLockDuration`：第 level 级的锁定时长（`lockIpSec << level`，封顶 `lockCapSec`）
 
 ## 许可证
 

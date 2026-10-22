@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS ip_sessions (
   login_at DATETIME NOT NULL,
   FOREIGN KEY(username) REFERENCES accounts(username) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS login_policy (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  max_fails_ip   INTEGER NOT NULL,
+  lock_ip_sec    INTEGER NOT NULL,
+  max_fails_user INTEGER NOT NULL,
+  lock_user_sec  INTEGER NOT NULL,
+  lock_cap_sec   INTEGER NOT NULL
+);
 `
 
 // openDB 打开 SQLite 连接，设置 PRAGMA（FK/WAL/busy_timeout）并确保 schema 存在。
@@ -373,6 +381,53 @@ func loadFromDB() error {
 	}
 
 	log.Printf("State loaded from DB (%d upstreams)", len(stateMap))
+
+	// 登录限流策略：空表则落地一行默认值，保证库内始终有显式策略，
+	// -e 导出必然带上该字段，用户能直接看到可改的值而不必去读源码。
+	policy, err := loadLoginPolicy(conn)
+	if err != nil {
+		return err
+	}
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	loginLimiter.setPolicy(policy)
+	return nil
+}
+
+// loadLoginPolicy 读取 login_policy 单行表；表空则 INSERT 一行编译期默认值。
+func loadLoginPolicy(conn *sql.DB) (LoginPolicy, error) {
+	var p LoginPolicy
+	err := conn.QueryRow(`SELECT max_fails_ip, lock_ip_sec, max_fails_user, lock_user_sec, lock_cap_sec
+		FROM login_policy WHERE id = 1`).
+		Scan(&p.MaxFailsIp, &p.LockIpSec, &p.MaxFailsUser, &p.LockUserSec, &p.LockCapSec)
+	if err == nil {
+		return p, nil
+	}
+	if err != sql.ErrNoRows {
+		return p, fmt.Errorf("query login_policy: %w", err)
+	}
+
+	// 表空（首次启动 / 新库）→ 写入默认值
+	p = defaultLoginPolicy()
+	if err := writeLoginPolicy(conn, p); err != nil {
+		return p, err
+	}
+	log.Printf("[state] login_policy empty -> seeded defaults (%+v)", p)
+	return p, nil
+}
+
+// writeLoginPolicy 以 INSERT OR REPLACE 写单行策略（execer 兼容 *sql.DB 与 *sql.Tx）。
+func writeLoginPolicy(ex interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}, p LoginPolicy) error {
+	_, err := ex.Exec(`INSERT OR REPLACE INTO login_policy
+		(id, max_fails_ip, lock_ip_sec, max_fails_user, lock_user_sec, lock_cap_sec)
+		VALUES (1,?,?,?,?,?)`,
+		p.MaxFailsIp, p.LockIpSec, p.MaxFailsUser, p.LockUserSec, p.LockCapSec)
+	if err != nil {
+		return fmt.Errorf("write login_policy: %w", err)
+	}
 	return nil
 }
 
@@ -611,6 +666,14 @@ func exportToJSON(outPath string) error {
 		return fmt.Errorf("dump ip_sessions: %w", err)
 	}
 
+	// 导出登录限流策略（loadFromDB 已保证表内有一行）
+	policy, err := loadLoginPolicy(db)
+	if err != nil {
+		db.Close()
+		db = nil
+		return err
+	}
+
 	// loadFromDB 把连接赋给了全局 db；导出场景下立即关闭，避免泄漏
 	if db != nil {
 		db.Close()
@@ -618,7 +681,7 @@ func exportToJSON(outPath string) error {
 	}
 
 	mu.Lock()
-	dump := DBDump{TokenMap: tokenMap, State: stateMap, Accounts: accounts, IPSessions: sessions}
+	dump := DBDump{TokenMap: tokenMap, State: stateMap, Accounts: accounts, IPSessions: sessions, LoginPolicy: &policy}
 	mu.Unlock()
 
 	data, err := json.MarshalIndent(dump, "", "  ")
@@ -666,9 +729,19 @@ func importFromJSON(inPath string) error {
 	if dump.State == nil {
 		dump.State = map[string]*AvailabilityState{}
 	}
+	// 旧版导出文件不含 loginPolicy：nil 时用编译期默认值并写入 DB，
+	// 保持 -i 的「全量覆盖」语义——不残留导入前的旧策略。
+	if dump.LoginPolicy == nil {
+		p := defaultLoginPolicy()
+		dump.LoginPolicy = &p
+		log.Printf("[import] no loginPolicy in dump -> using defaults")
+	}
 
 	// 配置校验（ISSUES #7）：在触碰 DB 之前全量校验，非法则直接拒绝，不备份不清空。
 	if err := dump.TokenMap.Validate(); err != nil {
+		return fmt.Errorf("import validation failed (DB untouched): %w", err)
+	}
+	if err := dump.LoginPolicy.Validate(); err != nil {
 		return fmt.Errorf("import validation failed (DB untouched): %w", err)
 	}
 
@@ -716,6 +789,9 @@ func importFromJSON(inPath string) error {
 	}
 	if _, err := tx.Exec(`DELETE FROM upstreams`); err != nil {
 		return fmt.Errorf("clear upstreams: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM login_policy`); err != nil {
+		return fmt.Errorf("clear login_policy: %w", err)
 	}
 
 	// 2. INSERT upstreams（配置列 + 状态列全写）
@@ -882,6 +958,11 @@ func importFromJSON(inPath string) error {
 			return fmt.Errorf("insert ip_session %q: %w", sess.IP, err)
 		}
 		sessCount++
+	}
+
+	// 8. login_policy（已在上面 DELETE，此处写入规范值）
+	if err := writeLoginPolicy(tx, *dump.LoginPolicy); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {

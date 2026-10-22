@@ -48,6 +48,21 @@ const (
 // maxBodySize 限制单次请求体大小，避免恶意超大body导致OOM
 const maxBodySize int64 = 32 << 20 // 32MB
 
+// 登录爆破防护的编译期默认值。
+// 实际生效值持久化在 login_policy 单行表（见 state.go），可在库中或经 -e/-i 调整。
+// maxFails* 为 0 表示关闭该维度限流。
+const (
+	defaultLoginMaxFailsIP   = 5
+	defaultLoginLockIPSec    = 300 // 5m
+	defaultLoginMaxFailsUser = 20
+	defaultLoginLockUserSec  = 300  // 5m
+	defaultLoginLockCapSec   = 3600 // 1h
+
+	// loginLimiterCap 每个维度（per-IP / per-账号）的内存表条目上限。
+	// 防止伪造源 IP 或随机用户名的扫描把内存撑爆；超出后淘汰 LRU 尾部条目。
+	loginLimiterCap = 1024
+)
+
 // cronCacheCap cron解析缓存LRU容量上限
 const cronCacheCap = 256
 

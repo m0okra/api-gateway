@@ -93,5 +93,12 @@
       }
     }
   },
-  "state": {}
+  "state": {},
+  "loginPolicy": {
+    "maxFailsIp": 5,
+    "lockIpSec": 300,
+    "maxFailsUser": 20,
+    "lockUserSec": 300,
+    "lockCapSec": 3600
+  }
 }

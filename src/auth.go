@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +74,32 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// authMiddlewareRedirect 与 authMiddleware 相同，但未登录时 302 到 /login 而非 401 JSON。
+// 仅用于面向人浏览的 HTML 页面路由（/status）；API 路由必须用 authMiddleware，
+// 保证错误响应始终是可被程序解析的 JSON。
+func authMiddlewareRedirect(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if authEnabled {
+			ip := clientIP(r)
+			authMu.RLock()
+			_, ok := ipSessions[ip]
+			authMu.RUnlock()
+			if !ok {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// authDisabledHandler 用于 -auth 未启用时显式注册认证端点：返回 404 JSON。
+// 不注册而让请求落到 catch-all "/" 会让登录页访问者收到「token 缺失」这类
+// 与认证无关的错误，非常迷惑。
+func authDisabledHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": "Not found (-auth not enabled)"})
 }
 
 // ============================================================================
@@ -186,18 +214,37 @@ func loginSubmitHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var hash string
-	err := db.QueryRow(`SELECT password_hash FROM accounts WHERE username=?`, username).Scan(&hash)
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "用户名或密码错误"})
+	ip := clientIP(r)
+
+	// 爆破防护：锁定期内直接短路，不执行 bcrypt（否则防护治不了 CPU 燃烧）。
+	// per-IP 命中 → 429 + Retry-After（告诉对方等待时长，避免无谓重试）；
+	// per-账号命中 → 仍返回 401「用户名或密码错误」，不泄露哪些账号被锁。
+	if remain := loginLimiter.ipLockRemaining(ip); remain > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(remain.Seconds()))))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "尝试过于频繁，请稍后再试"})
 		return
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+	if loginLimiter.userLockRemaining(username) > 0 {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "用户名或密码错误"})
 		return
 	}
 
-	ip := clientIP(r)
+	var hash string
+	err := db.QueryRow(`SELECT password_hash FROM accounts WHERE username=?`, username).Scan(&hash)
+	if err != nil {
+		loginLimiter.recordFailure(ip, username)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "用户名或密码错误"})
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
+		loginLimiter.recordFailure(ip, username)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "用户名或密码错误"})
+		return
+	}
+
+	// 登录成功：清空两个维度的失败计数（含 per-IP 翻倍等级）
+	loginLimiter.recordSuccess(ip, username)
+
 	now := time.Now().Format(time.RFC3339)
 	if _, err := db.Exec(`INSERT OR REPLACE INTO ip_sessions (ip, username, login_at) VALUES (?,?,?)`, ip, username, now); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal error"})
@@ -380,19 +427,24 @@ button:hover{background:#555}
 </html>`
 
 // ============================================================================
-// -account 交互式添加账户
+// 账户管理 CLI（-account / -del-account / -list-accounts / -passwd）
+//
+// 所有子命令均为「独立进程改库」，不影响已运行的网关：
+// authMiddleware 只查内存 ipSessions，从不回查 accounts 表。
+// 因此删除/改密后需重启运行中的网关才生效。
 // ============================================================================
 
-func createAccountFlow() {
-	reader := bufio.NewReader(os.Stdin)
-
-	fmt.Print("Username: ")
-	username, _ := reader.ReadString('\n')
-	username = strings.TrimSpace(username)
-	if username == "" {
-		log.Fatalf("username must not be empty")
+// requireExistingDB 校验 -db 指向的库文件已存在。
+// list/del/passwd 针对的是已存在的账户库，路径打错应报错而不是
+// 让 openDB 静默造出一个空白库（openDB 会 CREATE TABLE IF NOT EXISTS）。
+func requireExistingDB() {
+	if _, err := os.Stat(dbPath); err != nil {
+		log.Fatalf("database %q does not exist; refusing to create it for an account management command", dbPath)
 	}
+}
 
+// readPasswordConfirmed 读取两次隐藏回显的密码并要求一致。
+func readPasswordConfirmed() string {
 	fmt.Print("Password: ")
 	pwBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Println()
@@ -413,6 +465,39 @@ func createAccountFlow() {
 	if string(confirmBytes) != password {
 		log.Fatalf("passwords do not match")
 	}
+	return password
+}
+
+// confirmPrompt 从 stdin 读一行，仅当为 y/yes（大小写不敏感）时返回 true。
+func confirmPrompt(prompt string) bool {
+	fmt.Print(prompt)
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && line == "" {
+		return false // stdin 已关闭（EOF）：视为拒绝
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes"
+}
+
+// warnRestartRequired 提示 CLI 改库对运行中进程的影响。
+func warnRestartRequired() {
+	fmt.Println("NOTE: a running gateway holds sessions in memory; restart it for this change to take effect.")
+}
+
+// createAccountFlow 交互式添加账户（-account）。
+// 与其它管理命令不同，本命令允许自动建库（首次使用需先有库才能加账户）。
+func createAccountFlow() {
+	reader := bufio.NewReader(os.Stdin)
+
+	fmt.Print("Username: ")
+	username, _ := reader.ReadString('\n')
+	username = strings.TrimSpace(username)
+	if username == "" {
+		log.Fatalf("username must not be empty")
+	}
+
+	password := readPasswordConfirmed()
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
@@ -428,5 +513,137 @@ func createAccountFlow() {
 	if _, err := conn.Exec(`INSERT INTO accounts (username, password_hash) VALUES (?,?)`, username, string(hash)); err != nil {
 		log.Fatalf("failed to add account: %v", err)
 	}
+
 	log.Printf("account %q added", username)
+}
+
+// deleteAccountFlow 删除账户及其全部登录会话（-del-account <username>）。
+// 会话由 ip_sessions.username 的 ON DELETE CASCADE 连带删除（openDB 已开 PRAGMA foreign_keys=ON）。
+func deleteAccountFlow(username string) {
+	requireExistingDB()
+	if strings.TrimSpace(username) == "" {
+		log.Fatalf("-del-account requires a username")
+	}
+
+	conn, err := openDB(dbPath)
+	if err != nil {
+		log.Fatalf("failed to open database: %v", err)
+	}
+	defer conn.Close()
+
+	var exists int
+	err = conn.QueryRow(`SELECT COUNT(*) FROM accounts WHERE username=?`, username).Scan(&exists)
+	if err != nil {
+		log.Fatalf("failed to query account: %v", err)
+	}
+	if exists == 0 {
+		log.Fatalf("account %q not found", username)
+	}
+
+	var sessions int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM ip_sessions WHERE username=?`, username).Scan(&sessions); err != nil {
+		log.Fatalf("failed to query sessions: %v", err)
+	}
+
+	if !confirmPrompt(fmt.Sprintf(
+		"Delete account %q and its %d active session(s)? This cannot be undone. [y/N]: ", username, sessions)) {
+		fmt.Println("Aborted.")
+		return
+	}
+
+	if _, err := conn.Exec(`DELETE FROM accounts WHERE username=?`, username); err != nil {
+		log.Fatalf("failed to delete account: %v", err)
+	}
+
+	log.Printf("account %q deleted (%d session(s) removed)", username, sessions)
+	warnRestartRequired()
+}
+
+// listAccountsFlow 以纯文本表格列出账号与已登录 IP 数（-list-accounts）。
+func listAccountsFlow() {
+	requireExistingDB()
+
+	conn, err := openDB(dbPath)
+	if err != nil {
+		log.Fatalf("failed to open database: %v", err)
+	}
+	defer conn.Close()
+
+	rows, err := conn.Query(`
+		SELECT a.username,
+		       (SELECT COUNT(*) FROM ip_sessions s WHERE s.username = a.username) AS sessions
+		FROM accounts a
+		ORDER BY a.username`)
+	if err != nil {
+		log.Fatalf("failed to query accounts: %v", err)
+	}
+	defer rows.Close()
+
+	type entry struct {
+		username string
+		sessions int
+	}
+	var entries []entry
+	nameWidth := len("USERNAME")
+	for rows.Next() {
+		var e entry
+		if err := rows.Scan(&e.username, &e.sessions); err != nil {
+			log.Fatalf("failed to scan account: %v", err)
+		}
+		entries = append(entries, e)
+		if len(e.username) > nameWidth {
+			nameWidth = len(e.username)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("failed to iterate accounts: %v", err)
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No accounts.")
+		return
+	}
+
+	fmt.Printf("%-*s  %s\n", nameWidth, "USERNAME", "SESSIONS")
+	for _, e := range entries {
+		fmt.Printf("%-*s  %d\n", nameWidth, e.username, e.sessions)
+	}
+	fmt.Printf("\n%d account(s)\n", len(entries))
+}
+
+// changePasswordFlow 重置指定账户的密码（-passwd <username>），交互式输入两次。
+// 按约定不动 ip_sessions：改密码只改密码，已登录 IP 会话保留。
+func changePasswordFlow(username string) {
+	requireExistingDB()
+	if strings.TrimSpace(username) == "" {
+		log.Fatalf("-passwd requires a username")
+	}
+
+	conn, err := openDB(dbPath)
+	if err != nil {
+		log.Fatalf("failed to open database: %v", err)
+	}
+	defer conn.Close()
+
+	var exists int
+	if err := conn.QueryRow(`SELECT COUNT(*) FROM accounts WHERE username=?`, username).Scan(&exists); err != nil {
+		log.Fatalf("failed to query account: %v", err)
+	}
+	if exists == 0 {
+		log.Fatalf("account %q not found", username)
+	}
+
+	password := readPasswordConfirmed()
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		log.Fatalf("failed to hash password: %v", err)
+	}
+
+	if _, err := conn.Exec(`UPDATE accounts SET password_hash=? WHERE username=?`, string(hash), username); err != nil {
+		log.Fatalf("failed to update password: %v", err)
+	}
+
+	log.Printf("password for account %q updated", username)
+	warnRestartRequired()
 }

@@ -61,6 +61,9 @@ func runScheduler(shutdownCtx context.Context, stopCh <-chan struct{}, done chan
 			}
 		case <-shadowCleanupTicker.C:
 			cleanupExpiredGeminiShadows()
+			// 登录限流器的过期条目回收。正确性由懒清理保证，
+			// 这里只负责抑制内存长期滞胀，所以直接复用该 ticker（零新增 goroutine）。
+			loginLimiter.gc()
 		}
 	}
 }

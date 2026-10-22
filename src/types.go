@@ -126,6 +126,9 @@ type DBDump struct {
 	State      map[string]*AvailabilityState `json:"state"`
 	Accounts   []AccountDump                 `json:"accounts,omitempty"`
 	IPSessions []IPSessionDump               `json:"ipSessions,omitempty"`
+	// LoginPolicy 登录爆破防护策略。omitempty + 指针：旧版导出文件不含该字段，
+	// 导入时 nil 表示「用编译期默认值」并写入 DB（与 accounts 的向后兼容方式一致）。
+	LoginPolicy *LoginPolicy `json:"loginPolicy,omitempty"`
 }
 
 type AccountDump struct {

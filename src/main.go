@@ -203,6 +203,8 @@ func main() {
 	var addrs addrList
 	var exportPath, importPath string
 	var addAccount bool
+	var delAccount, passwdAccount string
+	var listAccounts bool
 	var certFile, keyFile string
 	// -p / -port 共享同一 addrList，可重复指定，向后兼容单端口用法（未传则默认 :9090）
 	// 加 "https://" 前缀即该端口走 HTTPS（需配合 -cert / -key）
@@ -217,6 +219,9 @@ func main() {
 	flag.StringVar(&importPath, "import", "", "导入：将该 JSON 文件全量导入 -db 库后退出")
 	flag.BoolVar(&authEnabled, "auth", false, "启用 IP 账号认证")
 	flag.BoolVar(&addAccount, "account", false, "交互式添加账户后退出")
+	flag.StringVar(&delAccount, "del-account", "", "删除指定账户及其全部登录会话后退出")
+	flag.BoolVar(&listAccounts, "list-accounts", false, "列出所有账户及其已登录 IP 数后退出")
+	flag.StringVar(&passwdAccount, "passwd", "", "重置指定账户的密码后退出")
 	flag.DurationVar(&streamIdleTimeout, "stream-idle-timeout", defaultStreamIdleTimeout,
 		"流式(SSE)响应空闲读超时：连续无数据超过该时长则取消上游连接（须 >0 且 ≤ -stream-max-life）")
 	flag.DurationVar(&maxStreamLife, "stream-max-life", defaultMaxStreamLife,
@@ -229,10 +234,31 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
-	// 管理操作分支：导出/导入互斥，执行后立即退出，不启动 HTTP 服务器
-	if exportPath != "" && importPath != "" {
-		log.Fatalf("-e/-export and -i/-import are mutually exclusive; use only one")
+	// 管理操作分支：导出/导入/账户管理显式互斥，执行后立即退出，不启动 HTTP 服务器。
+	// 靠 if 链顺序隐式决定优先级在选项变多后不可预测，故统一统计后判错。
+	var mgmt []string
+	if exportPath != "" {
+		mgmt = append(mgmt, "-e/-export")
 	}
+	if importPath != "" {
+		mgmt = append(mgmt, "-i/-import")
+	}
+	if addAccount {
+		mgmt = append(mgmt, "-account")
+	}
+	if delAccount != "" {
+		mgmt = append(mgmt, "-del-account")
+	}
+	if listAccounts {
+		mgmt = append(mgmt, "-list-accounts")
+	}
+	if passwdAccount != "" {
+		mgmt = append(mgmt, "-passwd")
+	}
+	if len(mgmt) > 1 {
+		log.Fatalf("management flags are mutually exclusive; got %s", strings.Join(mgmt, " + "))
+	}
+
 	if exportPath != "" {
 		if err := exportToJSON(exportPath); err != nil {
 			log.Fatalf("Export failed: %v", err)
@@ -247,6 +273,18 @@ func main() {
 	}
 	if addAccount {
 		createAccountFlow()
+		return
+	}
+	if delAccount != "" {
+		deleteAccountFlow(delAccount)
+		return
+	}
+	if listAccounts {
+		listAccountsFlow()
+		return
+	}
+	if passwdAccount != "" {
+		changePasswordFlow(passwdAccount)
 		return
 	}
 
@@ -327,10 +365,21 @@ func main() {
 	//    WriteTimeout 保持 0：流式 SSE 响应可能长时间持续，设写超时会中断合法流。
 	//    ReadTimeout/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
 	mux := http.NewServeMux()
-	mux.HandleFunc("/status", authMiddleware(statusHandler))
-	mux.HandleFunc("/status/check", statusCheckHandler)
-	mux.HandleFunc("/login", loginHandler)
-	mux.HandleFunc("/login/logout", logoutHandler)
+	// -auth 未启用时显式注册认证端点返回 404 JSON：不注册而落到 catch-all "/"
+	// 会让登录页访问者收到「token 缺失」这类与认证无关的错误，非常迷惑。
+	// -auth 启用时只有 /login 与 /login/logout 不需要登录，其余（含 /status、/status/check）全部受保护。
+	if authEnabled {
+		mux.HandleFunc("/login", loginHandler)
+		mux.HandleFunc("/login/logout", logoutHandler)
+		// /status 是给人看的 HTML 页面，未登录时 302 到 /login 而非喷 401 JSON
+		mux.HandleFunc("/status", authMiddlewareRedirect(statusHandler))
+	} else {
+		mux.HandleFunc("/login", authDisabledHandler)
+		mux.HandleFunc("/login/logout", authDisabledHandler)
+		mux.HandleFunc("/status", statusHandler)
+	}
+	// /status/check 与 catch-all "/" 返回机器可解析的 JSON，未登录统一 401
+	mux.HandleFunc("/status/check", authMiddleware(statusCheckHandler))
 	mux.HandleFunc("/", authMiddleware(handler))
 
 	// 同步绑定所有 listener：任一端口冲突立即 log.Fatalf，避免半启动状态。
