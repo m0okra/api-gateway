@@ -245,6 +245,43 @@ func applyAvailabilityResult(upstreamName string, res AvailabilityResult) bool {
 // 网关：请求转发 + upstream队列轮转
 // ============================================================================
 
+// readLimitedBody 一次性读取请求体，并施加 maxBodySize 上限。
+//
+// 返回 ok=false 表示已向 w 写过错误响应（413/500），调用方须立即 return。
+// 只有非空 body 才置 hasBody=true（与原行为一致：空 body 不参与 JSON 解析）。
+//
+// 注意：http.MaxBytesReader 自身**不写任何状态码**。它只在读超限时返回
+// *http.MaxBytesError，并标记 response 的 requestBodyLimitHit（顺带让 net/http
+// 在响应头加上 Connection: close）。若调用方收到该错误后直接 return 而不写响应，
+// net/http 会在 finishRequest 里补一个 WriteHeader(200)，客户端看到的是
+// 「200 OK + 空 body」而非 413 —— 故此处必须显式 writeJSON(413)。
+func readLimitedBody(w http.ResponseWriter, r *http.Request) (body []byte, hasBody bool, ok bool) {
+	if r.Body == nil {
+		return nil, false, true
+	}
+	limited := http.MaxBytesReader(w, r.Body, maxBodySize)
+	read, rerr := io.ReadAll(limited)
+	r.Body.Close()
+
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(rerr, &maxBytesErr) {
+		log.Printf("[REQ] request body too large: limit=%d bytes", maxBytesErr.Limit)
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{
+			"error": fmt.Sprintf("Request body too large: limit is %d bytes", maxBytesErr.Limit),
+		})
+		return nil, false, false
+	}
+	if rerr != nil {
+		writeJSON(w, http.StatusInternalServerError,
+			map[string]string{"error": "Read request body failed: " + rerr.Error()})
+		return nil, false, false
+	}
+	if len(read) == 0 {
+		return nil, false, true
+	}
+	return read, true, true
+}
+
 // handler 主请求处理：fakeToken -> upstream队列轮转
 func handler(w http.ResponseWriter, r *http.Request) {
 	// 全局并发上限：acquire 一个令牌，defer 保证释放（含 panic 路径）。
@@ -297,30 +334,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		maxAttempts = 1
 	}
 
-	// Issue 3 & 4: 读取请求体 限制最大 32MB，并处理读取错误
-	// 注意：http.MaxBytesReader 在超限时已内部调用 w.WriteHeader(413)，
-	// 故这里使用 errors.As 判断 *http.MaxBytesError 后直接 return，
-	// 避免再次 writeJSON 触发 "superfluous WriteHeader" 警告。
-	var bodyBytes []byte
-	hasBody := false
-	if r.Body != nil {
-		limited := http.MaxBytesReader(w, r.Body, maxBodySize)
-		read, rerr := io.ReadAll(limited)
-		r.Body.Close()
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(rerr, &maxBytesErr) {
-			// 超限：413 状态码已由 MaxBytesReader 写入，直接终止
-			return
-		}
-		if rerr != nil {
-			writeJSON(w, http.StatusInternalServerError,
-				map[string]string{"error": "Read request body failed: " + rerr.Error()})
-			return
-		}
-		if len(read) > 0 {
-			bodyBytes = read
-			hasBody = true
-		}
+	// Issue 3 & 4: 读取请求体（上限 maxBodySize，默认 32MiB，可经 -max-body-size 覆盖）
+	// 超限时 readLimitedBody 已显式写回 413，故这里只需判断 ok 后终止。
+	bodyBytes, hasBody, ok := readLimitedBody(w, r)
+	if !ok {
+		return
 	}
 
 	isStream := strings.Contains(r.Header.Get("Accept"), "text/event-stream") ||
