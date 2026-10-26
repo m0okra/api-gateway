@@ -45,8 +45,12 @@ const (
 	availPassthrough = "none"
 )
 
-// maxBodySize 限制单次请求体大小，避免恶意超大body导致OOM
-const maxBodySize int64 = 32 << 20 // 32MB
+// defaultMaxBodySize 单次请求体大小上限的编译期默认值（32MiB），可被 -max-body-size 覆盖。
+// 实际生效值是 globals.go 中的 maxBodySize 变量（flag.Parse 前绑定到该变量）。
+//
+// 用途：避免恶意/误发的超大 body 把内存打爆。注意请求体会被一次性读进内存（io.ReadAll），
+// 故最坏内存占用约为 maxConcurrentReqs × maxBodySize。
+const defaultMaxBodySize int64 = 32 << 20 // 32MiB
 
 // 登录爆破防护的编译期默认值。
 // 实际生效值持久化在 login_policy 单行表（见 state.go），可在库中或经 -e/-i 调整。
@@ -71,9 +75,13 @@ const (
 	// maxConcurrentReqs 全局并发请求上限（channel semaphore）。超过则请求阻塞排队，
 	// 防止高并发下无限 goroutine 爆炸。256 在中等并发场景下兼顾吞吐与资源。
 	maxConcurrentReqs = 256
-	// serverReadTimeout 读取请求头/体的超时，防御慢速连接（Slowloris）攻击。
-	// 注意：代理请求体可能较大（上限 32MB），10s 足以读取完毕。
-	serverReadTimeout = 10 * time.Second
+	// defaultServerReadTimeout HTTP 服务端读超时（ReadTimeout）的编译期默认值，可被 -read-timeout 覆盖。
+	// 实际生效值是 globals.go 中的 serverReadTimeout 变量。
+	// 注意：ReadTimeout 覆盖「读完整个请求（含 body）」的总时长，因此它同时构成
+	// maxBodySize 的隐含带宽下限——客户端要在大 body 上限内完成上传，带宽需 ≥
+	// maxBodySize/serverReadTimeout（默认 32MiB/10s ≈ 3.2MiB/s），否则会先超时
+	// 走 500「Read request body failed」而不是 413。调大 -max-body-size 时须同步评估 -read-timeout。
+	defaultServerReadTimeout = 10 * time.Second
 	// serverIdleTimeout keep-alive 空闲连接超时，回收闲置连接资源。
 	serverIdleTimeout = 120 * time.Second
 	// serverMaxHeaderBytes 请求头上限，防止超大头部滥用。

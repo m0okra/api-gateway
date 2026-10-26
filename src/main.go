@@ -177,6 +177,40 @@ func (e *listenAddrError) Error() string {
 	return "invalid listen address " + strconv.Quote(e.raw) + ": " + e.reason
 }
 
+// formatRate 把字节/秒的速率格式化为易读字符串（≥1MiB/s 用 MiB/s，否则 KiB/s），
+// 仅用于启动日志里的「所需最低上传速率」，避免小上限时显示成 0.00 MiB/s。
+func formatRate(bytesPerSec float64) string {
+	if bytesPerSec >= 1<<20 {
+		return fmt.Sprintf("%.2f MiB/s", bytesPerSec/(1<<20))
+	}
+	return fmt.Sprintf("%.2f KiB/s", bytesPerSec/(1<<10))
+}
+
+// validateMaxBodySize 校验 -max-body-size 启动参数（单位：字节）。
+// 规则：必须为正数。http.MaxBytesReader 把负值当 0 处理，0/负值会令任何非空请求体
+// 都被判超限（代理直接全废），故显式拒绝而不是静默解释成“上限 0”。
+//
+// 返回 error 而非直接 log.Fatalf，便于单测；由 main 在 flag.Parse 后立即调用并退出。
+func validateMaxBodySize(n int64) error {
+	if n <= 0 {
+		return fmt.Errorf("-max-body-size must be positive (got %d)", n)
+	}
+	return nil
+}
+
+// validateReadTimeout 校验 -read-timeout 启动参数。
+// 规则：必须为正数。http.Server.ReadTimeout 的零值 0 表示「不超时」，
+// 负值则会被 net/http 当作已过期的 deadline（任何请求都读不完），
+// 两者一个丢保护一个丢服务，因此都不接受——需要超长读取就明确写一个很大但有限的值。
+//
+// 返回 error 而非直接 log.Fatalf，便于单测；由 main 在 flag.Parse 后立即调用并退出。
+func validateReadTimeout(d time.Duration) error {
+	if d <= 0 {
+		return fmt.Errorf("-read-timeout must be positive (got %s)", d)
+	}
+	return nil
+}
+
 // validateStreamTimeouts 校验两个流式超时启动参数（-stream-idle-timeout / -stream-max-life）。
 // 规则：
 //   - 两者都必须为正数：0 或负值交给 context.WithTimeout / time.NewTimer 会立即过期，
@@ -226,11 +260,21 @@ func main() {
 		"流式(SSE)响应空闲读超时：连续无数据超过该时长则取消上游连接（须 >0 且 ≤ -stream-max-life）")
 	flag.DurationVar(&maxStreamLife, "stream-max-life", defaultMaxStreamLife,
 		"流式(SSE)请求最大生命周期硬上限：到期强制取消上游连接（须 ≥ -stream-idle-timeout）")
+	flag.Int64Var(&maxBodySize, "max-body-size", defaultMaxBodySize,
+		"单次请求体上限（字节），超限返回 413 且不转发上游（须 >0；默认 33554432 = 32MiB）")
+	flag.DurationVar(&serverReadTimeout, "read-timeout", defaultServerReadTimeout,
+		"HTTP 读超时（含请求头与请求体），Go duration 格式，如 10s/1m（须 >0；默认 10s）")
 	flag.Parse()
 
 	// 启动参数校验：无条件执行（在 -e/-i/-account 等提前退出的管理分支之前），
 	// 传参错误无论本次是否启动服务器都应 fail-fast。
 	if err := validateStreamTimeouts(streamIdleTimeout, maxStreamLife); err != nil {
+		log.Fatalf("%v", err)
+	}
+	if err := validateMaxBodySize(maxBodySize); err != nil {
+		log.Fatalf("%v", err)
+	}
+	if err := validateReadTimeout(serverReadTimeout); err != nil {
 		log.Fatalf("%v", err)
 	}
 
@@ -319,8 +363,19 @@ func main() {
 		log.Printf("warning: -cert/-key provided but no https:// listener is configured; certificate will not be used")
 	}
 
-	// 打印生效的流式超时参数（仅在实际启动服务器的路径上输出，管理操作不受噪）。
-	log.Printf("[CONFIG] stream idle timeout=%s, max life=%s", streamIdleTimeout, maxStreamLife)
+	// 打印生效的超时/上限参数（仅在实际启动服务器的路径上输出，管理操作不受噪）。
+	// minUploadRate 是「在上限内传完 body」所需的最低客户端上传速率——
+	// -max-body-size 与 -read-timeout 的组合是否现实，看这个数最直观。
+	minUploadRate := float64(maxBodySize) / serverReadTimeout.Seconds()
+	log.Printf("[CONFIG] stream idle timeout=%s, max life=%s, read timeout=%s, max request body=%d bytes (%.1f MiB, needs ≥ %s upload)",
+		streamIdleTimeout, maxStreamLife, serverReadTimeout, maxBodySize,
+		float64(maxBodySize)/(1<<20), formatRate(minUploadRate))
+	// 请求体是整包读进内存的，实际上限是 maxBodySize × maxConcurrentReqs；
+	// 调大时提醒一次，避免改成 GB 级后才发现 OOM。
+	if maxBodySize > defaultMaxBodySize {
+		log.Printf("warning: -max-body-size=%d exceeds default %d; worst-case buffered memory ≈ %d concurrent × %d = %d bytes",
+			maxBodySize, defaultMaxBodySize, maxConcurrentReqs, maxBodySize, int64(maxConcurrentReqs)*maxBodySize)
+	}
 
 	// 1. 从 SQLite 加载配置与状态（统一数据源）
 	dbExisted := true
@@ -363,7 +418,7 @@ func main() {
 
 	// 4. 启动 HTTP 服务器（多端口共享同一 mux 与全局状态）
 	//    WriteTimeout 保持 0：流式 SSE 响应可能长时间持续，设写超时会中断合法流。
-	//    ReadTimeout/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
+	//    ReadTimeout（可经 -read-timeout 覆盖）/IdleTimeout/MaxHeaderBytes 用于防御慢速连接与超大头部攻击。
 	mux := http.NewServeMux()
 	// -auth 未启用时显式注册认证端点返回 404 JSON：不注册而落到 catch-all "/"
 	// 会让登录页访问者收到「token 缺失」这类与认证无关的错误，非常迷惑。

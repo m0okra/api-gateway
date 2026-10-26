@@ -59,6 +59,8 @@ go build -o api-gateway.exe .
 | `-i <file>` / `-import <file>` | 将 JSON 文件全量导入 `-db` 库后退出（不启动服务器，全量覆盖） |
 | `-stream-idle-timeout` | 流式（SSE）响应空闲读超时，Go duration 格式（如 `5m`、`90s`、`1h30m`），默认 `5m`。连续无数据超过该时长则取消上游连接。须 >0 且 ≤ `-stream-max-life`，否则启动即退出 |
 | `-stream-max-life` | 流式（SSE）请求最大生命周期硬上限，Go duration 格式，默认 `30m`。到期强制取消上游连接，防止流式 goroutine 无限堆积。须 ≥ `-stream-idle-timeout`，否则启动即退出。注意 thinking-signature 修复重试会重建一份完整预算，故单次客户端请求寿命上界为 2× |
+| `-max-body-size` | 单次请求体上限，**单位字节**（不是 `MB`/`MiB` 后缀格式），默认 `33554432`（= 32MiB）。超限返回 **413** 且不转发上游（连一次 attempt 都不会发起）。须 >0，否则启动即退出。取值仅作用于请求体，不影响响应/SSE；超过默认值时启动日志会打印最坏内存占用告警（上限 × 256 并发）。注意它受 `-read-timeout` 制约（读完整个请求的总时长限制），大 body 还需带宽支撑（详见下文「请求体大小限制」） |
+| `-read-timeout` | HTTP 读超时，Go duration 格式（如 `10s`、`1m`），默认 `10s`。即 `http.Server.ReadTimeout`：覆盖「读完请求头 + 请求体」的总时长，超时则中断读取，用于防御慢速连接（Slowloris）。须 >0，否则启动即退出（`0` 在 net/http 里表示「不超时」，不提供这种用法）。它与 `-max-body-size` 共同决定大 body 能否传完：所需上传速率 ≥ `max-body-size` / `-read-timeout`，启动日志会打印该值 |
 
 **管理类 flag 互斥**：`-e`、`-i`、`-account`、`-del-account`、`-list-accounts`、`-passwd` 六者**最多只能指定一个**，同时给出多个会直接报错退出（而非按顺序隐式优先）。
 
@@ -631,19 +633,45 @@ api-gateway -del-account admin
 
 ### 请求体大小限制
 
-单请求体上限 32MB。使用 `http.MaxBytesReader` 包裹请求体，超限时内部自动写入 413 状态码并返回 `*http.MaxBytesError`。代码通过 `errors.As(rerr, &maxBytesErr)` 判断超限后直接 return，避免二次 WriteHeader 触发 "superfluous" 警告。
+单请求体上限默认为 32MiB（`33554432` 字节），可用 `-max-body-size <bytes>` 覆盖；服务端读超时默认为 `10s`，可用 `-read-timeout <duration>` 覆盖。两个参数都在启动即校验（须 >0，`0`/负值直接 fail-fast）。仅作用于**发往兜底路由 `/` 的代理请求**：`/login`、`/login/logout`、`/status`、`/status/check` 不经过该限制。
+
+实现：`readLimitedBody`（`gateway.go`）用 `http.MaxBytesReader(w, r.Body, maxBodySize)` 包裹请求体后 `io.ReadAll`，再用 `errors.As(rerr, &maxBytesErr)` 判定超限。
+
+**关键点：`http.MaxBytesReader` 自己不写任何状态码。** 它在读超限时只返回 `*http.MaxBytesError` 并标记 `requestBodyLimitHit`（顺带让 net/http 加上 `Connection: close` 响应头）。若 handler 收到该错误后直接 `return` 而不写响应，net/http 会在 `finishRequest` 里补一个 `WriteHeader(200)`，客户端看到的是「200 OK + 空 body」而非 413。因此 `readLimitedBody` 超限分支必须显式 `writeJSON(w, http.StatusRequestEntityTooLarge, ...)`。
+
+超限时的响应样例（请求体是整包读进内存后才判定，故此时尚未接触上游）：
+
+```
+HTTP/1.1 413 Request Entity Too Large
+Connection: close
+Content-Type: application/json
+
+{"error":"Request body too large: limit is 33554432 bytes"}
+```
+
+判别顺序：请求先经并发信号量 `reqSem`（256）、`OPTIONS` 短路、fakeToken 校验（无效 token → 401）与（`-auth` 时的）IP 会话校验，**这些步骤都不读请求体，因此不会触发 413**；只有全部通过后才进入 `readLimitedBody`。
+
+三个隐含边界：
+
+- **恰好等于上限是合法的**（`MaxBytesReader` 只在读到第 `limit+1` 字节时报错）：32MiB 整通过，32MiB+1B 触发 413。
+- **`-read-timeout`（默认 `10s`）会先于上限生效**：它是「读完整个请求（含 body）」的总时长，故客户端带宽需 ≳ `max-body-size` / `-read-timeout`（默认约 3.2MiB/s）。慢速上传失败时拿到的是 500 `Read request body failed: ...`，而不是 413。启动日志会打印该带宽下限，例如 `read timeout=10s, max request body=33554432 bytes (32.0 MiB, needs ≥ 3.20 MiB/s upload)`；调大 `-max-body-size` 时需同步调大 `-read-timeout`（或确认客户端上传速率足够）。
+- **内存放大**：请求体一次性 `io.ReadAll` 进内存，最坏占用约 `max-body-size × 256`（默认 32MiB × 256 ≈ 8GiB）。超过默认值时启动日志会打印该告警：
+
+```
+warning: -max-body-size=67108864 exceeds default 33554432; worst-case buffered memory ≈ 256 concurrent × 67108864 = 17179869184 bytes
+```
 
 ## 各文件逻辑详解
 
 ### main.go
 
-1. 解析 `-p` / `-port` / `-cert` / `-key` / `-db` / `-auth` / `-account` / `-e`(`-export`) / `-i`(`-import`) / `-stream-idle-timeout` / `-stream-max-life` flag，随后立即调用 `validateStreamTimeouts` 校验两个流式超时（在管理操作分支之前，故传参错误无论是否启动服务器都会 fail-fast）。`-p` 值可带 `https://` / `http://` 前缀声明协议，解析为 `listenSpec{addr, tls}`（`parseListenSpec` → `splitListenScheme` → `normalizeListenAddr`）
+1. 解析 `-p` / `-port` / `-cert` / `-key` / `-db` / `-auth` / `-account` / `-e`(`-export`) / `-i`(`-import`) / `-stream-idle-timeout` / `-stream-max-life` / `-max-body-size` / `-read-timeout` flag，随后立即调用 `validateStreamTimeouts`、`validateMaxBodySize` 与 `validateReadTimeout` 校验（在管理操作分支之前，故传参错误无论是否启动服务器都会 fail-fast）。`-p` 值可带 `https://` / `http://` 前缀声明协议，解析为 `listenSpec{addr, tls}`（`parseListenSpec` → `splitListenScheme` → `normalizeListenAddr`）
 2. 若指定 `-e` 或 `-i`：执行导出/导入后 `os.Exit(0)`，不启动服务器（管理操作，互斥）
 3. 调用 `loadFromDB()` 从 SQLite 加载配置与状态（统一数据源），并运行 `Validate()` 校验——失败即 `log.Fatal` 退出
 4. 若 `-auth` 启用：调用 `loadAuthFromDB()` 加载 IP 会话到内存，检查账号数量——为 0 则 `log.Fatal` 退出
 5. 启动 `runScheduler` goroutine
 6. 初始化 `reqSem` 并发信号量（channel semaphore，容量 256），handler 入口 acquire、defer release
-7. 启动 HTTP/HTTPS server：所有监听地址共享同一 mux。路由按 `-auth` 分流：启用时注册 `/login`、`/login/logout`（免登录）、`/status`（`authMiddlewareRedirect`）、`/status/check` 与 `/`（`authMiddleware`）；未启用时 `/login`、`/login/logout` 显式注册为 404 JSON，`/status`、`/status/check` 公开。另配置 `ReadTimeout=10s` / `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）
+7. 启动 HTTP/HTTPS server：所有监听地址共享同一 mux。路由按 `-auth` 分流：启用时注册 `/login`、`/login/logout`（免登录）、`/status`（`authMiddlewareRedirect`）、`/status/check` 与 `/`（`authMiddleware`）；未启用时 `/login`、`/login/logout` 显式注册为 404 JSON，`/status`、`/status/check` 公开。另配置 `ReadTimeout`（`-read-timeout`，默认 `10s`）/ `IdleTimeout=120s` / `MaxHeaderBytes=1MB`（防御慢速连接攻击；`WriteTimeout=0` 保护流式 SSE）。注意 `ReadTimeout` 覆盖「读完整个请求（含 body）」，因此它是 `-max-body-size` 的隐含带宽下限（详见「请求体大小限制」）
    - **同步 bind 全部 listener**后才发就绪日志，任一端口冲突或证书加载失败即 `log.Fatal`，避免半启动
    - https 端口的证书经 `newCertReloader` 在 bind 阶段加载；每个 https 端口各自持有 `newTLSConfig()` 产出的独立 `*tls.Config`，启动时调 `ServeTLS(ln, "", "")`（证书由 `GetCertificate` 回调动态提供，故不传文件路径），明文端口调 `Serve(ln)`；就绪日志按协议输出 `http://host:port` / `https://host:port`
 8. 等待 SIGINT/SIGTERM，触发优雅关闭（等待 scheduler final save 完成后关闭 DB）；`Shutdown` 对所有 listener（含 TLS）并发执行，复用同一 `shutdownCtx` 超时预算

@@ -44,6 +44,20 @@ var (
 	maxStreamLife = defaultMaxStreamLife
 )
 
+// 请求体上限与服务端读超时：编译期默认值见 constants.go，
+// 可分别在启动时通过 -max-body-size / -read-timeout 覆盖。
+// 两者共同决定「大 body 能否在上限内传完」：所需客户端上传速率 ≥ maxBodySize/serverReadTimeout，
+// 低于此值时请求会先撞读超时（500），而不是拿到 413。
+// 仅在 main 启动阶段写入，启动完成后只读，故无需加锁。
+var (
+	// maxBodySize 单次请求体上限。语义：请求体超过该字节数即返回 413，
+	// 且不再转发上游（连一次 attempt 都不会发起）。
+	maxBodySize = defaultMaxBodySize
+	// serverReadTimeout HTTP 服务端读超时（http.Server.ReadTimeout），
+	// 覆盖「读完请求头 + 请求体」的总时长，兼防慢速连接（Slowloris）攻击。
+	serverReadTimeout = defaultServerReadTimeout
+)
+
 // ============================================================================
 // 共享 HTTP 客户端（复用连接，避免每次请求创建Transport）
 // ============================================================================
